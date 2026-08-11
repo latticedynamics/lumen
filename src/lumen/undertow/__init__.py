@@ -17,6 +17,6 @@ the pattern that has already survived a real downstream architecture.
 
 from __future__ import annotations
 
-from lumen.undertow.layer import UndertowAttention, UndertowConfig
+from lumen.undertow.layer import UndertowAttention, UndertowConfig, UndertowState
 
-__all__ = ["UndertowAttention", "UndertowConfig"]
+__all__ = ["UndertowAttention", "UndertowConfig", "UndertowState"]

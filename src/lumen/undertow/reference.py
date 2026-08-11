@@ -89,16 +89,47 @@ def window_validity(
     seq_len: int,
     window: int,
     *,
+    n_prefix: int = 0,
     device: torch.device | None = None,
 ) -> torch.Tensor:
     """`(T, W)` bool mask — does slot ``w`` of query ``t`` name a real position?
 
-    False only in the first ``W-1`` rows, where part of the window lies before
-    the start of the sequence.
+    In the extended key array (``n_prefix`` real history slots, then the chunk,
+    left-aligned so original position ``p`` lands at index ``p + (W-1)``), query
+    ``t`` slot ``w`` reads index ``t + w``.  That index is real exactly when it
+    reaches no further back than the history does::
+
+        valid(t, w)  ⟺  t + w  ≥  (W-1) - n_prefix
+
+    With ``n_prefix=0`` this reduces to ``t - (W-1) + w ≥ 0`` — the
+    start-of-sequence case, where only the first ``W-1`` rows are affected.
+
+    Args:
+        n_prefix: how many real history positions precede the chunk, capped at
+            ``W-1`` by the caller (anything older is out of reach anyway).
     """
     t = torch.arange(seq_len, device=device)
     w = torch.arange(window, device=device)
-    return (t[:, None] - (window - 1) + w[None, :]) >= 0
+    return (t[:, None] + w[None, :]) >= (window - 1 - n_prefix)
+
+
+def _extend(
+    x: torch.Tensor, window: int, prefix: torch.Tensor | None
+) -> torch.Tensor:
+    """Left-extend `(B, H, T, D)` by ``W-1`` slots of history, or of zeros.
+
+    Zeros are safe here *only* because the corresponding slots are masked to
+    ``-inf`` before the softmax; nothing downstream may assume the padding is
+    inert.  See the module docstring.
+    """
+    if prefix is None:
+        return F.pad(x, (0, 0, window - 1, 0))
+    if prefix.shape[2] != window - 1:
+        raise ValueError(
+            f"prefix must carry exactly window-1 = {window - 1} positions, "
+            f"got {prefix.shape[2]}"
+        )
+    return torch.cat([prefix, x], dim=2)
 
 
 def windowed_scores(
@@ -106,18 +137,24 @@ def windowed_scores(
     k: torch.Tensor,
     window: int,
     scale: float,
+    *,
+    prefix: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Windowed QKᵀ — `(B, H, T, D)` × 2 → `(B, H, T, W)`.
 
     Computed one window offset at a time.  Each iteration touches only a
-    `(B, H, T)` temporary and slices ``k`` as a view, so no `(B, H, T, W, D)`
-    intermediate is ever materialised — that tensor is what makes the naive
-    unfold formulation unusable at long sequence length.
+    `(B, H, T)` temporary and slices the extended keys as a view, so no
+    `(B, H, T, W, D)` intermediate is ever materialised — that tensor is what
+    makes the naive unfold formulation unusable at long sequence length.
+
+    Args:
+        prefix: `(B, H, W-1, D)` of preceding keys, for continuing a stream.
+            ``None`` starts a fresh sequence.
     """
     seq_len = q.shape[2]
-    k_padded = F.pad(k, (0, 0, window - 1, 0))
+    k_ext = _extend(k, window, prefix)
     return torch.stack(
-        [(q * k_padded[:, :, w:w + seq_len, :]).sum(-1) for w in range(window)],
+        [(q * k_ext[:, :, w:w + seq_len, :]).sum(-1) for w in range(window)],
         dim=-1,
     ) / scale
 
@@ -126,17 +163,20 @@ def windowed_aggregate(
     weights: torch.Tensor,
     v: torch.Tensor,
     window: int,
+    *,
+    prefix: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Windowed weighted sum — `(B, H, T, W)` × `(B, H, T, D)` → `(B, H, T, D)`.
 
-    The mirror of :func:`windowed_scores`, and it must use the same padding, or
-    slot ``w`` means two different keys on the two sides of the softmax.
+    The mirror of :func:`windowed_scores`, and it must extend by the same
+    amount and from the same history, or slot ``w`` means two different
+    positions on the two sides of the softmax.
     """
     seq_len = v.shape[2]
-    v_padded = F.pad(v, (0, 0, window - 1, 0))
+    v_ext = _extend(v, window, prefix)
     out = v.new_zeros(v.shape)
     for w in range(window):
-        out = out + weights[..., w].unsqueeze(-1) * v_padded[:, :, w:w + seq_len, :]
+        out = out + weights[..., w].unsqueeze(-1) * v_ext[:, :, w:w + seq_len, :]
     return out
 
 
@@ -147,6 +187,8 @@ def windowed_weights(
     plateau: int | None,
     *,
     log_profile: torch.Tensor | None = None,
+    prefix: torch.Tensor | None = None,
+    n_prefix: int = 0,
 ) -> torch.Tensor:
     """`(B, H, T, W)` attention weights — the whole pre-aggregation path.
 
@@ -163,7 +205,7 @@ def windowed_weights(
     seq_len = q.shape[2]
     scale = math.sqrt(q.shape[-1])
 
-    scores = windowed_scores(q, k, window, scale)
+    scores = windowed_scores(q, k, window, scale, prefix=prefix)
 
     if log_profile is None:
         log_profile = log_decay_profile(
@@ -171,7 +213,7 @@ def windowed_weights(
         )
     scores = scores + log_profile.to(scores.dtype)
 
-    valid = window_validity(seq_len, window, device=q.device)
+    valid = window_validity(seq_len, window, n_prefix=n_prefix, device=q.device)
     scores = scores.masked_fill(~valid, float("-inf"))
 
     return torch.softmax(scores, dim=-1)

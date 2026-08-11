@@ -378,6 +378,208 @@ def test_gradients_flow_to_every_projection() -> None:
         assert parameter.grad.abs().sum() > 0, f"{name} gradient is all zero"
 
 
+# ── streaming ──────────────────────────────────────────────────────────────
+
+
+def _layer(window: int = 8, plateau: int | None = 6, seed: int = 5) -> UndertowAttention:
+    torch.manual_seed(seed)
+    return UndertowAttention(
+        UndertowConfig(d_model=64, n_heads=8, window=window, plateau=plateau)
+    ).eval()
+
+
+def test_init_state_shapes_and_emptiness() -> None:
+    layer = _layer(window=8)
+    state = layer.init_state(batch=3)
+    assert state.keys.shape == (3, 8, 7, 8)
+    assert state.values.shape == state.keys.shape
+    assert state.seen == 0
+    assert state.filled == 0
+    assert torch.equal(state.keys, torch.zeros_like(state.keys))
+
+
+@pytest.mark.parametrize("window,plateau", [(8, 6), (8, None), (1, None), (5, 0)])
+def test_step_matches_forward_including_the_prefix(
+    window: int, plateau: int | None
+) -> None:
+    """The Phase 3 gate.
+
+    ``forward`` masks the partial-window prefix by positional validity;
+    ``step`` masks it by counting filled buffer slots. Those are different
+    pieces of code, so agreement over the first W-1 positions is a real check
+    rather than a formality — which is exactly why the range is not skipped.
+    """
+    layer = _layer(window=window, plateau=plateau)
+    x = torch.randn(2, 20, 64)
+
+    with torch.no_grad():
+        parallel = layer(x)
+        state = layer.init_state(batch=2)
+        stepped = []
+        for t in range(x.shape[1]):
+            y_t, state = layer.step(x[:, t : t + 1], state)
+            stepped.append(y_t)
+        sequential = torch.cat(stepped, dim=1)
+
+    assert state.seen == x.shape[1]
+
+    prefix = max(window - 1, 1)
+    prefix_diff = (parallel[:, :prefix] - sequential[:, :prefix]).abs().max().item()
+    total_diff = (parallel - sequential).abs().max().item()
+
+    assert prefix_diff < 1e-5, f"prefix diverged by {prefix_diff:.3e}"
+    assert total_diff < 1e-5, f"step vs forward diverged by {total_diff:.3e}"
+
+
+def test_unmasked_step_would_have_been_wrong() -> None:
+    """Characterise the bug the count-based mask prevents.
+
+    Until the buffer fills, its front slots hold zeros from ``init_state``.
+    Leaving them unmasked lets them take real attention mass — the streaming
+    twin of zero-padding in ``forward``.  Reproduced here so that removing the
+    mask fails a test, rather than quietly shifting the first W-1 outputs of
+    every generated sequence.
+    """
+    layer = _layer(window=8, plateau=6)
+    x = torch.randn(2, 20, 64)
+    window = layer.config.window
+
+    with torch.no_grad():
+        parallel = layer(x)
+        state = layer.init_state(batch=2)
+        collected = []
+        for t in range(x.shape[1]):
+            q, k, v, gate = layer._project(x[:, t : t + 1])
+            keys = torch.cat([state.keys, k.float()], dim=2)
+            values = torch.cat([state.values, v.float()], dim=2)
+            scores = torch.matmul(q.float(), keys.transpose(-2, -1)) / layer.scale
+            scores = scores + layer.log_profile
+            # The mask belongs here.  Its absence is the bug under test.
+            o = torch.matmul(torch.softmax(scores, dim=-1), values)
+            collected.append(layer._out(o, gate))
+            state = layer._next_state(keys, values, state.seen + 1)
+        unmasked = torch.cat(collected, dim=1)
+
+    prefix_diff = (parallel[:, : window - 1] - unmasked[:, : window - 1]).abs().max()
+    interior_diff = (parallel[:, window - 1 :] - unmasked[:, window - 1 :]).abs().max()
+
+    assert prefix_diff.item() > 1e-5, "unmasked buffer slots should corrupt the prefix"
+    assert interior_diff.item() < 1e-5, "and should leave the saturated region alone"
+
+
+def test_step_rejects_multiple_positions() -> None:
+    layer = _layer()
+    state = layer.init_state(batch=2)
+    with pytest.raises(ValueError, match="one position at a time"):
+        layer.step(torch.randn(2, 3, 64), state)
+
+
+def test_state_size_is_constant_in_generated_length() -> None:
+    """The property the whole fixed window exists to buy."""
+    layer = _layer(window=8)
+    state = layer.init_state(batch=2)
+    x = torch.randn(2, 1, 64)
+
+    shapes = set()
+    with torch.no_grad():
+        for _ in range(200):
+            _, state = layer.step(x, state)
+            shapes.add((tuple(state.keys.shape), tuple(state.values.shape)))
+
+    assert len(shapes) == 1, f"state changed shape during generation: {shapes}"
+    assert state.seen == 200
+    assert state.filled == 7  # saturates at window-1 and stays there
+
+
+def test_prefill_then_step_matches_one_pass() -> None:
+    """Prefill a prompt in parallel, continue token by token, same answer."""
+    layer = _layer(window=8, plateau=6)
+    x = torch.randn(2, 24, 64)
+    split = 15
+
+    with torch.no_grad():
+        whole = layer(x)
+        head, state = layer(x[:, :split], return_state=True)
+        tail = []
+        for t in range(split, x.shape[1]):
+            y_t, state = layer.step(x[:, t : t + 1], state)
+            tail.append(y_t)
+        joined = torch.cat([head, *tail], dim=1)
+
+    diff = (whole - joined).abs().max().item()
+    assert diff < 1e-5, f"prefill+step diverged from one pass by {diff:.3e}"
+
+
+@pytest.mark.parametrize("splits", [(4, 20), (8, 16), (1, 23), (12, 12), (23, 1)])
+def test_chunked_forward_matches_one_pass(splits: tuple[int, int]) -> None:
+    """Chunked prefill: a state handed to forward reaches back correctly.
+
+    Includes a first chunk shorter than the window, where the second chunk's
+    early queries must reach past a partly-filled buffer.
+    """
+    layer = _layer(window=8, plateau=6)
+    first, second = splits
+    x = torch.randn(2, first + second, 64)
+
+    with torch.no_grad():
+        whole = layer(x)
+        head, state = layer(x[:, :first], return_state=True)
+        tail, state = layer(x[:, first:], state=state, return_state=True)
+        joined = torch.cat([head, tail], dim=1)
+
+    assert state.seen == first + second
+    diff = (whole - joined).abs().max().item()
+    assert diff < 1e-5, f"chunked forward diverged by {diff:.3e}"
+
+
+def test_state_is_frozen_so_streams_can_branch() -> None:
+    """Two continuations from one state must not share a buffer."""
+    layer = _layer(window=8)
+    state = layer.init_state(batch=2)
+    with torch.no_grad():
+        _, state = layer.step(torch.randn(2, 1, 64), state)
+        _, branch_a = layer.step(torch.randn(2, 1, 64), state)
+        _, branch_b = layer.step(torch.randn(2, 1, 64), state)
+
+    with pytest.raises(Exception):
+        state.seen = 99  # type: ignore[misc]
+    assert branch_a.keys.data_ptr() != branch_b.keys.data_ptr()
+    assert not torch.allclose(branch_a.keys, branch_b.keys)
+
+
+def test_forward_without_return_state_is_unchanged() -> None:
+    """The default path must not have shifted under the new keyword args."""
+    layer = _layer(window=8, plateau=6)
+    x = torch.randn(2, 20, 64)
+    with torch.no_grad():
+        plain = layer(x)
+        with_state, _ = layer(x, return_state=True)
+    assert torch.equal(plain, with_state)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA device")
+def test_generation_memory_is_flat() -> None:
+    """Peak allocation must not grow with how much has been generated."""
+    layer = _layer(window=8).cuda()
+    x = torch.randn(2, 1, 64, device="cuda")
+
+    peaks = []
+    for length in (64, 256, 1024):
+        state = layer.init_state(batch=2, device=torch.device("cuda"))
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        with torch.no_grad():
+            for _ in range(length):
+                _, state = layer.step(x, state)
+        torch.cuda.synchronize()
+        peaks.append(torch.cuda.max_memory_allocated())
+
+    # 16x the tokens must not move peak allocation appreciably.
+    growth = peaks[-1] / peaks[0]
+    assert growth < 1.1, f"peak memory grew {growth:.2f}x over 16x the tokens"
+
+
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA device")
 def test_windowed_matches_dense_on_cuda() -> None:

@@ -28,8 +28,10 @@ it are worth repeating where the code lives:
   one masking mechanism with the validity mask and cannot drive the normaliser
   toward zero.  ``tests/test_undertow.py`` holds the layer to that equivalence.
 
-Phase note: ``init_state`` / ``step`` / ``forward(..., state=, return_state=)``
-land next, with their own verification.  They are absent rather than untested.
+Streaming works the way the rest of Lumen's components do — ``init_state`` /
+``step`` / ``forward(..., state=, return_state=)`` — so a block can hold this or
+Gated DeltaNet without knowing which.  The state here is a ring buffer of the
+last ``W-1`` keys and values, constant in generated length.
 """
 
 from __future__ import annotations
@@ -47,6 +49,33 @@ from lumen.undertow.reference import (
     windowed_aggregate,
     windowed_scores,
 )
+
+
+@dataclass(frozen=True)
+class UndertowState:
+    """Everything needed to continue a stream — a ring buffer and a count.
+
+    ``keys`` and ``values`` are `(B, H, W-1, D)`: the most recent positions
+    still within reach of the *next* query.  Constant in generated length,
+    which is the property a fixed window exists to buy.
+
+    Unfilled slots sit at the **front** (oldest end) and hold zeros.  They are
+    masked before the softmax and their contents never reach an output; the
+    count is what distinguishes them.
+
+    Frozen — :meth:`UndertowAttention.step` returns a new state rather than
+    mutating one, so a caller can branch a stream (beam search, speculative
+    decode) without two branches quietly sharing a buffer.
+    """
+
+    keys: torch.Tensor
+    values: torch.Tensor
+    seen: int
+
+    @property
+    def filled(self) -> int:
+        """How many buffer slots hold real positions."""
+        return min(self.seen, self.keys.shape[2])
 
 
 @dataclass(frozen=True)
@@ -176,26 +205,42 @@ class UndertowAttention(nn.Module):
         )
 
     def _window_scores(
-        self, q: torch.Tensor, k: torch.Tensor, window: int
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        window: int,
+        *,
+        prefix: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """`(B, H, T, W)` raw scores.  Overridden by accelerated paths."""
-        return windowed_scores(q, k, window, self.scale)
+        return windowed_scores(q, k, window, self.scale, prefix=prefix)
 
     def _window_aggregate(
-        self, weights: torch.Tensor, v: torch.Tensor, window: int
+        self,
+        weights: torch.Tensor,
+        v: torch.Tensor,
+        window: int,
+        *,
+        prefix: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """`(B, H, T, D)` weighted sum.  Overridden by accelerated paths."""
-        return windowed_aggregate(weights, v, window)
+        return windowed_aggregate(weights, v, window, prefix=prefix)
 
     def _window_weights(
-        self, q: torch.Tensor, k: torch.Tensor, window: int
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        window: int,
+        *,
+        prefix: torch.Tensor | None = None,
+        n_prefix: int = 0,
     ) -> torch.Tensor:
         """`(B, H, T, W)` attention weights — scores, bias, mask, softmax.
 
         Both the decay profile and the structural validity mask are additive
         pre-softmax terms, so there is one masking path here and not two.
         """
-        scores = self._window_scores(q, k, window)
+        scores = self._window_scores(q, k, window, prefix=prefix)
 
         # When T < window the window is clamped, but the profile is *sliced*,
         # never rebuilt: p(δ) is a property of the configured window and must
@@ -204,7 +249,9 @@ class UndertowAttention(nn.Module):
         # a clamped window spans.
         scores = scores + self.log_profile[-window:].to(scores.dtype)
 
-        valid = window_validity(q.shape[2], window, device=q.device)
+        valid = window_validity(
+            q.shape[2], window, n_prefix=n_prefix, device=q.device
+        )
         scores = scores.masked_fill(~valid, float("-inf"))
 
         return torch.softmax(scores, dim=-1)
@@ -225,22 +272,146 @@ class UndertowAttention(nn.Module):
         o = o.reshape(batch, seq_len, self.config.d_model).to(gate.dtype)
         return self.dropout(self.o_proj(o * F.silu(gate)))
 
+    # ── streaming ─────────────────────────────────────────────────────────
+
+    def init_state(
+        self,
+        batch: int,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> UndertowState:
+        """An empty stream — a zeroed `(B, H, W-1, D)` ring buffer, ``seen=0``.
+
+        The buffer is fp32 by default because the kernels are; ``dtype`` is
+        offered for callers who have measured that something else works on
+        their hardware.
+        """
+        config = self.config
+        shape = (batch, config.n_heads, config.window - 1, config.d_head)
+        zeros = torch.zeros(shape, device=device, dtype=dtype or torch.float32)
+        return UndertowState(keys=zeros, values=zeros.clone(), seen=0)
+
+    def _next_state(
+        self,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        seen: int,
+    ) -> UndertowState:
+        """Keep the newest ``W-1`` positions, front-padding if there are fewer.
+
+        Front-padding matches :meth:`init_state`'s layout — unfilled slots at
+        the oldest end — so ``seen`` alone always says which slots are real,
+        whether the state came from a fresh start, a prefill, or a step.
+        """
+        buffer_len = self.config.window - 1
+        available = keys.shape[2]
+
+        if buffer_len == 0:
+            return UndertowState(keys[:, :, :0], values[:, :, :0], seen)
+        if available >= buffer_len:
+            return UndertowState(
+                keys[:, :, -buffer_len:].contiguous(),
+                values[:, :, -buffer_len:].contiguous(),
+                seen,
+            )
+        pad = buffer_len - available
+        return UndertowState(
+            F.pad(keys, (0, 0, pad, 0)), F.pad(values, (0, 0, pad, 0)), seen
+        )
+
+    def step(
+        self, x: torch.Tensor, state: UndertowState
+    ) -> tuple[torch.Tensor, UndertowState]:
+        """One position — `(B, 1, d_model)` → output and the successor state.
+
+        Scores against the whole `W`-slot buffer in a single matmul rather than
+        going through the windowed kernels: at `T = 1` the offset loop would be
+        `W` launches to do one small product.
+
+        Slots the stream has not reached yet sit at the front and are masked
+        by *count*, where :meth:`forward` masks by positional validity.  Two
+        different mechanisms reaching the same answer is exactly why the
+        agreement between them is worth a test rather than an assertion.
+        """
+        if x.shape[1] != 1:
+            raise ValueError(
+                f"step() consumes one position at a time, got {x.shape[1]}; "
+                f"use forward(x, state=..., return_state=True) for a chunk"
+            )
+
+        window = self.config.window
+        q, k, v, gate = self._project(x)
+
+        keys = torch.cat([state.keys, k.float()], dim=2)
+        values = torch.cat([state.values, v.float()], dim=2)
+
+        scores = torch.matmul(q.float(), keys.transpose(-2, -1)) / self.scale
+        scores = scores + self.log_profile.to(scores.dtype)
+
+        n_valid = min(state.seen + 1, window)
+        if n_valid < window:
+            invalid = torch.zeros(window, dtype=torch.bool, device=x.device)
+            invalid[: window - n_valid] = True
+            scores = scores.masked_fill(invalid, float("-inf"))
+
+        o = torch.matmul(torch.softmax(scores, dim=-1), values)
+
+        return self._out(o, gate), self._next_state(
+            keys, values, state.seen + 1
+        )
+
     # ── forward ───────────────────────────────────────────────────────────
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """`(B, T, d_model)` → `(B, T, d_model)`.
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        state: UndertowState | None = None,
+        return_state: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, UndertowState]:
+        """`(B, T, d_model)` → `(B, T, d_model)`, optionally continuing a stream.
+
+        Args:
+            state: history to attend into. ``None`` starts at the beginning of
+                a sequence. Passing one makes this a *chunked* prefill —
+                queries near the start of ``x`` reach back into the buffer
+                exactly as far as the window allows.
+            return_state: also return the state after consuming ``x``, so a
+                prompt can be prefilled in one parallel pass and generation
+                continued with :meth:`step`.
 
         A sequence shorter than the window clamps rather than raising: a
-        windowed path has no reason to reject a short batch, and the profile
-        slice keeps every distance meaning what it meant.
+        windowed path has no reason to reject a short batch, and slicing the
+        profile keeps every distance meaning what it meant. With a ``state``
+        there is nothing to clamp — the history supplies the reach.
         """
+        seq_len = x.shape[1]
         q, k, v, gate = self._project(x)
-        window = min(self.config.window, x.shape[1])
+        q, k, v = q.float(), k.float(), v.float()
 
-        weights = self._window_weights(q.float(), k.float(), window)
-        o = self._window_aggregate(weights, v.float(), window)
+        if state is None:
+            window = min(self.config.window, seq_len)
+            prefix_k = prefix_v = None
+            n_prefix = 0
+            seen = 0
+        else:
+            window = self.config.window
+            prefix_k, prefix_v = state.keys, state.values
+            n_prefix = state.filled
+            seen = state.seen
 
-        return self._out(o, gate)
+        weights = self._window_weights(
+            q, k, window, prefix=prefix_k, n_prefix=n_prefix
+        )
+        o = self._window_aggregate(weights, v, window, prefix=prefix_v)
+        y = self._out(o, gate)
+
+        if not return_state:
+            return y
+
+        keys = k if prefix_k is None else torch.cat([prefix_k, k], dim=2)
+        values = v if prefix_v is None else torch.cat([prefix_v, v], dim=2)
+        return y, self._next_state(keys, values, seen + seq_len)
 
     def extra_repr(self) -> str:
         config = self.config
