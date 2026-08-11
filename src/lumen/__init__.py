@@ -39,6 +39,7 @@ or from Python::
 from __future__ import annotations
 
 from lumen.bench import BenchResult, benchmark_layer, compare, format_table
+from lumen.undertow import UndertowAttention, UndertowConfig
 from lumen.probe import (
     ArchFacts,
     DeviceInfo,
@@ -74,4 +75,7 @@ __all__ = [
     "benchmark_layer",
     "compare",
     "format_table",
+    # undertow
+    "UndertowAttention",
+    "UndertowConfig",
 ]
