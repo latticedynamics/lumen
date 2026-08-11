@@ -11,7 +11,7 @@ additive log-space bias before the softmax, which places it in the same family
 as ALiBi and T5's relative position bias.  With ``plateau=None`` the boundary is
 hard and the layer is ordinary sliding-window attention.
 
-The design record is ``notes/drafts/UNDERTOW.md``; it carries the formal
+The design record is ``docs/design/UNDERTOW.md``; it carries the formal
 definition, the decisions, and what is deliberately excluded.  Two points from
 it are worth repeating where the code lives:
 

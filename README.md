@@ -45,7 +45,11 @@ need instruments, so the instruments were built first.
 | [`lumen.probe`](./docs/HARDWARE_PROBE.md) | What a machine *actually does*, measured — dtype reality-checking, Triton viability, autotune cost |
 | `lumen.bench` | Layer benchmarking that reports the **backward pass separately** — see below |
 
-### Being consolidated
+### Consolidated
+
+| | |
+|---|---|
+| [`lumen.undertow`](./docs/UNDERTOW.md) | Fixed-window causal attention, no positional encoding, optional graded boundary — streaming with constant memory, opt-in Triton path. [Design record](./docs/design/UNDERTOW.md) |
 
 Every component gets a design record before it gets code — what the existing
 implementations uniquely contribute, what was decided and on what evidence, and

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lumen"
-version = "0.1.0"
+version = "0.1.0a1"
 description = "One place for the components worth keeping: consolidated architectures, measured hardware capability, no assumptions."
 readme = "README.md"
 license = { text = "MIT" }

@@ -8,7 +8,7 @@ Two paths live here and they compute the same thing:
   `(T, T)` log-space bias.  This is the *oracle* — it is the definition of the
   layer written in the most obvious possible way, and the windowed path is
   required to reproduce it to 1e-6 at every position (see
-  ``notes/drafts/UNDERTOW.md`` §6).
+  ``docs/design/UNDERTOW.md`` §6).
 
 Keeping the obvious implementation around, permanently, is the cheapest defence
 against a clever one drifting.  It is not dead code; it is the specification.
