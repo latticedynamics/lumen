@@ -43,12 +43,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from lumen.undertow import triton_kernels
 from lumen.undertow.reference import (
+    extend,
     log_decay_profile,
     window_validity,
     windowed_aggregate,
     windowed_scores,
 )
+
+BACKENDS = ("reference", "triton")
 
 
 @dataclass(frozen=True)
@@ -101,6 +105,13 @@ class UndertowConfig:
                   zero rather than injecting noise into a converged residual
                   stream.
         eps:      Per-head RMSNorm epsilon.
+        backend:  ``"reference"`` (default) or ``"triton"``.  **Opt-in, and
+                  deliberately not auto-detected.**  A fast path that switches
+                  itself on whenever a package happens to be importable would
+                  mean two projects sharing this layer are not running the same
+                  object — and then a difference in their numbers stops being a
+                  difference in their experiment, which is the one thing this
+                  library exists to prevent.  Ask for it, measure it, keep it.
     """
 
     d_model: int
@@ -110,6 +121,7 @@ class UndertowConfig:
     dropout: float = 0.0
     zero_init: bool = False
     eps: float = 1e-6
+    backend: str = "reference"
 
     def __post_init__(self) -> None:
         if self.d_model < 1:
@@ -132,6 +144,12 @@ class UndertowConfig:
             raise ValueError(f"dropout must be in [0, 1), got {self.dropout}")
         if self.eps <= 0.0:
             raise ValueError(f"eps must be > 0, got {self.eps}")
+        # Validate the *name* here and availability in the layer: this dataclass
+        # is pure logic and stays testable on a machine with no GPU.
+        if self.backend not in BACKENDS:
+            raise ValueError(
+                f"backend must be one of {BACKENDS}, got {self.backend!r}"
+            )
 
     @property
     def d_head(self) -> int:
@@ -160,6 +178,15 @@ class UndertowAttention(nn.Module):
 
     def __init__(self, config: UndertowConfig) -> None:
         super().__init__()
+
+        # An explicit request that cannot be honoured is an error, not a silent
+        # downgrade.  Degrading cleanly is for capabilities nobody asked for.
+        if config.backend == "triton" and not triton_kernels.HAS_TRITON:
+            raise RuntimeError(
+                'backend="triton" was requested but triton did not import. '
+                "Install it, or use the reference backend."
+            )
+
         self.config = config
 
         d_model = config.d_model
@@ -212,7 +239,17 @@ class UndertowAttention(nn.Module):
         *,
         prefix: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """`(B, H, T, W)` raw scores.  Overridden by accelerated paths."""
+        """`(B, H, T, W)` raw scores, on whichever backend is configured.
+
+        The Triton path takes the extended key array rather than a prefix: the
+        extension is a differentiable cat or pad, so autograd routes the
+        gradient back to the history and the chunk on its own, and the kernel's
+        inner loop needs no bounds check.
+        """
+        if self.config.backend == "triton" and triton_kernels.usable(q):
+            return triton_kernels.windowed_scores(
+                q, extend(k, window, prefix), window, self.scale
+            )
         return windowed_scores(q, k, window, self.scale, prefix=prefix)
 
     def _window_aggregate(
@@ -223,7 +260,15 @@ class UndertowAttention(nn.Module):
         *,
         prefix: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """`(B, H, T, D)` weighted sum.  Overridden by accelerated paths."""
+        """`(B, H, T, D)` weighted sum, on whichever backend is configured.
+
+        Falls back to the reference on non-CUDA tensors — that is a device
+        without such a path, not a missing capability, so it is not an error.
+        """
+        if self.config.backend == "triton" and triton_kernels.usable(v):
+            return triton_kernels.windowed_aggregate(
+                weights, extend(v, window, prefix), window
+            )
         return windowed_aggregate(weights, v, window, prefix=prefix)
 
     def _window_weights(

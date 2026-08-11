@@ -113,7 +113,7 @@ def window_validity(
     return (t[:, None] + w[None, :]) >= (window - 1 - n_prefix)
 
 
-def _extend(
+def extend(
     x: torch.Tensor, window: int, prefix: torch.Tensor | None
 ) -> torch.Tensor:
     """Left-extend `(B, H, T, D)` by ``W-1`` slots of history, or of zeros.
@@ -152,7 +152,7 @@ def windowed_scores(
             ``None`` starts a fresh sequence.
     """
     seq_len = q.shape[2]
-    k_ext = _extend(k, window, prefix)
+    k_ext = extend(k, window, prefix)
     return torch.stack(
         [(q * k_ext[:, :, w:w + seq_len, :]).sum(-1) for w in range(window)],
         dim=-1,
@@ -173,7 +173,7 @@ def windowed_aggregate(
     positions on the two sides of the softmax.
     """
     seq_len = v.shape[2]
-    v_ext = _extend(v, window, prefix)
+    v_ext = extend(v, window, prefix)
     out = v.new_zeros(v.shape)
     for w in range(window):
         out = out + weights[..., w].unsqueeze(-1) * v_ext[:, :, w:w + seq_len, :]

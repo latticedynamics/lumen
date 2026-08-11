@@ -19,6 +19,7 @@ import pytest
 import torch
 
 from lumen.undertow import UndertowAttention, UndertowConfig
+from lumen.undertow.triton_kernels import HAS_TRITON as _HAS_TRITON
 from lumen.undertow.reference import (
     decay_profile,
     dense_attention,
@@ -619,3 +620,116 @@ def test_log_profile_buffer_is_not_persistent() -> None:
     config = UndertowConfig(d_model=32, n_heads=4, window=8, plateau=6)
     layer = UndertowAttention(config)
     assert "log_profile" not in layer.state_dict()
+
+
+# ── triton backend ─────────────────────────────────────────────────────────
+
+
+def test_backend_name_is_validated() -> None:
+    with pytest.raises(ValueError, match="backend must be one of"):
+        UndertowConfig(d_model=16, n_heads=4, window=8, backend="cuda")
+
+
+def test_reference_is_the_default() -> None:
+    """Opt-in, not auto-detected: two installs must run the same object."""
+    assert UndertowConfig(d_model=16, n_heads=4, window=8).backend == "reference"
+
+
+@pytest.mark.triton
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and _HAS_TRITON), reason="needs CUDA + triton"
+)
+@pytest.mark.parametrize(
+    "seq_len,window,plateau", [(64, 8, 6), (128, 16, None), (33, 8, 6), (5, 8, 6)]
+)
+def test_triton_forward_matches_reference(
+    seq_len: int, window: int, plateau: int | None
+) -> None:
+    torch.manual_seed(3)
+    shared = dict(d_model=64, n_heads=8, window=window, plateau=plateau)
+    reference = UndertowAttention(UndertowConfig(**shared)).cuda().eval()
+    accelerated = UndertowAttention(
+        UndertowConfig(**shared, backend="triton")
+    ).cuda().eval()
+    accelerated.load_state_dict(reference.state_dict())
+
+    x = torch.randn(2, seq_len, 64, device="cuda")
+    with torch.no_grad():
+        diff = (reference(x) - accelerated(x)).abs().max().item()
+    assert diff < TOL, f"triton vs reference forward: {diff:.3e}"
+
+
+@pytest.mark.triton
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and _HAS_TRITON), reason="needs CUDA + triton"
+)
+def test_triton_backward_matches_reference() -> None:
+    """Every gradient compared separately.
+
+    A matching loss value proves very little — the backward is where kernel
+    bugs hide, and dQ, dK and dV fail in different ways.
+    """
+    torch.manual_seed(9)
+    shared = dict(d_model=64, n_heads=8, window=8, plateau=6)
+    reference = UndertowAttention(UndertowConfig(**shared)).cuda()
+    accelerated = UndertowAttention(
+        UndertowConfig(**shared, backend="triton")
+    ).cuda()
+    accelerated.load_state_dict(reference.state_dict())
+
+    x = torch.randn(2, 48, 64, device="cuda")
+    target = torch.randn(2, 48, 64, device="cuda")
+
+    grads = {}
+    for name, layer in (("reference", reference), ("triton", accelerated)):
+        layer.zero_grad()
+        inp = x.clone().requires_grad_(True)
+        ((layer(inp) - target) ** 2).mean().backward()
+        grads[name] = {"input": inp.grad.clone()} | {
+            p_name: p.grad.clone() for p_name, p in layer.named_parameters()
+        }
+
+    for key in grads["reference"]:
+        a, b = grads["reference"][key], grads["triton"][key]
+        scale = max(a.abs().max().item(), 1e-8)
+        diff = (a - b).abs().max().item() / scale
+        assert diff < 1e-5, f"gradient {key} diverged by {diff:.3e} (relative)"
+
+
+@pytest.mark.triton
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and _HAS_TRITON), reason="needs CUDA + triton"
+)
+def test_triton_handles_chunked_state() -> None:
+    """The extended-array formulation should make prefill work unchanged."""
+    torch.manual_seed(15)
+    config = UndertowConfig(
+        d_model=64, n_heads=8, window=8, plateau=6, backend="triton"
+    )
+    layer = UndertowAttention(config).cuda().eval()
+    x = torch.randn(2, 40, 64, device="cuda")
+
+    with torch.no_grad():
+        whole = layer(x)
+        head, state = layer(x[:, :22], return_state=True)
+        tail, _ = layer(x[:, 22:], state=state, return_state=True)
+
+    diff = (whole - torch.cat([head, tail], dim=1)).abs().max().item()
+    assert diff < TOL, f"chunked triton diverged by {diff:.3e}"
+
+
+@pytest.mark.triton
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and _HAS_TRITON), reason="needs CUDA + triton"
+)
+def test_triton_falls_back_on_cpu() -> None:
+    """A CUDA-only path on a CPU tensor is a device gap, not a failure."""
+    config = UndertowConfig(d_model=32, n_heads=4, window=8, backend="triton")
+    layer = UndertowAttention(config).eval()
+    y = layer(torch.randn(2, 12, 32))
+    assert y.shape == (2, 12, 32)
+    assert torch.isfinite(y).all()
