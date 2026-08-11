@@ -1,0 +1,27 @@
+# build artefacts
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.py[cod]
+
+# environments -- deliberately NOT a .python-version file.  requires-python in
+# pyproject.toml is the portable declaration; a pyenv virtualenv name is a fact
+# about one machine and travels to no other.
+.venv/
+venv/
+
+# triton compilation cache, if pointed here
+.triton/
+
+# probe output is a fact about one machine, not about this repo
+*.probe.json
+
+# working notes -- cross-repo surveys, sequencing, open questions, and anything
+# naming a path on one machine.  Two audiences: docs/ is for whoever clones this
+# repo, notes/ is for whoever is building it.  See CLAUDE.md for the rule.
+# Promoting a note to docs/ is always available; un-publishing one is not.
+notes/
+
+.pytest_cache/
+.ipynb_checkpoints/

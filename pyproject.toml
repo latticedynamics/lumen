@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lumen"
+version = "0.1.0"
+description = "One place for the components worth keeping: consolidated architectures, measured hardware capability, no assumptions."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Kenneth Grace" }]
+requires-python = ">=3.10"
+keywords = ["pytorch", "linear-attention", "gated-deltanet", "benchmarking", "reproducibility"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# Deliberately minimal and deliberately loose on torch.
+#
+# The house rule is: pin what you import from someone else's *research* code,
+# because that is what moves without warning.  torch is not that -- it is the
+# substrate, the user already has a build matched to their driver, and pinning
+# it is how a library becomes uninstallable on the exact old hardware it claims
+# to support.  triton is NOT a dependency at all; it is probed for at runtime
+# and everything degrades cleanly without it.  That is the whole point.
+dependencies = [
+    "torch>=2.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.urls]
+Repository = "https://github.com/latticedynamics/lumen"
+Issues = "https://github.com/latticedynamics/lumen/issues"
+
+[project.scripts]
+lumen-probe = "lumen.probe:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
