@@ -32,8 +32,6 @@ That is what this repository is for.
 
 ## Status
 
-Honest version: **the infrastructure is here, the components are not yet.**
-
 Consolidating a layer means proving the merged version reproduces what it
 replaces, on hardware that is not the machine it was written on. Both of those
 need instruments, so the instruments were built first.
@@ -50,6 +48,12 @@ need instruments, so the instruments were built first.
 | | |
 |---|---|
 | [`lumen.undertow`](./docs/UNDERTOW.md) | Fixed-window causal attention, no positional encoding, optional graded boundary — streaming with constant memory, opt-in Triton path. [Design record](./docs/design/UNDERTOW.md) |
+| [`lumen.gdn`](./docs/GDN.md) | Gated DeltaNet — a fixed-size associative memory with a delta-rule write. Linear in sequence length, constant-memory generation, configurable head layout. [Design record](./docs/design/GATED_DELTANET.md) |
+
+The two are **interchangeable**: same three methods, same shapes, same output
+path, so a block can hold either mixer without knowing which it has. That is the
+point of a common surface — a difference in two projects' numbers should be a
+difference in their experiment.
 
 Every component gets a design record before it gets code — what the existing
 implementations uniquely contribute, what was decided and on what evidence, and

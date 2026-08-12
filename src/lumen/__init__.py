@@ -39,6 +39,12 @@ or from Python::
 from __future__ import annotations
 
 from lumen.bench import BenchResult, benchmark_layer, compare, format_table
+from lumen.gdn import (
+    GatedDeltaNet,
+    GatedDeltaNetConfig,
+    GatedDeltaNetState,
+    HeadLayout,
+)
 from lumen.undertow import UndertowAttention, UndertowConfig
 from lumen.probe import (
     ArchFacts,
@@ -54,7 +60,7 @@ from lumen.probe import (
     probe_triton,
 )
 
-__version__ = "0.1.0a1"
+__version__ = "0.2.0"
 
 __all__ = [
     "__version__",
@@ -75,6 +81,11 @@ __all__ = [
     "benchmark_layer",
     "compare",
     "format_table",
+    # gdn
+    "GatedDeltaNet",
+    "GatedDeltaNetConfig",
+    "GatedDeltaNetState",
+    "HeadLayout",
     # undertow
     "UndertowAttention",
     "UndertowConfig",
