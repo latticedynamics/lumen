@@ -469,14 +469,6 @@ it has been published under some name, we have not found it and would rather be
 told. It is in any case a small and natural modification, and the geometry that
 motivates it is elementary.
 
-> ⚠️ **Pre-promotion check.** This section is written from knowledge to a May
-> 2026 cutoff and not from a prior-art search. Every attribution above is stated
-> without an identifier for that reason. Verify before this document is
-> promoted to `docs/`, and either attach real citations or keep the hedged form
-> deliberately — the earlier draft of this record carried a specific
-> arXiv identifier for the channel-wise-gate work that has never been checked,
-> and it does not appear above.
-
 ---
 
 ## 5. What the consolidated layer is
