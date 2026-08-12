@@ -399,6 +399,51 @@ def test_init_state_shapes_and_emptiness() -> None:
     assert torch.equal(state.keys, torch.zeros_like(state.keys))
 
 
+def test_init_state_follows_the_module() -> None:
+    """`layer.to(...).init_state(batch)` must not need a second argument.
+
+    The CPU half of this looks vacuous and is not: the state used to be built
+    with `device=None`, which is correct on a CPU-only box and in CI, and a
+    device mismatch on the first `step()` of a GPU run.  A default that is
+    right exactly where it is tested is the one worth pinning.
+
+    Dtype deliberately does NOT follow the module here -- the buffer is fp32
+    because the kernels are.  That differs from GatedDeltaNet and the
+    docstring says why, so it is asserted rather than left to drift.
+    """
+    layer = _layer(window=8)
+    reference = layer.q_proj.weight
+    state = layer.init_state(batch=2)
+    assert state.keys.device == reference.device
+    assert state.keys.dtype == torch.float32
+
+    layer = layer.double()
+    assert layer.init_state(batch=2).keys.dtype == torch.float32
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_both_mixers_decode_on_cuda_without_a_device_argument() -> None:
+    """The interchangeability promise, on the device where it can fail.
+
+    The CPU interchangeability test cannot catch a device bug, because on a
+    CPU-only box every wrong device default is the right one.  This is the
+    same contract asserted where it has teeth: build, move, init, step --
+    with no caller ever naming a device.
+    """
+    from lumen.gdn import GatedDeltaNet, GatedDeltaNetConfig
+
+    mixers = [
+        UndertowAttention(UndertowConfig(d_model=64, n_heads=8, window=8)),
+        GatedDeltaNet(GatedDeltaNetConfig(d_model=64, n_heads=8, chunk_size=16)),
+    ]
+    for mixer in mixers:
+        mixer = mixer.cuda()
+        state = mixer.init_state(2)
+        y, state = mixer.step(torch.randn(2, 1, 64, device="cuda"), state)
+        assert y.is_cuda, f"{type(mixer).__name__} decoded off-device"
+
+
 @pytest.mark.parametrize("window,plateau", [(8, 6), (8, None), (1, None), (5, 0)])
 def test_step_matches_forward_including_the_prefix(
     window: int, plateau: int | None

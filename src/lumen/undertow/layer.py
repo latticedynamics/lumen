@@ -327,12 +327,21 @@ class UndertowAttention(nn.Module):
     ) -> UndertowState:
         """An empty stream — a zeroed `(B, H, W-1, D)` ring buffer, ``seen=0``.
 
-        The buffer is fp32 by default because the kernels are; ``dtype`` is
-        offered for callers who have measured that something else works on
-        their hardware.
+        Device follows the layer's own parameters unless overridden, so
+        ``layer.to("cuda").init_state(batch)`` needs no second argument and
+        cannot silently produce a state on the wrong device.  It used not to,
+        and the failure mode was the bad one: correct on a CPU-only box and in
+        CI, a device mismatch on the first decode of a GPU run.
+
+        Dtype does **not** follow the module, and that asymmetry with
+        :meth:`GatedDeltaNet.init_state` is deliberate: the buffer is fp32
+        because the kernels are, whatever the surrounding module has been cast
+        to.  ``dtype`` is offered for callers who have measured that something
+        else works on their hardware.
         """
         config = self.config
         shape = (batch, config.n_heads, config.window - 1, config.d_head)
+        device = self.q_proj.weight.device if device is None else device
         zeros = torch.zeros(shape, device=device, dtype=dtype or torch.float32)
         return UndertowState(keys=zeros, values=zeros.clone(), seen=0)
 
