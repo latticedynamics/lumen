@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lumen"
-version = "0.1.0"
+version = "0.1.0a1"
 description = "One place for the components worth keeping: consolidated architectures, measured hardware capability, no assumptions."
 readme = "README.md"
 license = { text = "MIT" }
@@ -49,3 +49,10 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# CI is CPU-only and hosted; these two are deselected there and run locally
+# before tagging.  Anything a laptop cannot check is not checked automatically,
+# which is a reason to keep the reference path exact -- not to lower the bar.
+markers = [
+    "gpu: requires CUDA",
+    "triton: requires a working triton install",
+]
