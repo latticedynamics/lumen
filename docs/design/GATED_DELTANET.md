@@ -68,7 +68,7 @@ Constant in generated length — a fixed-size memory is the whole proposition.
 
 | lineage | uniquely had |
 |---|---|
-| **Sandbox** | crossed key/value grouping (§3.1); independent `expand_k`/`expand_v` with the argument for expanding the *key* side; a frozen config dataclass; the in-chunk decay clamp; fp32 and no Triton, by design |
+| **Consuming model** | crossed key/value grouping (§3.1); independent `expand_k`/`expand_v` with the argument for expanding the *key* side; a frozen config dataclass; the in-chunk decay clamp; fp32 and no Triton, by design |
 | **Streaming** | `init_state()` / `step()` / `forward(..., state=, return_state=)`; per-head learned `β` via sigmoid, zero-initialised so `β` starts *exactly* at the fixed-strength engine it replaced; a per-head geometric decay band, optionally learnable; structural masking |
 | **Trained** | the lineage with real training behind it — and, on inspection, little else the others lack: most of its length is tokenizer and corpus handling, which is exactly the coupling §5 excludes |
 | **Episodic** | **key/query centring** (§3.3); an optional kNN episodic store with a gated read |
@@ -424,6 +424,110 @@ Consolidation that silently changes numerics invalidates every experimental
 record that depended on the old code. Merge → verify → switch → evolve, as four
 steps. Not one.
 
+### 3.8 The decay is carried relatively, and the chunk size is not a modelling choice
+
+The chunkwise form absorbs the decay by writing the state as `M_t = γ_t M̃_t`,
+turning the gated recurrence into an ungated delta rule on `M̃` carrying values
+`v_t / γ_t`. That is the derivation. It is a separate question how the code
+should *compute* it, and the two answers are not numerically equivalent.
+
+**What appears in an answer is a ratio, and the ratio is bounded.** Every term
+reaching an output carries `γ_t / γ_i` for some `i ≤ t`. Writing `g = log γ`,
+which is non-increasing because `α ≤ 1`, that ratio is `exp(g_t − g_i)` with a
+non-positive exponent: it lies in `(0, 1]` **by construction**, for every pair
+the computation can form.
+
+**Factorising it splits a bounded quantity into two unbounded ones.** The
+obvious implementation materialises `γ_t` and `1/γ_i` separately and multiplies
+them back together at the end. The first shrinks, the second grows, and their
+product is the well-behaved thing — but the growing factor now exists as a
+number, and it has to survive every operation between the two.
+
+Two failures follow, and they are of different severities.
+
+- **Overflow.** In a format with maximum finite value `F`, `1/γ` is
+  unrepresentable once accumulated decay within a chunk exceeds `ln F` — about
+  `88.7` in binary32, about `709` in binary64. Past that the value is `inf`, and
+  since a fully-decayed contribution is multiplied by something approaching
+  zero, the next step is `inf · 0 = nan` and the whole batch is lost.
+- **Dynamic range within one accumulation.** Long before overflow, a sum mixing
+  terms whose `1/γ` differ by more than the format's precision — `2⁻ᵖ` for a
+  `p`-bit significand — loses the small terms into the rounding error of the
+  large ones. In a delta rule the small term is the *recent* position and the
+  large one is the stale position being forgotten, so the precision is lost
+  exactly where the layer is supposed to be paying attention.
+
+**The relative form computes the ratio directly.** `rel[t, i] = exp(g_t − g_i)`,
+formed once and used where `i ≤ t`. Neither half is ever built, nothing exceeds
+`1`, and the only reachable failure is underflow to zero — which is the *correct
+answer*, meaning that position has fully decayed. The failure mode inverts from
+"produce a poison value" to "round a negligible contribution to nothing."
+
+**Carrying it costs one masked multiply, because the decay commutes with the
+inverse.** The UT/WY transform inverts `I + N` for strictly-lower-triangular
+`N`. For lower-triangular `A`, `B` and any `D[i,j] = d_i / d_j`,
+
+```
+    (A ⊙ D)(B ⊙ D) = (A B) ⊙ D
+```
+
+since the intermediate factors telescope. So `A ↦ A ⊙ D` is an algebra
+homomorphism on lower-triangular matrices, `I ⊙ D = I`, and therefore it
+commutes with inversion:
+
+```
+    (I + N ⊙ D)⁻¹ = (I + N)⁻¹ ⊙ D
+```
+
+Folding the relative decay into `N` *before* the solve yields the correctly
+scaled inverse for free. The scaled quantities differ from the unscaled ones by
+a factor of `γ_i` per row, which is exactly the factor the readout and the state
+update would otherwise have had to divide back out.
+
+The cost is a `[C, C]` tensor where a `[C]` vector sufficed, and it folds into
+masks the kernel already builds, so it is two elementwise operations on tensors
+already in flight.
+
+**Rejected: recentring the exponent.** Shifting the accumulated decay to
+`±half` instead of `0..full` doubles the usable range at the same precision. It
+is a partial fix that still changes numerics, and if the verification cost is
+being paid it should buy the whole thing.
+
+#### Why this deletes a configuration option rather than retuning one
+
+An implementation that materialises `1/γ` needs a ceiling on accumulated decay
+within a chunk to stay in range. Such a ceiling is a bound on `Σ log α` over `C`
+positions, so it implies a **shortest expressible half-life** of
+
+```
+    C · ln 2 / ceiling
+```
+
+which is *linear in the chunk size*. The chunk size exists to tile the sequence
+for the hardware. Under a ceiling it also decides how fast a head is permitted
+to forget, and raising it for throughput silently lengthens the shortest memory
+the model can represent — a performance dial reaching into the hypothesis class.
+
+That is the class of defect this repository exists to catch, so the option is
+**removed rather than given a better default**. A parameter whose correct value
+depends on a parameter chosen for unrelated reasons is not a parameter worth
+tuning. With the relative form there is no range to bound and nothing to
+configure: `chunk_size` becomes what it claims to be.
+
+The clamp's reach is visible in the call graph as well as the algebra. It had to
+be applied where the features are computed, upstream of *both* the chunkwise and
+the single-step paths, because a model trained under a binding floor must decode
+under the same one. But the single-step path never forms a cumulative product
+and never had the numerical problem. A guard can live next to its hazard; this
+one could not, which is what a modelling constraint looks like from the outside.
+
+**This change is not numerically transparent and is not meant to be.** It is the
+`evolve` in merge → verify → switch → evolve, taken deliberately and after the
+switch, so that "this layer differs from the one it replaced" and "the new
+factorisation differs from the old one" remain separable questions. A consumer
+carrying an experimental record across it is comparing two model classes, not
+two implementations.
+
 ---
 
 ## 4. Relation to existing work
@@ -473,14 +577,16 @@ motivates it is elementary.
 
 ## 5. What the consolidated layer is
 
-Shape and streaming from the streaming lineage, state algebra from the sandbox
-lineage, centring from the episodic lineage, head layout generalised so the
+Shape and streaming from the streaming lineage, state algebra from the
+consuming-model lineage, centring from the episodic lineage, head layout generalised so the
 ordinary arrangement is reachable:
 
 - frozen `GatedDeltaNetConfig`, validated on construction, with `d_model` and
-  `n_heads` the only required arguments — the layout and the width ratio have
-  earned defaults (§3.5), and a layout passed explicitly is **cross-checked**
-  against `n_heads` rather than silently overriding it
+  `layout` the only required arguments — the width ratio has an earned default
+  (§3.5), and `n_heads` is a **property derived from the layout** rather than a
+  second field. A head count does not determine a head arrangement, so a config
+  accepting one would have to choose on the caller's behalf (§3.1); making the
+  layout explicit is the same argument as §3.2's, applied to the constructor
 - `init_state()` / `step()` / `forward(..., state=, return_state=)` — the house
   interface, so a block can hold this or Undertow interchangeably
 - head layout as a `(key group, value group)` assignment, with named
@@ -521,13 +627,28 @@ Before any project switches to this layer:
    with fp32 round-off, not to 1e-9 (§3.7).
 2. **`step()` == `forward()`** to `1e-9` in fp64, and state carried across a
    chunked `forward` == one pass, split at several points.
-3. **The port reproduces the originating lineage** to `1e-9` in fp64 from
-   transferred weights, forward and step (§3.7).
+3. ~~**The port reproduces the originating lineage**~~ — **discharged, and no
+   longer runnable.** It was met exactly (`0.0e+00`, not merely within
+   tolerance) and then deliberately spent by §3.8's reformulation, which changes
+   what this layer computes on purpose. A gate whose premise the project has
+   since chosen to abandon is history, not a check; the sequential path in the
+   reference is what the kernel is now answerable to.
 4. **Peak memory flat** across a 4× sweep of generated length.
 5. **Zero-initialised centring is an exact identity** — same outputs, bit for
    bit, as the same weights without it. The claim in §3.3 is "by construction",
    and a construction claim should be held by a test rather than a comment.
 6. The three inverse implementations agree, and the reference is the forward
    substitution (§3.6).
+7. **The chunk size is inert**, at decay strong enough that a `1/γ`
+   factorisation could not have represented it: outputs agree across a sweep of
+   chunk sizes to fp64 round-off (§3.8). This is the gate the decay
+   reformulation exists for — a numerics change with no behavioural test is
+   indistinguishable from a refactor.
+8. **No overflow at extreme decay.** Accumulated decay within a chunk set well
+   past the fp32 `exp` ceiling produces finite outputs, and fully-decayed
+   contributions are zero rather than `nan` (§3.8).
+9. **The shortest expressible half-life does not depend on the chunk size.**
+   Driving `α` low yields the same half-life at every chunk size, and one below
+   `C · ln2 / 8` — the floor the removed ceiling would have imposed.
 
 Merge → verify → switch → evolve, as four steps. Not one.

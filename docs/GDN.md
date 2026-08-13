@@ -11,14 +11,20 @@ which are not, what is deliberately excluded — is in
 [the design record](design/GATED_DELTANET.md). This page is how to use it.
 
 ```python
-from lumen.gdn import GatedDeltaNet, GatedDeltaNetConfig
+from lumen.gdn import GatedDeltaNet, GatedDeltaNetConfig, HeadLayout
 
-mixer = GatedDeltaNet(GatedDeltaNetConfig(d_model=512, n_heads=8))
+mixer = GatedDeltaNet(GatedDeltaNetConfig(d_model=512, layout=HeadLayout.shared_key(8)))
 y = mixer(x)                                   # (B, T, 512) -> (B, T, 512)
 ```
 
-`d_model` and `n_heads` are the only required arguments. Everything else has a
+`d_model` and `layout` are the only required arguments. Everything else has a
 default, and the two that matter are discussed below.
+
+**There is no `n_heads` argument, and that is deliberate.** It is a read-only
+property derived from the layout. A head count does not determine a head
+*arrangement* — `shared_key(8)`, `diagonal(8)` and `crossed(2, 4)` are all eight
+heads and all different models — so a config taking `n_heads=8` has to pick one
+of them on your behalf. This one makes you say which.
 
 ---
 
@@ -92,25 +98,28 @@ your data.
 ## Head layout
 
 A head is a `(key group, value group)` pair. Four named layouts cover the cases
-anyone runs, and the default is `shared_key`:
+anyone runs, and `shared_key` is the one to reach for if you are unsure:
 
 ```python
 from lumen.gdn import HeadLayout
 
-HeadLayout.shared_key(8)      # default: one address space, 8 payloads
+HeadLayout.shared_key(8)      # the ordinary choice: one address space, 8 payloads
 HeadLayout.diagonal(8)        # one key and one value per head
 HeadLayout.crossed(2, 4)      # every (key group, value group) pair
 HeadLayout.shared_value(8)    # 8 address spaces, one payload
 ```
 
-Pass one explicitly when you want it, and `n_heads` is cross-checked against it:
+The layout is the only place the head count lives:
 
 ```python
-GatedDeltaNetConfig(d_model=512, n_heads=8, layout=HeadLayout.crossed(2, 4))
+config = GatedDeltaNetConfig(d_model=512, layout=HeadLayout.crossed(2, 4))
+config.n_heads       # 8, derived -- there is no second field to disagree with
 ```
 
-A layout that disagrees with `n_heads` is an error at construction rather than a
-quietly different model.
+`n_heads` was a separate argument until 0.3, cross-checked against the layout at
+construction. Deriving it makes disagreement *unrepresentable* rather than
+*detected*, which is the stronger guarantee: there is no state in which the two
+are both present and wrong.
 
 Two things worth knowing before choosing one. `α` and `β` live on the **key
 group**, so the layout also decides how many independent forgetting timescales
