@@ -196,11 +196,23 @@ class ShortConv(nn.Module):
 
         if u.shape[-1] == self.size:
             # Decode.  A depthwise convolution over exactly one output position
-            # is a weighted sum of `size` values, and calling `conv1d` for it
-            # costs the same as calling it for a whole training sequence --
-            # the time is dispatch, not arithmetic, and grouped convolution
-            # dispatch scales with the channel count.  Measured on one machine:
-            # ~450x, and it is 95% of a decode step.
+            # is a weighted sum of `size` values, and a library call for it is
+            # dominated by dispatch rather than arithmetic -- grouped convolution
+            # dispatch scales with the channel count, not with the work.
+            #
+            # The size of that win is a fact about a machine, so: measured on one
+            # box, batch 8, width 4, fp32, against this same function forced
+            # through `conv1d`.  On its CPU, 164x at 128 channels falling to 1.7x
+            # by 2048 -- the win is largest exactly where dispatch dominates and
+            # narrows as the elementwise work below becomes real.  On its Tesla
+            # P40, 0.87x: about 11 us *slower* per call, flat across that whole
+            # channel range, because there both paths are pure launch overhead
+            # and this one issues one extra kernel.
+            #
+            # The branch is unconditional on purpose.  13% on one device against
+            # up to 164x on another is not a close trade, and a device-dependent
+            # branch would have to be probed rather than assumed -- see
+            # `lumen.probe` for why this package does not read hardware flags.
             #
             # This is arithmetically the same sum, but not bit-identical to
             # cuDNN/oneDNN's accumulation order -- order 1e-15 in fp64, six
