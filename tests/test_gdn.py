@@ -291,7 +291,6 @@ def make_layer(layout=None, **overrides):
     config = GatedDeltaNetConfig(
         **{
             "d_model": 64,
-            "n_heads": layout.n_heads,
             "layout": layout,
             "expand_k": 2.0,
             "expand_v": 1.0,
@@ -316,31 +315,56 @@ def test_layer_forward_shape_and_finiteness(name):
 
 def test_config_rejects_bad_values():
     with pytest.raises(ValueError, match="power of two"):
-        GatedDeltaNetConfig(d_model=64, n_heads=8, chunk_size=24)
+        GatedDeltaNetConfig(d_model=64, layout=HeadLayout.shared_key(8), chunk_size=24)
     with pytest.raises(ValueError, match="divide evenly"):
-        GatedDeltaNetConfig(d_model=12, n_heads=8, expand_k=1.0)
+        GatedDeltaNetConfig(d_model=12, layout=HeadLayout.shared_key(8), expand_k=1.0)
     with pytest.raises(ValueError, match="expand_k must be > 0"):
-        GatedDeltaNetConfig(d_model=64, n_heads=8, expand_k=0.0)
+        GatedDeltaNetConfig(d_model=64, layout=HeadLayout.shared_key(8), expand_k=0.0)
     with pytest.raises(ValueError, match="dropout"):
-        GatedDeltaNetConfig(d_model=64, n_heads=8, dropout=1.0)
-    with pytest.raises(ValueError, match="n_heads must be >= 1"):
-        GatedDeltaNetConfig(d_model=64, n_heads=0)
+        GatedDeltaNetConfig(d_model=64, layout=HeadLayout.shared_key(8), dropout=1.0)
+    with pytest.raises(TypeError, match="layout must be a HeadLayout"):
+        GatedDeltaNetConfig(d_model=64, layout=8)
 
 
 def test_the_common_case_is_one_call():
-    """A library people depend on should not need a layout object to get going."""
-    config = GatedDeltaNetConfig(d_model=512, n_heads=8)
-    assert config.layout == HeadLayout.shared_key(8)
+    config = GatedDeltaNetConfig(d_model=512, layout=HeadLayout.shared_key(8))
     assert config.d_k == 128 and config.d_v == 64
     assert GatedDeltaNet(config)(torch.randn(1, 8, 512)).shape == (1, 8, 512)
 
 
-def test_layout_and_n_heads_are_cross_checked():
-    """Over-determined on purpose: disagreement is an error, not a silent model."""
-    ok = GatedDeltaNetConfig(d_model=64, n_heads=8, layout=HeadLayout.crossed(2, 4))
-    assert ok.layout.n_heads == 8
-    with pytest.raises(ValueError, match="pass one or the other"):
-        GatedDeltaNetConfig(d_model=64, n_heads=8, layout=HeadLayout.crossed(2, 2))
+def test_n_heads_is_derived_and_cannot_disagree_with_the_layout():
+    """It used to be a second field cross-checked into agreement (0.2 §6.4).
+
+    Deriving makes disagreement *unrepresentable* rather than *detected*, which
+    is the stronger guarantee -- there is no state in which the two are both
+    present and wrong, so there is nothing left to validate.  Assigning to it
+    fails because a property has no setter, which is the same fact from the
+    other direction.
+    """
+    config = GatedDeltaNetConfig(d_model=64, layout=HeadLayout.crossed(2, 4))
+    assert config.n_heads == 8 == config.layout.n_heads
+
+    with pytest.raises(AttributeError):
+        config.n_heads = 4  # type: ignore[misc]
+
+    # And the head count follows the layout wherever it goes.
+    for layout in LAYOUTS.values():
+        assert GatedDeltaNetConfig(d_model=64, layout=layout).n_heads == layout.n_heads
+
+
+def test_layout_is_required_because_a_head_count_does_not_imply_one():
+    """`n_heads=8` used to mean `shared_key(8)` silently.  That was a decision.
+
+    The layout module's whole argument is that "8 heads" does not determine an
+    arrangement -- diagonal, shared-key and crossed(2,4) are all eight heads and
+    all different models.  A default picked one of them without saying so.
+    """
+    with pytest.raises(TypeError):
+        GatedDeltaNetConfig(d_model=64)  # type: ignore[call-arg]
+
+    eight = [HeadLayout.shared_key(8), HeadLayout.diagonal(8), HeadLayout.crossed(2, 4)]
+    assert all(layout.n_heads == 8 for layout in eight)
+    assert len({layout.describe() for layout in eight}) == 3, "same count, three models"
 
 
 def test_layer_backward_reaches_every_parameter():
@@ -716,7 +740,7 @@ def test_it_is_interchangeable_with_undertow():
 
     x = torch.randn(2, 32, 64)
     mixers = [
-        GatedDeltaNet(GatedDeltaNetConfig(d_model=64, n_heads=8, chunk_size=16)),
+        GatedDeltaNet(GatedDeltaNetConfig(d_model=64, layout=HeadLayout.shared_key(8), chunk_size=16)),
         UndertowAttention(UndertowConfig(d_model=64, n_heads=8, window=8)),
     ]
     for mixer in mixers:
@@ -732,7 +756,7 @@ def test_it_is_interchangeable_with_undertow():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_layer_runs_on_cuda_end_to_end():
     layer = GatedDeltaNet(
-        GatedDeltaNetConfig(d_model=64, n_heads=8, chunk_size=16)
+        GatedDeltaNetConfig(d_model=64, layout=HeadLayout.shared_key(8), chunk_size=16)
     ).cuda()
     x = torch.randn(2, 100, 64, device="cuda")
     y, state = layer(x, return_state=True)

@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from lumen.gdn import GatedDeltaNet, GatedDeltaNetConfig
+from lumen.gdn import GatedDeltaNet, GatedDeltaNetConfig, HeadLayout
 from lumen.nn import RMSNorm, rms_norm
 from lumen.undertow import UndertowAttention, UndertowConfig
 
@@ -66,7 +66,7 @@ def test_module_computes_in_fp32_and_restores_the_input_dtype():
 
 
 LAYERS = [
-    lambda: GatedDeltaNet(GatedDeltaNetConfig(d_model=128, n_heads=4, expand_k=2.0)),
+    lambda: GatedDeltaNet(GatedDeltaNetConfig(d_model=128, layout=HeadLayout.shared_key(4), expand_k=2.0)),
     lambda: UndertowAttention(UndertowConfig(d_model=128, n_heads=4, window=8)),
 ]
 

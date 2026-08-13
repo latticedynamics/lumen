@@ -78,9 +78,12 @@ class GatedDeltaNetConfig:
 
     Args:
         d_model:  Residual stream width.
-        layout:   Which key and value each state uses.  **The source of truth
-                  for the head count** — ``n_heads`` is derived from it, so the
-                  two cannot disagree.  See :mod:`lumen.gdn.layout`.
+        layout:   Which key and value each state uses, and **the only place the
+                  head count is stored** — ``n_heads`` is a property derived
+                  from it, so the two cannot disagree.  Required: "8 heads" does
+                  not determine an arrangement, so there is no honest default.
+                  ``HeadLayout.shared_key(8)`` is the ordinary one.  See
+                  :mod:`lumen.gdn.layout`.
         expand_k: Total key width as a multiple of ``d_model``; per-state
                   ``d_k = expand_k · d_model / H``.  **Required.**  Since
                   ``rank(M) ≤ min(d_k, d_v)``, this is the dial that buys
@@ -106,10 +109,9 @@ class GatedDeltaNetConfig:
     """
 
     d_model: int
-    n_heads: int
+    layout: HeadLayout
     expand_k: float = 2.0
     expand_v: float = 1.0
-    layout: HeadLayout | None = None
     chunk_size: int = 64
     conv_size: int = 4
     beta_max: float = 2.0
@@ -120,19 +122,10 @@ class GatedDeltaNetConfig:
     def __post_init__(self) -> None:
         if self.d_model < 1:
             raise ValueError(f"d_model must be >= 1, got {self.d_model}")
-        if self.n_heads < 1:
-            raise ValueError(f"n_heads must be >= 1, got {self.n_heads}")
-
-        # `layout` and `n_heads` over-determine each other on purpose: the
-        # default is derived, and an explicit one is cross-checked.  That turns
-        # "changed n_heads, forgot the layout" from a silently different model
-        # into an error at construction.
-        if self.layout is None:
-            object.__setattr__(self, "layout", HeadLayout.shared_key(self.n_heads))
-        elif self.layout.n_heads != self.n_heads:
-            raise ValueError(
-                f"layout has {self.layout.n_heads} heads but n_heads={self.n_heads}; "
-                f"pass one or the other, or make them agree"
+        if not isinstance(self.layout, HeadLayout):
+            raise TypeError(
+                f"layout must be a HeadLayout, got {type(self.layout).__name__}; "
+                f"try HeadLayout.shared_key(n) for the ordinary arrangement"
             )
 
         if self.chunk_size < 1 or self.chunk_size & (self.chunk_size - 1):
@@ -160,6 +153,19 @@ class GatedDeltaNetConfig:
                     f"{name} = {expand} is too small for {self.n_heads} heads "
                     f"at d_model = {self.d_model}"
                 )
+
+    @property
+    def n_heads(self) -> int:
+        """Derived from `layout`, which is the only place head count is stored.
+
+        These used to be two fields cross-checked into agreement in
+        ``__post_init__``.  Deriving instead makes disagreement *unrepresentable*
+        rather than *detected*, which is a different and better guarantee — and
+        it removes a hidden decision, because `n_heads=8` silently meant
+        ``shared_key(8)`` and the whole argument of :mod:`lumen.gdn.layout` is
+        that "8 heads" does not determine an arrangement.
+        """
+        return self.layout.n_heads
 
     @property
     def d_k(self) -> int:
