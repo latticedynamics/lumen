@@ -108,7 +108,8 @@ def test_head_norm_stays_a_flat_parameter(build):
 
     The mixers share :func:`rms_norm` rather than holding an :class:`RMSNorm`,
     because a submodule prefixes its parameters and would rename this key.
-    Every archived checkpoint, and Luminous's legacy remap, address it flat.
+    Every archived checkpoint, and every downstream legacy remap, addresses it
+    flat.
     Tidying the parameter into a submodule is the obvious-looking change this
     test exists to fail.
     """
