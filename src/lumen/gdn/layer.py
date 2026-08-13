@@ -42,6 +42,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from lumen.gdn.layout import HeadLayout
+from lumen.nn import rms_norm
 from lumen.gdn.reference import (
     assign_values,
     chunk_gated_delta,
@@ -360,9 +361,12 @@ class GatedDeltaNet(nn.Module):
         config = self.config
         batch, _, _, seq_len, _ = o.shape
 
+        # The fp32 promotion is the caller's, not the norm's: it covers this
+        # whole output path, and 0.2 Phase 4 flagged it as making a whole-layer
+        # fp64 comparison fp32-limited by construction.  Keeping it visible here
+        # is what leaves it available to be reconsidered.
         o = o.permute(0, 3, 1, 2, 4).float()
-        o = o * torch.rsqrt(o.pow(2).mean(-1, keepdim=True) + config.norm_eps)
-        o = o * self.head_norm.float()
+        o = rms_norm(o, self.head_norm, config.norm_eps)
         o = o.reshape(batch, seq_len, config.n_heads * config.d_v).to(x.dtype)
         return self.dropout(self.o_proj(o * F.silu(self.g_proj(x))))
 

@@ -45,6 +45,7 @@ from lumen.gdn import (
     GatedDeltaNetState,
     HeadLayout,
 )
+from lumen.nn import RMSNorm, rms_norm
 from lumen.undertow import UndertowAttention, UndertowConfig
 from lumen.probe import (
     ArchFacts,
@@ -86,6 +87,9 @@ __all__ = [
     "GatedDeltaNetConfig",
     "GatedDeltaNetState",
     "HeadLayout",
+    # nn
+    "RMSNorm",
+    "rms_norm",
     # undertow
     "UndertowAttention",
     "UndertowConfig",
