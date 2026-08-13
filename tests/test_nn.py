@@ -65,14 +65,44 @@ def test_module_computes_in_fp32_and_restores_the_input_dtype():
     assert torch.equal(out, expected)
 
 
-@pytest.mark.parametrize(
-    "build",
-    [
-        lambda: GatedDeltaNet(GatedDeltaNetConfig(d_model=128, n_heads=4, expand_k=2.0)),
-        lambda: UndertowAttention(UndertowConfig(d_model=128, n_heads=4, window=8)),
-    ],
-    ids=["gdn", "undertow"],
-)
+LAYERS = [
+    lambda: GatedDeltaNet(GatedDeltaNetConfig(d_model=128, n_heads=4, expand_k=2.0)),
+    lambda: UndertowAttention(UndertowConfig(d_model=128, n_heads=4, window=8)),
+]
+
+
+@pytest.mark.parametrize("build", LAYERS, ids=["gdn", "undertow"])
+def test_out_path_promotes_and_never_demotes(build):
+    """An fp64 caller must not be silently capped at fp32 by the output path.
+
+    ``.float()`` casts to *exactly* fp32: a promotion for fp16 and bf16, a
+    demotion for fp64.  The probe is two inputs that fp32 cannot tell apart --
+    they differ by 1e-10 at unit scale, well under fp32's 1.2e-7 epsilon -- so
+    an output path that rounds through fp32 returns bit-identical results for
+    both, and one that promotes does not.
+
+    Perturbing a single element rather than scaling: RMS normalisation is
+    scale-invariant, so a uniform rescale would cancel and the probe would pass
+    for the wrong reason.
+    """
+    torch.manual_seed(0)
+    layer = build().double().eval()
+    x = torch.randn(1, 8, 128, dtype=torch.float64)
+
+    a = torch.randn(1, 8, 128, dtype=torch.float64)
+    b = a.clone()
+    b[0, 0, 0] += 1e-10
+
+    assert torch.equal(a.float(), b.float()), "probe is invalid: fp32 can see the difference"
+
+    with torch.no_grad():
+        ya, yb = layer(a + x * 0), layer(b + x * 0)
+    ya = ya[0] if isinstance(ya, tuple) else ya
+    yb = yb[0] if isinstance(yb, tuple) else yb
+    assert not torch.equal(ya, yb), "output path rounded an fp64 difference away"
+
+
+@pytest.mark.parametrize("build", LAYERS, ids=["gdn", "undertow"])
 def test_head_norm_stays_a_flat_parameter(build):
     """``head_norm``, not ``head_norm.weight`` -- a checkpoint compatibility test.
 

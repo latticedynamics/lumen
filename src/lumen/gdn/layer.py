@@ -361,11 +361,17 @@ class GatedDeltaNet(nn.Module):
         config = self.config
         batch, _, _, seq_len, _ = o.shape
 
-        # The fp32 promotion is the caller's, not the norm's: it covers this
-        # whole output path, and 0.2 Phase 4 flagged it as making a whole-layer
-        # fp64 comparison fp32-limited by construction.  Keeping it visible here
-        # is what leaves it available to be reconsidered.
-        o = o.permute(0, 3, 1, 2, 4).float()
+        # Promote to *at least* fp32, rather than `.float()`, which casts to
+        # exactly fp32 -- a promotion for fp16 and bf16 and a silent demotion
+        # for fp64.  The reduction inside the norm genuinely needs the headroom
+        # (a mean of squares underflows in fp16), but nothing here wants an fp64
+        # caller quietly capped at fp32: it floors a whole-layer fp64 comparison
+        # around 6e-8, which is fp32 epsilon and eight orders off what the
+        # kernel's own oracle checks at.  Every dtype below fp64 is unaffected.
+        #
+        # The promotion stays at the call site rather than inside `rms_norm`
+        # because it covers this whole output path, not the norm alone.
+        o = o.permute(0, 3, 1, 2, 4).to(torch.promote_types(o.dtype, torch.float32))
         o = rms_norm(o, self.head_norm, config.norm_eps)
         o = o.reshape(batch, seq_len, config.n_heads * config.d_v).to(x.dtype)
         return self.dropout(self.o_proj(o * F.silu(self.g_proj(x))))
