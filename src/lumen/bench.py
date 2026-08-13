@@ -67,6 +67,22 @@ class BenchResult:
         return self.batch * self.seq_len / (self.fwd_bwd_ms / 1000.0)
 
 
+def _sync(device: torch.device) -> None:
+    """Block until `device` has finished the work already queued on it.
+
+    On CUDA this is what makes the timing mean anything: a launch returns
+    immediately, so timing without it measures the dispatch and not the kernel.
+    On CPU the work is complete when the call returns and there is nothing to
+    wait for, so the honest implementation is to do nothing.
+
+    Branching on `device.type` rather than on `torch.cuda.is_available()`: the
+    question is what this measurement is running on, not what the machine has.
+    A CPU cell on a GPU box must take the CPU path.
+    """
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
 def _time(fn: Callable[[], Any], warmup: int, reps: int, device: torch.device) -> float:
     """Median wall-clock ms per call.
 
@@ -75,12 +91,12 @@ def _time(fn: Callable[[], Any], warmup: int, reps: int, device: torch.device) -
     """
     for _ in range(warmup):
         fn()
-    torch.cuda.synchronize(device)
+    _sync(device)
     samples: list[float] = []
     for _ in range(reps):
         start = time.perf_counter()
         fn()
-        torch.cuda.synchronize(device)
+        _sync(device)
         samples.append((time.perf_counter() - start) * 1000.0)
     return statistics.median(samples)
 
@@ -130,7 +146,14 @@ def benchmark_layer(
             error=f"{type(exc).__name__}: {exc}"[:160],
         )
     finally:
-        torch.cuda.empty_cache()
+        # Same condition as `_sync`, for a different reason.  This one does not
+        # raise on CPU -- `empty_cache()` returns early when CUDA was never
+        # initialised -- so it is correct by accident on a CPU-only box and
+        # wrong everywhere else: on a GPU box, timing a CPU layer would flush
+        # the CUDA allocator once per cell for no reason.  A measurement should
+        # not have side effects on a device it is not measuring.
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
 
 def compare(
