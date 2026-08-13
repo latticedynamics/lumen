@@ -11,14 +11,20 @@ which are not, what is deliberately excluded — is in
 [the design record](design/GATED_DELTANET.md). This page is how to use it.
 
 ```python
-from lumen.gdn import GatedDeltaNet, GatedDeltaNetConfig
+from lumen.gdn import GatedDeltaNet, GatedDeltaNetConfig, HeadLayout
 
-mixer = GatedDeltaNet(GatedDeltaNetConfig(d_model=512, n_heads=8))
+mixer = GatedDeltaNet(GatedDeltaNetConfig(d_model=512, layout=HeadLayout.shared_key(8)))
 y = mixer(x)                                   # (B, T, 512) -> (B, T, 512)
 ```
 
-`d_model` and `n_heads` are the only required arguments. Everything else has a
+`d_model` and `layout` are the only required arguments. Everything else has a
 default, and the two that matter are discussed below.
+
+**There is no `n_heads` argument, and that is deliberate.** It is a read-only
+property derived from the layout. A head count does not determine a head
+*arrangement* — `shared_key(8)`, `diagonal(8)` and `crossed(2, 4)` are all eight
+heads and all different models — so a config taking `n_heads=8` has to pick one
+of them on your behalf. This one makes you say which.
 
 ---
 
@@ -92,25 +98,28 @@ your data.
 ## Head layout
 
 A head is a `(key group, value group)` pair. Four named layouts cover the cases
-anyone runs, and the default is `shared_key`:
+anyone runs, and `shared_key` is the one to reach for if you are unsure:
 
 ```python
 from lumen.gdn import HeadLayout
 
-HeadLayout.shared_key(8)      # default: one address space, 8 payloads
+HeadLayout.shared_key(8)      # the ordinary choice: one address space, 8 payloads
 HeadLayout.diagonal(8)        # one key and one value per head
 HeadLayout.crossed(2, 4)      # every (key group, value group) pair
 HeadLayout.shared_value(8)    # 8 address spaces, one payload
 ```
 
-Pass one explicitly when you want it, and `n_heads` is cross-checked against it:
+The layout is the only place the head count lives:
 
 ```python
-GatedDeltaNetConfig(d_model=512, n_heads=8, layout=HeadLayout.crossed(2, 4))
+config = GatedDeltaNetConfig(d_model=512, layout=HeadLayout.crossed(2, 4))
+config.n_heads       # 8, derived -- there is no second field to disagree with
 ```
 
-A layout that disagrees with `n_heads` is an error at construction rather than a
-quietly different model.
+`n_heads` was a separate argument until 0.3, cross-checked against the layout at
+construction. Deriving it makes disagreement *unrepresentable* rather than
+*detected*, which is the stronger guarantee: there is no state in which the two
+are both present and wrong.
 
 Two things worth knowing before choosing one. `α` and `β` live on the **key
 group**, so the layout also decides how many independent forgetting timescales
@@ -135,13 +144,40 @@ one training scale on one corpus — if your setting differs, measure.
 
 | option | default | what it does |
 |---|---|---|
-| `chunk_size` | 64 | Parallel block size. A power of two. Performance only. |
+| `chunk_size` | 64 | Parallel block size. A power of two. **Performance only** — it does not enter the answer, and it does not bound what the layer can represent. See below. |
 | `conv_size` | 4 | Short causal depthwise convolution on q/k/v. Local mixing, not a positional code — it carries relative offsets only. `0` disables it. |
 | `beta_max` | 2.0 | Write-strength ceiling. Above 1 the update becomes a reflection rather than only a contraction. |
-| `max_chunk_decay` | 8.0 | Bounds accumulated decay within a chunk, which keeps the chunkwise form's `1/γ` in range. |
 | `centre` | `False` | Learned per-head key/query centres, subtracted before the l2 norm. Zero-initialised, so switching it on is an exact no-op until training moves it. |
 | `norm_eps` | 1e-5 | Output RMSNorm epsilon. |
 | `dropout` | 0.0 | Applied after the output projection. |
+
+### Why `chunk_size` is only performance
+
+Worth stating explicitly, because for a while it was not true here.
+
+The chunkwise form absorbs the decay by writing the state as `M_t = γ_t M̃_t`.
+Everything that reaches an output is then the ratio `γ_t / γ_i` for `i ≤ t`,
+which lies in `(0, 1]`. The direct way to compute that is `exp(g_t − g_i)` for
+`g = log γ`; the tempting way is `γ_t · (1/γ_i)`, which reaches the same answer
+through a factor that grows without bound. In fp32, `1/γ` passes the largest
+representable value once accumulated decay within a chunk exceeds ≈88.7.
+
+A layer computing it the second way needs a ceiling on accumulated decay to stay
+in range — and that ceiling is a bound on `Σ log α` *within one chunk*, so it
+implies a shortest expressible half-life of
+
+```
+    chunk_size · ln 2 / ceiling
+```
+
+which is **linear in the chunk size**. A parameter chosen to tile the sequence
+for the GPU then decides how fast a head is permitted to forget, and raising it
+for throughput silently lengthens the shortest memory the model can express.
+
+This implementation forms the relative decay directly, so no ceiling exists and
+no such coupling exists. If you are comparing against an implementation that has
+a `max_chunk_decay`, `decay_bound` or similar, that is what it is for — and its
+`chunk_size` is not a free parameter in the way this one is.
 
 ## Positional encoding
 

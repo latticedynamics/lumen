@@ -48,8 +48,19 @@ LAYOUTS = {
 }
 
 
-def make_inputs(layout, seq_len=128, chunk=32, batch=2, d_k=16, d_v=12, dtype=torch.float64):
-    """Kernel-shaped inputs obeying the layer's own invariants."""
+def make_inputs(layout, seq_len=128, batch=2, d_k=16, d_v=12, dtype=torch.float64):
+    """Kernel-shaped inputs obeying the layer's own invariants.
+
+    **The decay is unclamped, deliberately.**  This fixture used to end with
+    ``.clamp(min=-8.0 / chunk)`` -- `max_chunk_decay` hard-coded into the test
+    inputs -- so every equivalence test ran inside the range the old `1/gamma`
+    factorisation could survive, and none of them ever visited the range it
+    could not.  With the clamp gone from the layer, leaving it here would have
+    made these tests pass without exercising anything the change opened up.
+    Unclamped `-softplus(randn)` accumulates to roughly `-110` over 128
+    positions, which is past fp32's `exp` ceiling of 88.7 and would have been
+    `nan` under the old form.
+    """
     g_k = layout.n_key_groups
     m = layout.states_per_key_group
     q = F.normalize(torch.randn(batch, g_k, m, seq_len, d_k, dtype=dtype), dim=-1)
@@ -58,9 +69,7 @@ def make_inputs(layout, seq_len=128, chunk=32, batch=2, d_k=16, d_v=12, dtype=to
         torch.randn(batch, seq_len, layout.n_value_groups, d_v, dtype=dtype), layout
     )
     beta = 2.0 * torch.sigmoid(torch.randn(batch, g_k, 1, seq_len, dtype=dtype))
-    log_alpha = -F.softplus(
-        torch.randn(batch, g_k, 1, seq_len, dtype=dtype)
-    ).clamp(min=-8.0 / chunk)
+    log_alpha = -F.softplus(torch.randn(batch, g_k, 1, seq_len, dtype=dtype))
     return q, k, v, beta, log_alpha
 
 
@@ -179,7 +188,7 @@ def test_chunkwise_is_independent_of_chunk_size(chunk):
     """Chunking is an implementation detail; the answer must not know about it."""
     torch.manual_seed(0)
     layout = LAYOUTS["shared_key"]
-    q, k, v, beta, log_alpha = make_inputs(layout, seq_len=128, chunk=128)
+    q, k, v, beta, log_alpha = make_inputs(layout, seq_len=128)
 
     out, state = chunk_gated_delta(q, k, v, beta, log_alpha, chunk)
     out_seq, state_seq = sequential_gated_delta(q, k, v, beta, log_alpha)
@@ -225,7 +234,7 @@ def test_zero_beta_is_pure_decay():
     """A sanity anchor with a closed form: no writes means the state only fades."""
     torch.manual_seed(0)
     layout = LAYOUTS["shared_key"]
-    q, k, v, beta, log_alpha = make_inputs(layout, seq_len=64, chunk=16)
+    q, k, v, beta, log_alpha = make_inputs(layout, seq_len=64)
     beta = torch.zeros_like(beta)
 
     memory = torch.randn(2, 1, 8, 16, 12, dtype=torch.float64)
@@ -282,7 +291,6 @@ def make_layer(layout=None, **overrides):
     config = GatedDeltaNetConfig(
         **{
             "d_model": 64,
-            "n_heads": layout.n_heads,
             "layout": layout,
             "expand_k": 2.0,
             "expand_v": 1.0,
@@ -307,31 +315,56 @@ def test_layer_forward_shape_and_finiteness(name):
 
 def test_config_rejects_bad_values():
     with pytest.raises(ValueError, match="power of two"):
-        GatedDeltaNetConfig(d_model=64, n_heads=8, chunk_size=24)
+        GatedDeltaNetConfig(d_model=64, layout=HeadLayout.shared_key(8), chunk_size=24)
     with pytest.raises(ValueError, match="divide evenly"):
-        GatedDeltaNetConfig(d_model=12, n_heads=8, expand_k=1.0)
+        GatedDeltaNetConfig(d_model=12, layout=HeadLayout.shared_key(8), expand_k=1.0)
     with pytest.raises(ValueError, match="expand_k must be > 0"):
-        GatedDeltaNetConfig(d_model=64, n_heads=8, expand_k=0.0)
+        GatedDeltaNetConfig(d_model=64, layout=HeadLayout.shared_key(8), expand_k=0.0)
     with pytest.raises(ValueError, match="dropout"):
-        GatedDeltaNetConfig(d_model=64, n_heads=8, dropout=1.0)
-    with pytest.raises(ValueError, match="n_heads must be >= 1"):
-        GatedDeltaNetConfig(d_model=64, n_heads=0)
+        GatedDeltaNetConfig(d_model=64, layout=HeadLayout.shared_key(8), dropout=1.0)
+    with pytest.raises(TypeError, match="layout must be a HeadLayout"):
+        GatedDeltaNetConfig(d_model=64, layout=8)
 
 
 def test_the_common_case_is_one_call():
-    """A library people depend on should not need a layout object to get going."""
-    config = GatedDeltaNetConfig(d_model=512, n_heads=8)
-    assert config.layout == HeadLayout.shared_key(8)
+    config = GatedDeltaNetConfig(d_model=512, layout=HeadLayout.shared_key(8))
     assert config.d_k == 128 and config.d_v == 64
     assert GatedDeltaNet(config)(torch.randn(1, 8, 512)).shape == (1, 8, 512)
 
 
-def test_layout_and_n_heads_are_cross_checked():
-    """Over-determined on purpose: disagreement is an error, not a silent model."""
-    ok = GatedDeltaNetConfig(d_model=64, n_heads=8, layout=HeadLayout.crossed(2, 4))
-    assert ok.layout.n_heads == 8
-    with pytest.raises(ValueError, match="pass one or the other"):
-        GatedDeltaNetConfig(d_model=64, n_heads=8, layout=HeadLayout.crossed(2, 2))
+def test_n_heads_is_derived_and_cannot_disagree_with_the_layout():
+    """It used to be a second field cross-checked into agreement (0.2 §6.4).
+
+    Deriving makes disagreement *unrepresentable* rather than *detected*, which
+    is the stronger guarantee -- there is no state in which the two are both
+    present and wrong, so there is nothing left to validate.  Assigning to it
+    fails because a property has no setter, which is the same fact from the
+    other direction.
+    """
+    config = GatedDeltaNetConfig(d_model=64, layout=HeadLayout.crossed(2, 4))
+    assert config.n_heads == 8 == config.layout.n_heads
+
+    with pytest.raises(AttributeError):
+        config.n_heads = 4  # type: ignore[misc]
+
+    # And the head count follows the layout wherever it goes.
+    for layout in LAYOUTS.values():
+        assert GatedDeltaNetConfig(d_model=64, layout=layout).n_heads == layout.n_heads
+
+
+def test_layout_is_required_because_a_head_count_does_not_imply_one():
+    """`n_heads=8` used to mean `shared_key(8)` silently.  That was a decision.
+
+    The layout module's whole argument is that "8 heads" does not determine an
+    arrangement -- diagonal, shared-key and crossed(2,4) are all eight heads and
+    all different models.  A default picked one of them without saying so.
+    """
+    with pytest.raises(TypeError):
+        GatedDeltaNetConfig(d_model=64)  # type: ignore[call-arg]
+
+    eight = [HeadLayout.shared_key(8), HeadLayout.diagonal(8), HeadLayout.crossed(2, 4)]
+    assert all(layout.n_heads == 8 for layout in eight)
+    assert len({layout.describe() for layout in eight}) == 3, "same count, three models"
 
 
 def test_layer_backward_reaches_every_parameter():
@@ -512,16 +545,88 @@ def test_beta_max_reaches_reflections():
     assert beta.max() < layer.config.beta_max
 
 
-def test_decay_is_clamped_within_a_chunk():
-    """max_chunk_decay bounds 1/gamma, which the decay absorption divides by."""
+@pytest.mark.parametrize("chunk_size", [8, 16, 32, 64, 128])
+def test_chunk_size_does_not_decide_the_shortest_half_life(chunk_size):
+    """**The test the decay reformulation exists for.**
+
+    `_features` used to floor `log_alpha` at ``-max_chunk_decay / chunk_size``,
+    to keep `1/gamma` in range for a decay absorption that no longer forms
+    `1/gamma`.  The side effect was that the shortest expressible half-life was
+
+        chunk_size * ln2 / max_chunk_decay
+
+    — *linear in the chunk size*.  A parameter whose entire job is to tile the
+    sequence for the GPU was silently deciding what the layer could represent:
+    at the old defaults a head could not forget faster than every 5.5 positions,
+    and moving to ``chunk_size = 128`` for performance would have doubled that
+    to 11 without anyone choosing it.
+
+    Driving `alpha` low must now produce the same half-life at every chunk size,
+    and one below the old floor.  A numerics change with no behavioural test is
+    indistinguishable from a refactor; this is the behaviour.
+    """
     torch.manual_seed(0)
-    layer = make_layer(max_chunk_decay=4.0, chunk_size=16)
-    x = 50.0 * torch.randn(2, 32, 64, dtype=torch.float64)
+    layer = make_layer(chunk_size=chunk_size, conv_size=0)
+    with torch.no_grad():
+        layer.a_proj.weight.zero_()
+        layer.a_proj.bias.fill_(2.0)  # softplus(2) ~ 2.13 -> alpha ~ 0.119
+
+    x = torch.randn(1, 8, 64, dtype=torch.float64)
     _, _, _, _, log_alpha, _ = layer._features(x)
 
-    assert log_alpha.max() <= 0.0
-    worst = -log_alpha.reshape(2, -1, 2, 16).sum(-1).max()
-    assert worst <= 4.0 + 1e-12
+    assert log_alpha.max() <= 0.0, "alpha must stay in (0, 1]"
+    half_life = math.log(2) / -log_alpha.mean().item()
+    old_floor = chunk_size * math.log(2) / 8.0
+
+    assert half_life == pytest.approx(0.3259, abs=1e-3), "must not depend on chunk_size"
+    assert half_life < old_floor, (
+        f"half-life {half_life:.3f} is not below the old floor {old_floor:.3f}; "
+        f"the clamp's removal is not observable and the change is a refactor"
+    )
+
+
+@pytest.mark.parametrize("chunk", [1, 2, 8, 32, 128])
+def test_chunk_size_is_inert_on_unclamped_decay(chunk):
+    """Gate 3 — outputs agree across chunk sizes where the old form could not.
+
+    Distinct from `test_chunkwise_is_independent_of_chunk_size` only in what the
+    fixture now supplies: unclamped decay, accumulating past `-100` inside a
+    128-chunk.  Under the `1/gamma` factorisation that range was unreachable by
+    construction, which is why this could not have been asserted before.
+    """
+    torch.manual_seed(0)
+    layout = LAYOUTS["shared_key"]
+    q, k, v, beta, log_alpha = make_inputs(layout, seq_len=128)
+    assert -log_alpha.cumsum(-1)[..., -1].min() > 50.0, "fixture is not exercising the range"
+
+    out, state = chunk_gated_delta(q, k, v, beta, log_alpha, chunk)
+    out_seq, state_seq = sequential_gated_delta(q, k, v, beta, log_alpha)
+
+    assert (out - out_seq).abs().max() < EXACT
+    assert (state - state_seq).abs().max() < EXACT
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_no_overflow_at_extreme_decay(dtype):
+    """Gate 4 — `-sum(log alpha) = 200` in one chunk, well past fp32's ceiling.
+
+    fp32 `exp` overflows at 88.7, so the old `inv_gamma = (-cumulative).exp()`
+    produced `inf` here, then `inf * 0 = nan`, and poisoned the batch.  The
+    relative form's only failure mode is underflow to zero, and underflow to
+    zero is the right answer: it means that position has fully decayed.
+    """
+    torch.manual_seed(0)
+    layout = LAYOUTS["shared_key"]
+    q, k, v, beta, _ = make_inputs(layout, seq_len=128, dtype=dtype)
+    log_alpha = torch.full_like(beta, -200.0 / 128)
+
+    out, state = chunk_gated_delta(q, k, v, beta, log_alpha, 128)
+
+    assert torch.isfinite(out).all(), "extreme decay must not produce inf or nan"
+    assert torch.isfinite(state).all()
+
+    out_seq, _ = sequential_gated_delta(q, k, v, beta, log_alpha)
+    assert (out - out_seq).abs().max() < (EXACT if dtype is torch.float64 else FP32)
 
 
 def test_decode_conv_matches_the_library_call():
@@ -574,7 +679,7 @@ def test_any_sequence_length_works_and_is_exact(seq_len):
     """
     torch.manual_seed(0)
     layout = LAYOUTS["shared_key"]
-    q, k, v, beta, log_alpha = make_inputs(layout, seq_len=seq_len, chunk=16)
+    q, k, v, beta, log_alpha = make_inputs(layout, seq_len=seq_len)
 
     out, state = chunk_gated_delta(q, k, v, beta, log_alpha, 16)
     out_seq, state_seq = sequential_gated_delta(q, k, v, beta, log_alpha)
@@ -635,7 +740,7 @@ def test_it_is_interchangeable_with_undertow():
 
     x = torch.randn(2, 32, 64)
     mixers = [
-        GatedDeltaNet(GatedDeltaNetConfig(d_model=64, n_heads=8, chunk_size=16)),
+        GatedDeltaNet(GatedDeltaNetConfig(d_model=64, layout=HeadLayout.shared_key(8), chunk_size=16)),
         UndertowAttention(UndertowConfig(d_model=64, n_heads=8, window=8)),
     ]
     for mixer in mixers:
@@ -651,7 +756,7 @@ def test_it_is_interchangeable_with_undertow():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_layer_runs_on_cuda_end_to_end():
     layer = GatedDeltaNet(
-        GatedDeltaNetConfig(d_model=64, n_heads=8, chunk_size=16)
+        GatedDeltaNetConfig(d_model=64, layout=HeadLayout.shared_key(8), chunk_size=16)
     ).cuda()
     x = torch.randn(2, 100, 64, device="cuda")
     y, state = layer(x, return_state=True)

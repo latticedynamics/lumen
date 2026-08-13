@@ -45,6 +45,7 @@ from lumen.gdn import (
     GatedDeltaNetState,
     HeadLayout,
 )
+from lumen.nn import RMSNorm, rms_norm
 from lumen.undertow import UndertowAttention, UndertowConfig
 from lumen.probe import (
     ArchFacts,
@@ -60,7 +61,7 @@ from lumen.probe import (
     probe_triton,
 )
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "__version__",
@@ -86,6 +87,9 @@ __all__ = [
     "GatedDeltaNetConfig",
     "GatedDeltaNetState",
     "HeadLayout",
+    # nn
+    "RMSNorm",
+    "rms_norm",
     # undertow
     "UndertowAttention",
     "UndertowConfig",

@@ -431,11 +431,11 @@ def test_both_mixers_decode_on_cuda_without_a_device_argument() -> None:
     same contract asserted where it has teeth: build, move, init, step --
     with no caller ever naming a device.
     """
-    from lumen.gdn import GatedDeltaNet, GatedDeltaNetConfig
+    from lumen.gdn import GatedDeltaNet, GatedDeltaNetConfig, HeadLayout
 
     mixers = [
         UndertowAttention(UndertowConfig(d_model=64, n_heads=8, window=8)),
-        GatedDeltaNet(GatedDeltaNetConfig(d_model=64, n_heads=8, chunk_size=16)),
+        GatedDeltaNet(GatedDeltaNetConfig(d_model=64, layout=HeadLayout.shared_key(8), chunk_size=16)),
     ]
     for mixer in mixers:
         mixer = mixer.cuda()

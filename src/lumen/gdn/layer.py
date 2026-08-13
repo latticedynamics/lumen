@@ -42,6 +42,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from lumen.gdn.layout import HeadLayout
+from lumen.nn import rms_norm
 from lumen.gdn.reference import (
     assign_values,
     chunk_gated_delta,
@@ -77,9 +78,12 @@ class GatedDeltaNetConfig:
 
     Args:
         d_model:  Residual stream width.
-        layout:   Which key and value each state uses.  **The source of truth
-                  for the head count** — ``n_heads`` is derived from it, so the
-                  two cannot disagree.  See :mod:`lumen.gdn.layout`.
+        layout:   Which key and value each state uses, and **the only place the
+                  head count is stored** — ``n_heads`` is a property derived
+                  from it, so the two cannot disagree.  Required: "8 heads" does
+                  not determine an arrangement, so there is no honest default.
+                  ``HeadLayout.shared_key(8)`` is the ordinary one.  See
+                  :mod:`lumen.gdn.layout`.
         expand_k: Total key width as a multiple of ``d_model``; per-state
                   ``d_k = expand_k · d_model / H``.  **Required.**  Since
                   ``rank(M) ≤ min(d_k, d_v)``, this is the dial that buys
@@ -97,8 +101,6 @@ class GatedDeltaNetConfig:
                   absolute.
         beta_max: Write strength ceiling.  At 2 the update reaches reflections;
                   all contributing lineages agree here.
-        max_chunk_decay: Ceiling on `−Σ log α` accumulated within one chunk,
-                  which bounds `1/γ` and keeps the decay absorption in range.
         centre:   Subtract a learned per-head centre from `q` and `k` before
                   the l2 norm.  Zero-initialised, so turning it on is an exact
                   no-op until training moves it.
@@ -107,14 +109,12 @@ class GatedDeltaNetConfig:
     """
 
     d_model: int
-    n_heads: int
+    layout: HeadLayout
     expand_k: float = 2.0
     expand_v: float = 1.0
-    layout: HeadLayout | None = None
     chunk_size: int = 64
     conv_size: int = 4
     beta_max: float = 2.0
-    max_chunk_decay: float = 8.0
     centre: bool = False
     norm_eps: float = 1e-5
     dropout: float = 0.0
@@ -122,19 +122,10 @@ class GatedDeltaNetConfig:
     def __post_init__(self) -> None:
         if self.d_model < 1:
             raise ValueError(f"d_model must be >= 1, got {self.d_model}")
-        if self.n_heads < 1:
-            raise ValueError(f"n_heads must be >= 1, got {self.n_heads}")
-
-        # `layout` and `n_heads` over-determine each other on purpose: the
-        # default is derived, and an explicit one is cross-checked.  That turns
-        # "changed n_heads, forgot the layout" from a silently different model
-        # into an error at construction.
-        if self.layout is None:
-            object.__setattr__(self, "layout", HeadLayout.shared_key(self.n_heads))
-        elif self.layout.n_heads != self.n_heads:
-            raise ValueError(
-                f"layout has {self.layout.n_heads} heads but n_heads={self.n_heads}; "
-                f"pass one or the other, or make them agree"
+        if not isinstance(self.layout, HeadLayout):
+            raise TypeError(
+                f"layout must be a HeadLayout, got {type(self.layout).__name__}; "
+                f"try HeadLayout.shared_key(n) for the ordinary arrangement"
             )
 
         if self.chunk_size < 1 or self.chunk_size & (self.chunk_size - 1):
@@ -143,10 +134,6 @@ class GatedDeltaNetConfig:
             raise ValueError(f"conv_size must be >= 0, got {self.conv_size}")
         if self.beta_max <= 0:
             raise ValueError(f"beta_max must be > 0, got {self.beta_max}")
-        if self.max_chunk_decay <= 0:
-            raise ValueError(
-                f"max_chunk_decay must be > 0, got {self.max_chunk_decay}"
-            )
         if self.norm_eps <= 0:
             raise ValueError(f"norm_eps must be > 0, got {self.norm_eps}")
         if not 0.0 <= self.dropout < 1.0:
@@ -166,6 +153,19 @@ class GatedDeltaNetConfig:
                     f"{name} = {expand} is too small for {self.n_heads} heads "
                     f"at d_model = {self.d_model}"
                 )
+
+    @property
+    def n_heads(self) -> int:
+        """Derived from `layout`, which is the only place head count is stored.
+
+        These used to be two fields cross-checked into agreement in
+        ``__post_init__``.  Deriving instead makes disagreement *unrepresentable*
+        rather than *detected*, which is a different and better guarantee — and
+        it removes a hidden decision, because `n_heads=8` silently meant
+        ``shared_key(8)`` and the whole argument of :mod:`lumen.gdn.layout` is
+        that "8 heads" does not determine an arrangement.
+        """
+        return self.layout.n_heads
 
     @property
     def d_k(self) -> int:
@@ -202,11 +202,23 @@ class ShortConv(nn.Module):
 
         if u.shape[-1] == self.size:
             # Decode.  A depthwise convolution over exactly one output position
-            # is a weighted sum of `size` values, and calling `conv1d` for it
-            # costs the same as calling it for a whole training sequence --
-            # the time is dispatch, not arithmetic, and grouped convolution
-            # dispatch scales with the channel count.  Measured on one machine:
-            # ~450x, and it is 95% of a decode step.
+            # is a weighted sum of `size` values, and a library call for it is
+            # dominated by dispatch rather than arithmetic -- grouped convolution
+            # dispatch scales with the channel count, not with the work.
+            #
+            # The size of that win is a fact about a machine, so: measured on one
+            # box, batch 8, width 4, fp32, against this same function forced
+            # through `conv1d`.  On its CPU, 164x at 128 channels falling to 1.7x
+            # by 2048 -- the win is largest exactly where dispatch dominates and
+            # narrows as the elementwise work below becomes real.  On its Tesla
+            # P40, 0.87x: about 11 us *slower* per call, flat across that whole
+            # channel range, because there both paths are pure launch overhead
+            # and this one issues one extra kernel.
+            #
+            # The branch is unconditional on purpose.  13% on one device against
+            # up to 164x on another is not a close trade, and a device-dependent
+            # branch would have to be probed rather than assumed -- see
+            # `lumen.probe` for why this package does not read hardware flags.
             #
             # This is arithmetically the same sum, but not bit-identical to
             # cuDNN/oneDNN's accumulation order -- order 1e-15 in fp64, six
@@ -334,10 +346,16 @@ class GatedDeltaNet(nn.Module):
         beta = config.beta_max * torch.sigmoid(self.b_proj(x))
         beta = beta.permute(0, 2, 1).unsqueeze(2)
 
+        # No floor.  There used to be one -- `clamp(min=-max_chunk_decay /
+        # chunk_size)` -- to keep `1/gamma` in range for a decay absorption that
+        # no longer forms `1/gamma` at all.  It bounded the shortest expressible
+        # half-life at `chunk_size * ln2 / max_chunk_decay`, making a tiling
+        # parameter chosen for the GPU silently decide what the layer could
+        # represent: at the old defaults a head could not forget faster than
+        # every 5.5 positions, and moving to `chunk_size = 128` for performance
+        # would have doubled that to 11 without anyone choosing it.
         log_alpha = -F.softplus(self.a_proj(x))
         log_alpha = log_alpha.permute(0, 2, 1).unsqueeze(2)
-        # Bound 1/gamma within a chunk; the decay absorption divides by it.
-        log_alpha = log_alpha.clamp(min=-config.max_chunk_decay / config.chunk_size)
 
         return q, k, v, beta, log_alpha, new_cache
 
@@ -360,9 +378,18 @@ class GatedDeltaNet(nn.Module):
         config = self.config
         batch, _, _, seq_len, _ = o.shape
 
-        o = o.permute(0, 3, 1, 2, 4).float()
-        o = o * torch.rsqrt(o.pow(2).mean(-1, keepdim=True) + config.norm_eps)
-        o = o * self.head_norm.float()
+        # Promote to *at least* fp32, rather than `.float()`, which casts to
+        # exactly fp32 -- a promotion for fp16 and bf16 and a silent demotion
+        # for fp64.  The reduction inside the norm genuinely needs the headroom
+        # (a mean of squares underflows in fp16), but nothing here wants an fp64
+        # caller quietly capped at fp32: it floors a whole-layer fp64 comparison
+        # around 6e-8, which is fp32 epsilon and eight orders off what the
+        # kernel's own oracle checks at.  Every dtype below fp64 is unaffected.
+        #
+        # The promotion stays at the call site rather than inside `rms_norm`
+        # because it covers this whole output path, not the norm alone.
+        o = o.permute(0, 3, 1, 2, 4).to(torch.promote_types(o.dtype, torch.float32))
+        o = rms_norm(o, self.head_norm, config.norm_eps)
         o = o.reshape(batch, seq_len, config.n_heads * config.d_v).to(x.dtype)
         return self.dropout(self.o_proj(o * F.silu(self.g_proj(x))))
 

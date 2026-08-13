@@ -43,6 +43,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from lumen.nn import rms_norm
 from lumen.undertow import triton_kernels
 from lumen.undertow.reference import (
     extend,
@@ -309,11 +310,13 @@ class UndertowAttention(nn.Module):
         changes that guarantee.
         """
         batch, _, seq_len, _ = o.shape
+        # Promote to at least fp32, never past it downward -- `.float()` demotes
+        # an fp64 caller.  See the matching note in `lumen.gdn.layer._out`; the
+        # two output paths are deliberately the same shape.
         o = o.transpose(1, 2).reshape(
             batch, seq_len, self.config.n_heads, self.config.d_head
-        ).float()
-        o = o * torch.rsqrt(o.pow(2).mean(-1, keepdim=True) + self.config.eps)
-        o = o * self.head_norm.float()
+        ).to(torch.promote_types(o.dtype, torch.float32))
+        o = rms_norm(o, self.head_norm, self.config.eps)
         o = o.reshape(batch, seq_len, self.config.d_model).to(gate.dtype)
         return self.dropout(self.o_proj(o * F.silu(gate)))
 
