@@ -98,8 +98,6 @@ class GatedDeltaNetConfig:
                   absolute.
         beta_max: Write strength ceiling.  At 2 the update reaches reflections;
                   all contributing lineages agree here.
-        max_chunk_decay: Ceiling on `−Σ log α` accumulated within one chunk,
-                  which bounds `1/γ` and keeps the decay absorption in range.
         centre:   Subtract a learned per-head centre from `q` and `k` before
                   the l2 norm.  Zero-initialised, so turning it on is an exact
                   no-op until training moves it.
@@ -115,7 +113,6 @@ class GatedDeltaNetConfig:
     chunk_size: int = 64
     conv_size: int = 4
     beta_max: float = 2.0
-    max_chunk_decay: float = 8.0
     centre: bool = False
     norm_eps: float = 1e-5
     dropout: float = 0.0
@@ -144,10 +141,6 @@ class GatedDeltaNetConfig:
             raise ValueError(f"conv_size must be >= 0, got {self.conv_size}")
         if self.beta_max <= 0:
             raise ValueError(f"beta_max must be > 0, got {self.beta_max}")
-        if self.max_chunk_decay <= 0:
-            raise ValueError(
-                f"max_chunk_decay must be > 0, got {self.max_chunk_decay}"
-            )
         if self.norm_eps <= 0:
             raise ValueError(f"norm_eps must be > 0, got {self.norm_eps}")
         if not 0.0 <= self.dropout < 1.0:
@@ -335,10 +328,16 @@ class GatedDeltaNet(nn.Module):
         beta = config.beta_max * torch.sigmoid(self.b_proj(x))
         beta = beta.permute(0, 2, 1).unsqueeze(2)
 
+        # No floor.  There used to be one -- `clamp(min=-max_chunk_decay /
+        # chunk_size)` -- to keep `1/gamma` in range for a decay absorption that
+        # no longer forms `1/gamma` at all.  It bounded the shortest expressible
+        # half-life at `chunk_size * ln2 / max_chunk_decay`, making a tiling
+        # parameter chosen for the GPU silently decide what the layer could
+        # represent: at the old defaults a head could not forget faster than
+        # every 5.5 positions, and moving to `chunk_size = 128` for performance
+        # would have doubled that to 11 without anyone choosing it.
         log_alpha = -F.softplus(self.a_proj(x))
         log_alpha = log_alpha.permute(0, 2, 1).unsqueeze(2)
-        # Bound 1/gamma within a chunk; the decay absorption divides by it.
-        log_alpha = log_alpha.clamp(min=-config.max_chunk_decay / config.chunk_size)
 
         return q, k, v, beta, log_alpha, new_cache
 

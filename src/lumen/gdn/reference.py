@@ -31,6 +31,36 @@ delta rule on `M̃` carrying values `v_t / γ_t`.  Exact, not an approximation.
 `P`, `W`, `E`, `F` and the intra-chunk attention are all state-free, so they are
 computed for every chunk at once and the loop does one matmul.
 
+**3. The decay is carried relatively, and this is the numerical story.**
+The two facts above are the derivation; they are not how the code computes it.
+Everything that reaches an answer is the ratio `γ_t / γ_i` for `i ≤ t`, which
+lies in `(0, 1]` because `g = log γ` is non-increasing.  Forming it as
+`γ_t · (1/γ_i)` computes a bounded number as one shrinking factor times one
+growing one, and materialises the growing one.  `1/γ` reaches fp32's ceiling at
+`−Σ log α ≈ 88.7`; long before that, an accumulation mixing terms whose `1/γ`
+differ by more than `2²⁴` loses the small ones into the ulp of the large ones —
+and in a delta rule the small term is the *recent* position, so the precision is
+lost exactly where it is needed.
+
+So `rel[t, i] = exp(g_t − g_i)` is formed directly and neither half is ever
+built.  Every factor is in `(0, 1]`, there is no range to exceed, and the only
+reachable failure is underflow to zero — which is the *correct* answer, meaning
+that position has fully decayed.  The form this replaced failed by reaching
+`inf`, meeting a zero, and returning `nan` for the whole batch.
+
+Written with hats for the relatively-scaled quantities, the chunk update is::
+
+    M_n = Ê_n M + F̂_n,    Ê_n = γ_C I − Kᵀ diag(e) Ŵ_n,    F̂_n = Kᵀ diag(e) P̂_n
+
+with `e_i = exp(g_C − g_i)` the chunk-exit factor.  The boundary decay that used
+to multiply the whole update is inside both terms now, because they no longer
+share it.
+
+This is also why the layer has no `max_chunk_decay`: that parameter existed to
+bound `1/γ`, and bounding it capped the shortest half-life a head could express
+at `chunk_size · ln2 / max_chunk_decay`, which made a GPU tiling parameter into
+a modelling constraint.  Nothing here has an opinion about `chunk_size` now.
+
 `E` and `W` depend only on the **key group** — the value axis never enters them
 — which is what makes a layout sharing one key across many states cheap.
 
@@ -244,34 +274,63 @@ def chunk_gated_delta(
     # give every state its own timescale.  Left as-is in this version.
     log_alpha = log_alpha.reshape(batch, n_key_groups, 1, n_chunks, chunk_size)
 
-    # ── decay absorption ──────────────────────────────────────────────────
+    # ── decay absorption, in relative form ────────────────────────────────
+    # `g` is non-increasing, so for the only entries anything reads -- `i <= t`
+    # -- the exponent below is <= 0 BY CONSTRUCTION and every value lies in
+    # (0, 1].  Nothing here can exceed 1, so there is no range to blow and no
+    # clamp to impose on the model to keep it in range.
+    #
+    # The failure mode inverts, and that is the point: the only thing that can
+    # happen is underflow to zero, and underflow to zero is the right answer --
+    # it means that position has fully decayed.  The `gamma`/`1/gamma` split
+    # this replaces failed the other way, reaching `inf`, meeting a zero, and
+    # poisoning the batch with `nan`.
     cumulative = log_alpha.cumsum(-1)
     gamma = cumulative.exp()
-    inv_gamma = (-cumulative).exp()
+    # rel[t, i] = exp(g_t - g_i).  The clamp is for the strictly-upper triangle,
+    # which no consumer reads but which `exp` would overflow *before* any mask
+    # is applied -- masking after an exp that has already produced `inf` does
+    # not help.  On every entry that is read it is a no-op.
+    rel = (cumulative[..., :, None] - cumulative[..., None, :]).clamp(max=0.0).exp()
+    # exp(g_C - g_i), the chunk-exit factor: the last row of the same matrix.
+    exit_decay = rel[..., -1, :]
 
     # ── UT/WY transform, once per key group ───────────────────────────────
     beta_k = beta[..., None] * k
     strict = torch.ones(
         chunk_size, chunk_size, device=q.device, dtype=torch.bool
     ).tril(-1)
-    transform = inv_unit((beta_k @ k.transpose(-1, -2)) * strict)[:, :, 0]
+    # The decay rides INSIDE the inverse rather than around it, which costs
+    # nothing and is the whole trick.  For lower-triangular `A`, `B` and
+    # `D[i,j] = d_i/d_j`, `(A*D)(B*D) = (AB)*D` -- so `A -> A*D` is an algebra
+    # homomorphism on lower-triangular matrices and therefore commutes with
+    # inversion.  Folding `rel` into `N` before the solve yields exactly
+    # `inv(I + N) * rel`, with no intermediate outside (0, 1] ever formed.
+    transform = inv_unit((beta_k @ k.transpose(-1, -2)) * strict * rel)[:, :, 0]
 
     # ── everything state-free, batched over all chunks ────────────────────
-    w = transform @ beta_k[:, :, 0]
-    # (beta * inv_gamma) is multiplied first because it carries no `m` axis:
-    # the one unavoidable pass over the full value tensor then happens once.
-    pseudo = transform[:, :, None] @ ((beta * inv_gamma)[..., None] * v)
+    # Hatted quantities carry a factor of gamma_i relative to the unscaled ones:
+    # `w_hat[i] = gamma_i w[i]` and `pseudo_hat[i] = gamma_i pseudo[i]`.  That
+    # factor is what the readout and the state update would otherwise have had
+    # to divide back out.
+    w = transform @ (gamma[..., None] * beta_k)[:, :, 0]
+    pseudo = transform[:, :, None] @ (beta[..., None] * v)
     k_t = k.transpose(-1, -2)[:, :, 0]
-    transition = torch.eye(d_k, device=q.device, dtype=q.dtype) - k_t @ w
+    # E = gamma_C I - K^T diag(exp(g_C - g)) W_hat.  The chunk-boundary decay is
+    # inside the transition now instead of multiplying the loop body, because
+    # the two terms it used to scale together no longer share a factor.
+    transition = gamma[..., -1][:, :, 0][..., None, None] * torch.eye(
+        d_k, device=q.device, dtype=q.dtype
+    ) - k_t @ (exit_decay[:, :, 0][..., None] * w)
     causal = torch.ones(chunk_size, chunk_size, device=q.device, dtype=torch.bool).tril(0)
-    intra = (q @ k_t[:, :, None]) * causal
+    intra = (q @ k_t[:, :, None]) * causal * rel
 
     # The `m` axis is folded into the value axis: `transition` is shared across
     # states in a key group, so this makes `E @ M` one batched matmul over
     # B*G_k with no broadcast.  Expanding it every iteration costs more than
     # the matmul does.
     carry = (
-        (k_t[:, :, None] @ pseudo)
+        (k_t[:, :, None] @ (exit_decay[..., None] * pseudo))
         .permute(0, 1, 3, 4, 2, 5)
         .reshape(batch, n_key_groups, n_chunks, d_k, per_group * d_v)
     )
@@ -290,12 +349,12 @@ def chunk_gated_delta(
     # backward is a single stack.
     transitions = transition.unbind(2)
     carries = carry.unbind(2)
-    boundary = gamma[..., -1][:, :, 0][..., None, None].unbind(2)
 
     entering = []
     for n in range(n_chunks):
         entering.append(memory)
-        memory = boundary[n] * (transitions[n] @ memory + carries[n])
+        # No boundary factor out front any more -- it is folded into both terms.
+        memory = transitions[n] @ memory + carries[n]
     stacked = torch.stack(entering, dim=2)
 
     # ── readout, all chunks at once ───────────────────────────────────────
@@ -305,7 +364,13 @@ def chunk_gated_delta(
     u = pseudo - w[:, :, None] @ unfolded
     # carry term + intra-chunk term.  The causal mask is diagonal-INCLUSIVE:
     # position t reads its own write.
-    out = (q @ unfolded + intra @ u) * gamma[..., None]
+    #
+    # `gamma` scales only the carry term now.  The intra-chunk term already
+    # carries its decay as `rel[t, i]` inside `intra`, which is the whole
+    # difference: the ratio `gamma_t / gamma_i` is formed as a single bounded
+    # exponential rather than as a product of one shrinking and one growing
+    # factor computed apart from each other.
+    out = (q @ unfolded) * gamma[..., None] + intra @ u
 
     memory = (
         memory.reshape(batch, n_key_groups, d_k, per_group, d_v)

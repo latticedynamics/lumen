@@ -48,8 +48,19 @@ LAYOUTS = {
 }
 
 
-def make_inputs(layout, seq_len=128, chunk=32, batch=2, d_k=16, d_v=12, dtype=torch.float64):
-    """Kernel-shaped inputs obeying the layer's own invariants."""
+def make_inputs(layout, seq_len=128, batch=2, d_k=16, d_v=12, dtype=torch.float64):
+    """Kernel-shaped inputs obeying the layer's own invariants.
+
+    **The decay is unclamped, deliberately.**  This fixture used to end with
+    ``.clamp(min=-8.0 / chunk)`` -- `max_chunk_decay` hard-coded into the test
+    inputs -- so every equivalence test ran inside the range the old `1/gamma`
+    factorisation could survive, and none of them ever visited the range it
+    could not.  With the clamp gone from the layer, leaving it here would have
+    made these tests pass without exercising anything the change opened up.
+    Unclamped `-softplus(randn)` accumulates to roughly `-110` over 128
+    positions, which is past fp32's `exp` ceiling of 88.7 and would have been
+    `nan` under the old form.
+    """
     g_k = layout.n_key_groups
     m = layout.states_per_key_group
     q = F.normalize(torch.randn(batch, g_k, m, seq_len, d_k, dtype=dtype), dim=-1)
@@ -58,9 +69,7 @@ def make_inputs(layout, seq_len=128, chunk=32, batch=2, d_k=16, d_v=12, dtype=to
         torch.randn(batch, seq_len, layout.n_value_groups, d_v, dtype=dtype), layout
     )
     beta = 2.0 * torch.sigmoid(torch.randn(batch, g_k, 1, seq_len, dtype=dtype))
-    log_alpha = -F.softplus(
-        torch.randn(batch, g_k, 1, seq_len, dtype=dtype)
-    ).clamp(min=-8.0 / chunk)
+    log_alpha = -F.softplus(torch.randn(batch, g_k, 1, seq_len, dtype=dtype))
     return q, k, v, beta, log_alpha
 
 
@@ -179,7 +188,7 @@ def test_chunkwise_is_independent_of_chunk_size(chunk):
     """Chunking is an implementation detail; the answer must not know about it."""
     torch.manual_seed(0)
     layout = LAYOUTS["shared_key"]
-    q, k, v, beta, log_alpha = make_inputs(layout, seq_len=128, chunk=128)
+    q, k, v, beta, log_alpha = make_inputs(layout, seq_len=128)
 
     out, state = chunk_gated_delta(q, k, v, beta, log_alpha, chunk)
     out_seq, state_seq = sequential_gated_delta(q, k, v, beta, log_alpha)
@@ -225,7 +234,7 @@ def test_zero_beta_is_pure_decay():
     """A sanity anchor with a closed form: no writes means the state only fades."""
     torch.manual_seed(0)
     layout = LAYOUTS["shared_key"]
-    q, k, v, beta, log_alpha = make_inputs(layout, seq_len=64, chunk=16)
+    q, k, v, beta, log_alpha = make_inputs(layout, seq_len=64)
     beta = torch.zeros_like(beta)
 
     memory = torch.randn(2, 1, 8, 16, 12, dtype=torch.float64)
@@ -512,16 +521,88 @@ def test_beta_max_reaches_reflections():
     assert beta.max() < layer.config.beta_max
 
 
-def test_decay_is_clamped_within_a_chunk():
-    """max_chunk_decay bounds 1/gamma, which the decay absorption divides by."""
+@pytest.mark.parametrize("chunk_size", [8, 16, 32, 64, 128])
+def test_chunk_size_does_not_decide_the_shortest_half_life(chunk_size):
+    """**The test the decay reformulation exists for.**
+
+    `_features` used to floor `log_alpha` at ``-max_chunk_decay / chunk_size``,
+    to keep `1/gamma` in range for a decay absorption that no longer forms
+    `1/gamma`.  The side effect was that the shortest expressible half-life was
+
+        chunk_size * ln2 / max_chunk_decay
+
+    — *linear in the chunk size*.  A parameter whose entire job is to tile the
+    sequence for the GPU was silently deciding what the layer could represent:
+    at the old defaults a head could not forget faster than every 5.5 positions,
+    and moving to ``chunk_size = 128`` for performance would have doubled that
+    to 11 without anyone choosing it.
+
+    Driving `alpha` low must now produce the same half-life at every chunk size,
+    and one below the old floor.  A numerics change with no behavioural test is
+    indistinguishable from a refactor; this is the behaviour.
+    """
     torch.manual_seed(0)
-    layer = make_layer(max_chunk_decay=4.0, chunk_size=16)
-    x = 50.0 * torch.randn(2, 32, 64, dtype=torch.float64)
+    layer = make_layer(chunk_size=chunk_size, conv_size=0)
+    with torch.no_grad():
+        layer.a_proj.weight.zero_()
+        layer.a_proj.bias.fill_(2.0)  # softplus(2) ~ 2.13 -> alpha ~ 0.119
+
+    x = torch.randn(1, 8, 64, dtype=torch.float64)
     _, _, _, _, log_alpha, _ = layer._features(x)
 
-    assert log_alpha.max() <= 0.0
-    worst = -log_alpha.reshape(2, -1, 2, 16).sum(-1).max()
-    assert worst <= 4.0 + 1e-12
+    assert log_alpha.max() <= 0.0, "alpha must stay in (0, 1]"
+    half_life = math.log(2) / -log_alpha.mean().item()
+    old_floor = chunk_size * math.log(2) / 8.0
+
+    assert half_life == pytest.approx(0.3259, abs=1e-3), "must not depend on chunk_size"
+    assert half_life < old_floor, (
+        f"half-life {half_life:.3f} is not below the old floor {old_floor:.3f}; "
+        f"the clamp's removal is not observable and the change is a refactor"
+    )
+
+
+@pytest.mark.parametrize("chunk", [1, 2, 8, 32, 128])
+def test_chunk_size_is_inert_on_unclamped_decay(chunk):
+    """Gate 3 — outputs agree across chunk sizes where the old form could not.
+
+    Distinct from `test_chunkwise_is_independent_of_chunk_size` only in what the
+    fixture now supplies: unclamped decay, accumulating past `-100` inside a
+    128-chunk.  Under the `1/gamma` factorisation that range was unreachable by
+    construction, which is why this could not have been asserted before.
+    """
+    torch.manual_seed(0)
+    layout = LAYOUTS["shared_key"]
+    q, k, v, beta, log_alpha = make_inputs(layout, seq_len=128)
+    assert -log_alpha.cumsum(-1)[..., -1].min() > 50.0, "fixture is not exercising the range"
+
+    out, state = chunk_gated_delta(q, k, v, beta, log_alpha, chunk)
+    out_seq, state_seq = sequential_gated_delta(q, k, v, beta, log_alpha)
+
+    assert (out - out_seq).abs().max() < EXACT
+    assert (state - state_seq).abs().max() < EXACT
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_no_overflow_at_extreme_decay(dtype):
+    """Gate 4 — `-sum(log alpha) = 200` in one chunk, well past fp32's ceiling.
+
+    fp32 `exp` overflows at 88.7, so the old `inv_gamma = (-cumulative).exp()`
+    produced `inf` here, then `inf * 0 = nan`, and poisoned the batch.  The
+    relative form's only failure mode is underflow to zero, and underflow to
+    zero is the right answer: it means that position has fully decayed.
+    """
+    torch.manual_seed(0)
+    layout = LAYOUTS["shared_key"]
+    q, k, v, beta, _ = make_inputs(layout, seq_len=128, dtype=dtype)
+    log_alpha = torch.full_like(beta, -200.0 / 128)
+
+    out, state = chunk_gated_delta(q, k, v, beta, log_alpha, 128)
+
+    assert torch.isfinite(out).all(), "extreme decay must not produce inf or nan"
+    assert torch.isfinite(state).all()
+
+    out_seq, _ = sequential_gated_delta(q, k, v, beta, log_alpha)
+    assert (out - out_seq).abs().max() < (EXACT if dtype is torch.float64 else FP32)
 
 
 def test_decode_conv_matches_the_library_call():
@@ -574,7 +655,7 @@ def test_any_sequence_length_works_and_is_exact(seq_len):
     """
     torch.manual_seed(0)
     layout = LAYOUTS["shared_key"]
-    q, k, v, beta, log_alpha = make_inputs(layout, seq_len=seq_len, chunk=16)
+    q, k, v, beta, log_alpha = make_inputs(layout, seq_len=seq_len)
 
     out, state = chunk_gated_delta(q, k, v, beta, log_alpha, 16)
     out_seq, state_seq = sequential_gated_delta(q, k, v, beta, log_alpha)

@@ -135,13 +135,40 @@ one training scale on one corpus — if your setting differs, measure.
 
 | option | default | what it does |
 |---|---|---|
-| `chunk_size` | 64 | Parallel block size. A power of two. Performance only. |
+| `chunk_size` | 64 | Parallel block size. A power of two. **Performance only** — it does not enter the answer, and it does not bound what the layer can represent. See below. |
 | `conv_size` | 4 | Short causal depthwise convolution on q/k/v. Local mixing, not a positional code — it carries relative offsets only. `0` disables it. |
 | `beta_max` | 2.0 | Write-strength ceiling. Above 1 the update becomes a reflection rather than only a contraction. |
-| `max_chunk_decay` | 8.0 | Bounds accumulated decay within a chunk, which keeps the chunkwise form's `1/γ` in range. |
 | `centre` | `False` | Learned per-head key/query centres, subtracted before the l2 norm. Zero-initialised, so switching it on is an exact no-op until training moves it. |
 | `norm_eps` | 1e-5 | Output RMSNorm epsilon. |
 | `dropout` | 0.0 | Applied after the output projection. |
+
+### Why `chunk_size` is only performance
+
+Worth stating explicitly, because for a while it was not true here.
+
+The chunkwise form absorbs the decay by writing the state as `M_t = γ_t M̃_t`.
+Everything that reaches an output is then the ratio `γ_t / γ_i` for `i ≤ t`,
+which lies in `(0, 1]`. The direct way to compute that is `exp(g_t − g_i)` for
+`g = log γ`; the tempting way is `γ_t · (1/γ_i)`, which reaches the same answer
+through a factor that grows without bound. In fp32, `1/γ` passes the largest
+representable value once accumulated decay within a chunk exceeds ≈88.7.
+
+A layer computing it the second way needs a ceiling on accumulated decay to stay
+in range — and that ceiling is a bound on `Σ log α` *within one chunk*, so it
+implies a shortest expressible half-life of
+
+```
+    chunk_size · ln 2 / ceiling
+```
+
+which is **linear in the chunk size**. A parameter chosen to tile the sequence
+for the GPU then decides how fast a head is permitted to forget, and raising it
+for throughput silently lengthens the shortest memory the model can express.
+
+This implementation forms the relative decay directly, so no ceiling exists and
+no such coupling exists. If you are comparing against an implementation that has
+a `max_chunk_decay`, `decay_bound` or similar, that is what it is for — and its
+`chunk_size` is not a free parameter in the way this one is.
 
 ## Positional encoding
 
