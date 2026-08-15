@@ -26,6 +26,11 @@ are worth repeating where the code lives:
 * **Centring is zero-initialised**, so a checkpoint from an uncentred model
   loads and behaves identically by construction.  There is a test for that;
   a construction claim deserves better than a comment.
+* **`decay` chooses where the timescale lives**, and it is a name rather than a
+  boolean.  `β` is pinned to the key group by the UT/WY inverse; `α` is not, and
+  giving each state its own is `decay="state"` — free of the `O(C³)` solve,
+  which stays shared.  §3.4 names a third arrangement (a fixed geometric band),
+  so a two-valued flag would have been the wrong shape to ship.
 
 Streaming works the way the rest of Lumen's components do — ``init_state`` /
 ``step`` / ``forward(..., state=, return_state=)`` — so a block can hold this or
@@ -36,6 +41,7 @@ short-conv cache, constant in generated length.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 import torch.nn as nn
@@ -104,6 +110,27 @@ class GatedDeltaNetConfig:
         centre:   Subtract a learned per-head centre from `q` and `k` before
                   the l2 norm.  Zero-initialised, so turning it on is an exact
                   no-op until training moves it.
+        decay:    Where the forgetting timescale lives, and **how much of it is
+                  data-dependent** — the second half is easy to miss and is the
+                  difference between the last two:
+
+                  * ``"key_group"`` — one rate per address space, modulated by
+                    the input.  Where the contributing lineages put it, and what
+                    every existing checkpoint was trained under.
+                  * ``"state"`` — each state gets its own *baseline* via a
+                    zero-initialised offset inside the softplus, but they all
+                    share one data-dependent signal.  A rigid band that breathes
+                    together: when the gate says "forget faster here", every
+                    state does, from its own starting point.  Costs `H` scalars
+                    and is an exact identity at init.
+                  * ``"state_gated"`` — each state gets its own rate *and* its
+                    own modulation, by widening ``a_proj`` to `H` outputs.  The
+                    fully independent arrangement, at `d_model · (H − G_k)`
+                    extra weights.
+
+                  **Not a boolean**, and the reason is the gap between the last
+                  two: "per-state decay" names two different models and only one
+                  of them is a band.
         norm_eps: Per-head output RMSNorm epsilon.
         dropout:  Applied to the layer output, after the output projection.
     """
@@ -116,6 +143,7 @@ class GatedDeltaNetConfig:
     conv_size: int = 4
     beta_max: float = 2.0
     centre: bool = False
+    decay: Literal["key_group", "state", "state_gated"] = "key_group"
     norm_eps: float = 1e-5
     dropout: float = 0.0
 
@@ -134,6 +162,29 @@ class GatedDeltaNetConfig:
             raise ValueError(f"conv_size must be >= 0, got {self.conv_size}")
         if self.beta_max <= 0:
             raise ValueError(f"beta_max must be > 0, got {self.beta_max}")
+        # 2 is not a taste ceiling.  The UT/WY solve advances by
+        # `(I - beta k k^T)`, whose spectral norm is `max(1, |1 - beta|)` -- so
+        # it is norm-preserving for every beta in [0, 2] and expanding past it,
+        # geometrically in `chunk_size`.  Measured on one machine, near-identical
+        # unit keys, fp64: `max|inv(I+N)|` is flat at 1.98 from C=16 to C=256 at
+        # beta_max = 2, and rises 5.8 -> 1.7e8 over the same range at 2.1.
+        #
+        # The relative decay damps the solve, which hides this whenever
+        # forgetting is fast -- and stops hiding it as `alpha -> 1`, since then
+        # `rel -> 1` and the solve sees the undamped matrix.  A value that is
+        # safe during early training and unsafe once the model learns to
+        # remember is worse than one that is simply refused.
+        if self.beta_max > 2.0:
+            raise ValueError(
+                f"beta_max must be <= 2, got {self.beta_max}; past 2 the delta "
+                f"update expands rather than reflects and the UT/WY inverse "
+                f"grows geometrically in chunk_size"
+            )
+        if self.decay not in ("key_group", "state", "state_gated"):
+            raise ValueError(
+                f"decay must be 'key_group', 'state' or 'state_gated', "
+                f"got {self.decay!r}"
+            )
         if self.norm_eps <= 0:
             raise ValueError(f"norm_eps must be > 0, got {self.norm_eps}")
         if not 0.0 <= self.dropout < 1.0:
@@ -263,7 +314,12 @@ class GatedDeltaNet(nn.Module):
         self.q_proj = nn.Linear(d_model, n_heads * d_k, bias=False)
         self.k_proj = nn.Linear(d_model, n_key_groups * d_k, bias=False)
         self.v_proj = nn.Linear(d_model, n_value_groups * d_v, bias=False)
-        self.a_proj = nn.Linear(d_model, n_key_groups, bias=True)
+        # `state_gated` is the only arrangement that widens this: one gate per
+        # state rather than one per address space.  `state` keeps it narrow and
+        # adds constants, which is why the two are different models and not two
+        # spellings of one.
+        n_decay = n_heads if config.decay == "state_gated" else n_key_groups
+        self.a_proj = nn.Linear(d_model, n_decay, bias=True)
         self.b_proj = nn.Linear(d_model, n_key_groups, bias=True)
         self.g_proj = nn.Linear(d_model, n_heads * d_v, bias=False)
         self.o_proj = nn.Linear(n_heads * d_v, d_model, bias=False)
@@ -288,9 +344,44 @@ class GatedDeltaNet(nn.Module):
         else:
             self.q_centre = self.k_centre = None
 
+        # Per-state decay as an OFFSET inside the softplus rather than a wider
+        # `a_proj`.  Three things follow, and the first is the one that matters:
+        # zero-initialised, it is the shared layer exactly, so the arrangement
+        # can be turned on without also changing what the layer computes.  It
+        # also costs H scalars instead of `d_model * (H - G_k)` weights, and it
+        # makes §3.4's geometric band a different *init* of this same parameter
+        # rather than a third code path.
+        #
+        # Symmetry breaks the moment training starts: each state's alpha now
+        # multiplies a different memory, so the gradients differ even where the
+        # values do not.
+        if config.decay == "state":
+            self.a_offset = nn.Parameter(
+                torch.zeros(n_key_groups, layout.states_per_key_group)
+            )
+        else:
+            self.a_offset = None
+
         # Start with slow forgetting: softplus(bias) small => alpha near 1.
         nn.init.constant_(self.a_proj.bias, -3.0)
         nn.init.zeros_(self.b_proj.bias)
+
+        if config.decay == "state_gated":
+            # Every state in a key group starts on the SAME gate, so the layer
+            # begins in the `key_group` arrangement and has to earn its way out
+            # of it -- the same discipline `state`'s zero-init offset enforces.
+            #
+            # It is a weaker guarantee than `state`'s, and the difference is
+            # worth naming: `state` is an EXACT identity with `key_group`
+            # because it adds zero to the same projection, while this one only
+            # reproduces the ARRANGEMENT.  A wider `nn.Linear` draws a different
+            # number of values, so its rates are not the rates a `key_group`
+            # layer built from the same seed would have had.  Structurally
+            # equal at init, numerically its own layer.
+            m = layout.states_per_key_group
+            with torch.no_grad():
+                shared = self.a_proj.weight[:n_key_groups].clone()
+                self.a_proj.weight.copy_(shared.repeat_interleave(m, dim=0))
 
     # ── seams ─────────────────────────────────────────────────────────────
 
@@ -354,8 +445,23 @@ class GatedDeltaNet(nn.Module):
         # represent: at the old defaults a head could not forget faster than
         # every 5.5 positions, and moving to `chunk_size = 128` for performance
         # would have doubled that to 11 without anyone choosing it.
-        log_alpha = -F.softplus(self.a_proj(x))
-        log_alpha = log_alpha.permute(0, 2, 1).unsqueeze(2)
+        decay = self.a_proj(x)
+        if config.decay == "state_gated":
+            # (B, T, H) -> (B, G_k, m, T).  Heads are key-group-major by the
+            # layout's own invariant, so this is a reshape and never a gather --
+            # the same guarantee `q` relies on a few lines above.
+            log_alpha = -F.softplus(decay)
+            log_alpha = log_alpha.view(batch, seq_len, n_key_groups, m)
+            log_alpha = log_alpha.permute(0, 2, 3, 1)
+        elif self.a_offset is None:
+            # (B, T, G_k) -> (B, G_k, 1, T): one timescale per key group.
+            log_alpha = -F.softplus(decay).permute(0, 2, 1).unsqueeze(2)
+        else:
+            # (B, T, G_k, m) -> (B, G_k, m, T).  The offset is inside the
+            # softplus, not added to its output, so `alpha` stays in (0, 1] by
+            # the same construction rather than by a clamp.
+            log_alpha = -F.softplus(decay.unsqueeze(-1) + self.a_offset)
+            log_alpha = log_alpha.permute(0, 2, 3, 1)
 
         return q, k, v, beta, log_alpha, new_cache
 
@@ -498,5 +604,5 @@ class GatedDeltaNet(nn.Module):
             f"d_model={config.d_model}, layout={config.layout.describe()}, "
             f"d_k={config.d_k}, d_v={config.d_v}, "
             f"expand_k={config.expand_k}, expand_v={config.expand_v}, "
-            f"centre={config.centre}"
+            f"centre={config.centre}, decay={config.decay}"
         )

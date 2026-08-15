@@ -13,6 +13,7 @@ consistent with fp32, never the fp64 one.
 
 from __future__ import annotations
 
+import itertools
 import math
 
 import pytest
@@ -48,8 +49,15 @@ LAYOUTS = {
 }
 
 
-def make_inputs(layout, seq_len=128, batch=2, d_k=16, d_v=12, dtype=torch.float64):
+def make_inputs(
+    layout, seq_len=128, batch=2, d_k=16, d_v=12, dtype=torch.float64, decay="shared"
+):
     """Kernel-shaped inputs obeying the layer's own invariants.
+
+    ``decay`` selects the state axis of `log_alpha`: ``"shared"`` gives one
+    timescale per key group (axis 1, the shipped arrangement) and ``"per_state"``
+    gives every state its own as a geometric band of half-lives — §3.4's
+    motivating case, and the one that has to reach the oracle.
 
     **The decay is unclamped, deliberately.**  This fixture used to end with
     ``.clamp(min=-8.0 / chunk)`` -- `max_chunk_decay` hard-coded into the test
@@ -69,7 +77,15 @@ def make_inputs(layout, seq_len=128, batch=2, d_k=16, d_v=12, dtype=torch.float6
         torch.randn(batch, seq_len, layout.n_value_groups, d_v, dtype=dtype), layout
     )
     beta = 2.0 * torch.sigmoid(torch.randn(batch, g_k, 1, seq_len, dtype=dtype))
-    log_alpha = -F.softplus(torch.randn(batch, g_k, 1, seq_len, dtype=dtype))
+
+    states = 1 if decay == "shared" else m
+    log_alpha = -F.softplus(torch.randn(batch, g_k, states, seq_len, dtype=dtype))
+    if decay != "shared":
+        # A geometric band across the states: two decades of half-life, which is
+        # the spread someone turns this on to get.  Uniform rates would let the
+        # per-state path pass by accident.
+        band = torch.logspace(0, 2, m, dtype=dtype).view(1, 1, m, 1)
+        log_alpha = log_alpha * band
     return q, k, v, beta, log_alpha
 
 
@@ -242,6 +258,223 @@ def test_zero_beta_is_pure_decay():
 
     expected = memory * log_alpha.sum(-1)[..., None, None].exp().transpose(2, 2)
     assert (final - expected).abs().max() < EXACT
+
+
+# ── per-state decay (§3.4's seam, taken) ──────────────────────────────────
+
+
+def test_the_oracle_was_per_state_ready_before_the_fast_path():
+    """`recurrent_gated_delta` needed no code for this, and that is a claim.
+
+    `alpha[..., None, None]` broadcasts against a state of `(B, G_k, m, d_k, d_v)`
+    whether the axis is 1 or m.  Relying on that silently would be how it quietly
+    stops being true, so: an m-wide alpha whose rows agree must reproduce the
+    shared answer *exactly* — same values, same elementwise multiply, no
+    tolerance earned or needed.
+    """
+    torch.manual_seed(0)
+    layout = LAYOUTS["shared_key"]
+    q, k, v, beta, log_alpha = make_inputs(layout, seq_len=32)
+
+    widened = log_alpha.expand(-1, -1, layout.states_per_key_group, -1).contiguous()
+    shared_out, shared_state = sequential_gated_delta(q, k, v, beta, log_alpha)
+    wide_out, wide_state = sequential_gated_delta(q, k, v, beta, widened)
+
+    assert torch.equal(shared_out, wide_out)
+    assert torch.equal(shared_state, wide_state)
+
+
+@pytest.mark.parametrize("name", list(LAYOUTS))
+def test_chunkwise_matches_sequential_with_per_state_decay(name):
+    """The gate the whole feature answers to, at every layout.
+
+    Same bound as the shared case: the chunkwise and sequential paths are the
+    same recurrence reached by two routes, and per-state decay does not make
+    that any less true.
+    """
+    torch.manual_seed(0)
+    layout = LAYOUTS[name]
+    q, k, v, beta, log_alpha = make_inputs(layout, decay="per_state")
+    assert log_alpha.shape[2] == layout.states_per_key_group
+
+    out_chunk, state_chunk = chunk_gated_delta(q, k, v, beta, log_alpha, 32)
+    out_seq, state_seq = sequential_gated_delta(q, k, v, beta, log_alpha)
+
+    assert (out_chunk - out_seq).abs().max() < EXACT
+    assert (state_chunk - state_seq).abs().max() < EXACT
+
+
+@pytest.mark.parametrize("chunk", [1, 2, 8, 32, 128])
+def test_per_state_decay_is_independent_of_chunk_size(chunk):
+    torch.manual_seed(0)
+    layout = LAYOUTS["crossed_2x4"]
+    q, k, v, beta, log_alpha = make_inputs(layout, seq_len=128, decay="per_state")
+
+    out, state = chunk_gated_delta(q, k, v, beta, log_alpha, chunk)
+    out_seq, state_seq = sequential_gated_delta(q, k, v, beta, log_alpha)
+
+    assert (out - out_seq).abs().max() < EXACT
+    assert (state - state_seq).abs().max() < EXACT
+
+
+def test_per_state_decay_carries_state_across_calls():
+    torch.manual_seed(0)
+    layout = LAYOUTS["shared_key"]
+    q, k, v, beta, log_alpha = make_inputs(layout, seq_len=128, decay="per_state")
+
+    whole, final = chunk_gated_delta(q, k, v, beta, log_alpha, 32)
+
+    split = 64
+    first, mid = chunk_gated_delta(
+        q[..., :split, :], k[..., :split, :], v[..., :split, :],
+        beta[..., :split], log_alpha[..., :split], 32,
+    )
+    second, end = chunk_gated_delta(
+        q[..., split:, :], k[..., split:, :], v[..., split:, :],
+        beta[..., split:], log_alpha[..., split:], 32, mid,
+    )
+
+    assert (torch.cat([first, second], dim=-2) - whole).abs().max() < EXACT
+    assert (end - final).abs().max() < EXACT
+
+
+def test_per_state_decay_reduces_to_shared_when_the_rows_agree():
+    """Turning the axis on without spreading the rates must change nothing.
+
+    Not bit-exact, and deliberately so: the two paths reach the same object by
+    opposite routes — damp-then-solve versus solve-then-damp — so agreement here
+    is the homomorphism `inv((I+N)*rel) = inv(I+N)*rel` holding numerically, not
+    a shape change.  That is exactly the claim the per-state route rests on.
+    """
+    torch.manual_seed(0)
+    layout = LAYOUTS["crossed_2x4"]
+    q, k, v, beta, log_alpha = make_inputs(layout, seq_len=64)
+
+    widened = log_alpha.expand(-1, -1, layout.states_per_key_group, -1).contiguous()
+    shared_out, shared_state = chunk_gated_delta(q, k, v, beta, log_alpha, 16)
+    wide_out, wide_state = chunk_gated_delta(q, k, v, beta, widened, 16)
+
+    assert (shared_out - wide_out).abs().max() < EXACT
+    assert (shared_state - wide_state).abs().max() < EXACT
+
+
+def test_per_state_decay_actually_gives_each_state_its_own_horizon():
+    """Otherwise every test above passes on a feature that does nothing.
+
+    Drive one state to forget fast and another slowly, with no writes at all, and
+    the surviving memory must follow each state's own rate rather than a shared
+    one.  Checked against the closed form, per state.
+    """
+    torch.manual_seed(0)
+    layout = LAYOUTS["shared_key"]  # one key group, eight states
+    m = layout.states_per_key_group
+    q, k, v, beta, _ = make_inputs(layout, seq_len=64)
+    beta = torch.zeros_like(beta)
+
+    rates = -torch.logspace(-2, 0, m, dtype=torch.float64).view(1, 1, m, 1)
+    log_alpha = rates.expand(2, 1, m, 64).contiguous()
+
+    memory = torch.randn(2, 1, m, 16, 12, dtype=torch.float64)
+    _, final = chunk_gated_delta(q, k, v, beta, log_alpha, 16, memory)
+
+    expected = memory * log_alpha.sum(-1)[..., None, None].exp()
+    assert (final - expected).abs().max() < EXACT
+
+    # and the states genuinely differ: the fastest has forgotten, the slowest
+    # has barely started.  Without this the closed form above is satisfiable by
+    # a layer that applied state 0's rate to everything.
+    survival = (final.abs().sum(dim=(-1, -2)) / memory.abs().sum(dim=(-1, -2)))[0, 0]
+    assert survival[0] > 0.5, "the slowest state should still remember"
+    assert survival[-1] < 1e-20, "the fastest state should have forgotten"
+
+
+def test_the_triangular_solve_stays_shared_under_per_state_decay(monkeypatch):
+    """The rectangle rule's `O(C^3)` paid `G_k` times, not `H` times (§3.1).
+
+    Per-state decay had an obvious implementation that pays it `H` times — fold
+    each state's `rel` in and solve `m` times.  This module takes the other route
+    precisely to avoid that, so the cost claim is worth holding to structurally
+    rather than in a benchmark that nobody runs.  The solve's batch must not
+    widen with the state axis.
+    """
+    from lumen.gdn import reference
+
+    seen: list[tuple[int, ...]] = []
+    original = reference.inv_unit
+
+    def recording(matrix):
+        seen.append(tuple(matrix.shape))
+        return original(matrix)
+
+    monkeypatch.setattr(reference, "inv_unit", recording)
+
+    torch.manual_seed(0)
+    layout = LAYOUTS["shared_key"]  # G_k = 1, m = 8: the worst case for this
+    for decay in ("shared", "per_state"):
+        seen.clear()
+        q, k, v, beta, log_alpha = make_inputs(layout, seq_len=64, decay=decay)
+        reference.chunk_gated_delta(q, k, v, beta, log_alpha, 16)
+
+        assert len(seen) == 1, "more than one solve per call"
+        assert seen[0][2] == 1, (
+            f"{decay}: the solve's state axis is {seen[0][2]}, not 1 — the "
+            f"inverse is being built per state and the rectangle rule is gone"
+        )
+
+
+def test_the_kernel_refuses_a_wide_log_alpha_it_would_mishandle():
+    """A wrong answer that does not raise is the worst failure mode here.
+
+    Before the state axis was plumbed through, a wide `log_alpha` flowed into
+    several `[:, :, 0]` slices that applied **state 0's decay to every state**
+    and returned a plausible tensor of the right shape.  The seam was documented
+    as open, so acting on it was exactly what a reader was invited to do.
+    """
+    torch.manual_seed(0)
+    layout = LAYOUTS["shared_key"]
+    q, k, v, beta, log_alpha = make_inputs(layout, seq_len=32)
+
+    with pytest.raises(ValueError, match="log_alpha's state axis"):
+        chunk_gated_delta(q, k, v, beta, log_alpha.expand(-1, -1, 3, -1), 16)
+
+    with pytest.raises(ValueError, match="beta must be per key group"):
+        chunk_gated_delta(
+            q, k, v, beta.expand(-1, -1, layout.states_per_key_group, -1), log_alpha, 16
+        )
+
+
+def test_beta_max_two_is_the_stability_boundary_of_the_undamped_solve():
+    """Why solve-then-damp is safe, held to as a property rather than a comment.
+
+    Forward substitution on `I + N` is the delta rule: `Z` advances by
+    `(I - beta k k^T)`, whose spectral norm is `max(1, |1 - beta|)` — exactly 1
+    for every beta in [0, 2].  So the undamped inverse is bounded independent of
+    the chunk size, which is what lets the decay be applied *after* the solve and
+    the solve stay shared across states.
+
+    Past 2 the operator expands and the growth is geometric in `C`.  That is not
+    only a per-state concern: `rel -> 1` as `alpha -> 1`, so slow forgetting
+    leaves the shared path's solve undamped too.
+    """
+    def peak(chunk: int, beta_max: float) -> float:
+        torch.manual_seed(0)
+        base = F.normalize(torch.randn(8, dtype=torch.float64), dim=-1)
+        keys = F.normalize(
+            base + 0.01 * torch.randn(chunk, 8, dtype=torch.float64), dim=-1
+        )
+        matrix = (beta_max * (keys @ keys.T)).tril(-1)
+        return inv_unit(matrix).abs().amax().item()
+
+    # Bounded, and flat in the chunk size, right up to the ceiling.
+    for beta_max in (0.5, 1.0, 1.9, 2.0):
+        peaks = [peak(chunk, beta_max) for chunk in (16, 64, 256)]
+        assert max(peaks) < 2.0, f"beta_max={beta_max} is not bounded by 2"
+        assert max(peaks) - min(peaks) < 0.01, (
+            f"beta_max={beta_max} grows with the chunk size: {peaks}"
+        )
+
+    # And past it, geometric -- so the ceiling is load-bearing, not decorative.
+    assert peak(256, 2.5) > 1e20
 
 
 def test_assign_values_is_a_view_for_named_layouts():
@@ -521,6 +754,246 @@ def test_centring_is_live_once_moved():
         after = layer(x)
 
     assert (before - after).abs().max() > 1e-3
+
+
+def test_zero_init_per_state_decay_is_the_shared_layer():
+    """The construction claim for `decay="state"`, and its honest tolerance.
+
+    `centre` gets `torch.equal` because subtracting an exact zero is exact.
+    This one does not, and the difference is worth being precise about rather
+    than papering over: the offset is zero so the *decay values* are identical,
+    but a per-state `log_alpha` sends the kernel down the solve-then-damp route
+    while the shared one damps first.  Same object, opposite routes, so the
+    guarantee is "mathematically the same layer, agreeing to the fp64 gate" and
+    not bit-identity.  Claiming the stronger one would be false.
+    """
+    torch.manual_seed(0)
+    plain = make_layer(decay="key_group")
+    torch.manual_seed(0)
+    per_state = make_layer(decay="state")
+
+    plain_params = dict(plain.named_parameters())
+    for name, param in per_state.named_parameters():
+        if name in plain_params:
+            assert torch.equal(param, plain_params[name]), name
+    assert torch.equal(per_state.a_offset, torch.zeros_like(per_state.a_offset))
+
+    x = torch.randn(2, 32, 64, dtype=torch.float64)
+    with torch.no_grad():
+        assert (plain(x) - per_state(x)).abs().max() < EXACT
+
+
+def test_per_state_decay_is_live_once_the_offset_moves():
+    """The flag must not be inert -- otherwise the test above proves nothing."""
+    torch.manual_seed(0)
+    layer = make_layer(decay="state")
+    x = torch.randn(2, 32, 64, dtype=torch.float64)
+
+    with torch.no_grad():
+        before = layer(x)
+        layer.a_offset.normal_(0.0, 1.0)
+        after = layer(x)
+
+    assert (before - after).abs().max() > 1e-3
+
+
+def test_per_state_decay_gives_the_layer_distinct_horizons():
+    """What someone turns this on for: the states must forget at different rates.
+
+    Checked on `log_alpha` itself rather than on the output, because that is
+    where the claim lives -- a spread in the outputs could come from anywhere.
+    """
+    torch.manual_seed(0)
+    layer = make_layer(LAYOUTS["shared_key"], decay="state")
+    m = layer.config.layout.states_per_key_group
+
+    with torch.no_grad():
+        # A geometric band is an init of this parameter, not another code path.
+        layer.a_offset.copy_(torch.linspace(-2.0, 2.0, m).view(1, m))
+
+    x = torch.randn(2, 32, 64, dtype=torch.float64)
+    _, _, _, _, log_alpha, _ = layer._features(x)
+
+    assert log_alpha.shape[2] == m
+    assert log_alpha.max() <= 0.0, "alpha must stay in (0, 1]"
+
+    half_lives = math.log(2) / -log_alpha.mean(dim=(0, 1, 3))
+    assert half_lives[0] > 10.0 * half_lives[-1], (
+        f"the band is not producing distinct horizons: {half_lives.tolist()}"
+    )
+
+
+def test_per_state_decay_backward_reaches_the_offset():
+    torch.manual_seed(0)
+    layer = make_layer(decay="state")
+    x = torch.randn(2, 32, 64, dtype=torch.float64, requires_grad=True)
+    layer(x).square().mean().backward()
+
+    missing = [n for n, p in layer.named_parameters() if p.grad is None]
+    assert not missing, f"no gradient reached: {missing}"
+    assert layer.a_offset.grad.abs().max() > 0.0, "the offset is not being trained"
+
+
+def test_per_state_decay_costs_one_scalar_per_state():
+    layout = LAYOUTS["shared_key"]
+    shared, per_state = make_layer(layout), make_layer(layout, decay="state")
+    added = sum(p.numel() for p in per_state.parameters()) - sum(
+        p.numel() for p in shared.parameters()
+    )
+    assert added == layout.n_heads, (
+        "per-state decay should cost H scalars, not a wider projection"
+    )
+
+
+def test_per_state_decay_streams():
+    """The interface commitment holds for both arrangements, not just the old one."""
+    torch.manual_seed(0)
+    layer = make_layer(LAYOUTS["crossed_2x4"], decay="state")
+    with torch.no_grad():
+        layer.a_offset.normal_(0.0, 1.0)
+    x = torch.randn(2, 32, 64, dtype=torch.float64)
+
+    parallel = layer(x)
+    state = layer.init_state(2, dtype=torch.float64)
+    stepped = []
+    for t in range(x.shape[1]):
+        y, state = layer.step(x[:, t:t + 1], state)
+        stepped.append(y)
+
+    assert (torch.cat(stepped, dim=1) - parallel).abs().max() < EXACT
+
+
+def test_decay_arrangements_do_not_silently_mix_checkpoints():
+    """Same rule as centring: crossing the boundary must be loud."""
+    shared, per_state = make_layer(decay="key_group"), make_layer(decay="state")
+    with pytest.raises(RuntimeError, match="[Uu]nexpected key"):
+        shared.load_state_dict(per_state.state_dict())
+    with pytest.raises(RuntimeError, match="[Mm]issing key"):
+        per_state.load_state_dict(shared.state_dict())
+
+
+@pytest.mark.parametrize("name", ["shared_key", "diagonal", "crossed_2x4", "single"])
+def test_state_gated_reaches_the_oracle(name):
+    """`state_gated` is a wider projection, not a different recurrence."""
+    torch.manual_seed(0)
+    layer = make_layer(LAYOUTS[name], d_model=64 if LAYOUTS[name].n_heads > 1 else 8,
+                       decay="state_gated")
+    with torch.no_grad():
+        layer.a_proj.weight.normal_(0.0, 0.5)  # break the shared-gate init
+    x = torch.randn(2, 32, layer.config.d_model, dtype=torch.float64)
+
+    q, k, v, beta, log_alpha, _ = layer._features(x)
+    assert log_alpha.shape[2] == LAYOUTS[name].states_per_key_group
+
+    out, state = layer._scan(q, k, v, beta, log_alpha, None)
+    out_seq, state_seq = sequential_gated_delta(q, k, v, beta, log_alpha)
+    assert (out - out_seq).abs().max() < EXACT
+    assert (state - state_seq).abs().max() < EXACT
+
+
+def test_state_gated_starts_in_the_key_group_arrangement():
+    """The weaker of the two init guarantees, stated as the weaker one.
+
+    `state` is an EXACT identity with `key_group` — it adds zero to the same
+    projection.  `state_gated` cannot be: a wider `nn.Linear` draws a different
+    number of values, so its rates are not the rates the narrow layer would have
+    had from the same seed.  What it *does* guarantee is the ARRANGEMENT — every
+    state in a key group on one gate, so the layer has to earn its way out.
+    Asserting the stronger claim here would be false, and asserting nothing
+    would let the init silently stop mattering.
+    """
+    torch.manual_seed(0)
+    gated = make_layer(decay="state_gated")
+    torch.manual_seed(0)
+    shared = make_layer(decay="key_group")
+    x = torch.randn(2, 32, 64, dtype=torch.float64)
+
+    *_, log_alpha, _ = gated._features(x)
+    assert torch.equal(log_alpha, log_alpha[:, :, :1].expand_as(log_alpha)), (
+        "states within a key group do not start on one gate"
+    )
+    # ...and it is its own layer, not a re-spelling of the narrow one.
+    with torch.no_grad():
+        assert not torch.allclose(gated(x), shared(x))
+
+
+def test_state_gated_is_live_and_independently_modulated():
+    """The property that separates it from `state`: each rate moves on its own.
+
+    Under `state` the eight rates share one data-dependent signal, so perturbing
+    the input moves them together.  Under `state_gated` they are eight functions
+    and need not agree.
+    """
+    torch.manual_seed(0)
+    layer = make_layer(decay="state_gated")
+    with torch.no_grad():
+        layer.a_proj.weight.normal_(0.0, 1.0)
+    x = torch.randn(2, 64, 64, dtype=torch.float64)
+
+    *_, log_alpha, _ = layer._features(x)
+    # across time, do the states' rates vary independently rather than in lockstep?
+    series = log_alpha[0, 0]                      # (m, T)
+    centred = series - series.mean(dim=-1, keepdim=True)
+    corr = torch.corrcoef(centred)
+    off = corr[~torch.eye(corr.shape[0], dtype=torch.bool)]
+    assert off.abs().max() < 0.99, (
+        f"state rates move in lockstep (max |corr| {off.abs().max():.3f}); "
+        f"that is the `state` arrangement, not `state_gated`"
+    )
+
+
+def test_the_two_per_state_arrangements_cost_different_things():
+    """`state` buys baselines for H scalars; `state_gated` buys gates for weights."""
+    layout = LAYOUTS["shared_key"]
+    base = sum(p.numel() for p in make_layer(layout).parameters())
+    band = sum(p.numel() for p in make_layer(layout, decay="state").parameters())
+    gated = sum(p.numel() for p in make_layer(layout, decay="state_gated").parameters())
+
+    config = make_layer(layout).config
+    extra = layout.n_heads - layout.n_key_groups
+    assert band - base == layout.n_heads
+    # a wider projection: weights and biases for the states beyond the first
+    assert gated - base == extra * (config.d_model + 1)
+    assert gated > band, "the gated arrangement should be the expensive one"
+
+
+def test_state_gated_backward_reaches_every_gate():
+    torch.manual_seed(0)
+    layer = make_layer(decay="state_gated")
+    x = torch.randn(2, 32, 64, dtype=torch.float64, requires_grad=True)
+    layer(x).square().mean().backward()
+
+    grad = layer.a_proj.weight.grad
+    assert grad is not None and torch.isfinite(grad).all()
+    # every state's gate must receive its own signal, not just the first
+    assert (grad.abs().sum(dim=-1) > 0).all(), "some state's gate got no gradient"
+
+
+def test_the_three_decay_arrangements_do_not_mix_checkpoints():
+    layers = {name: make_layer(decay=name)
+              for name in ("key_group", "state", "state_gated")}
+    for a, b in itertools.permutations(layers, 2):
+        with pytest.raises(RuntimeError):
+            layers[a].load_state_dict(layers[b].state_dict())
+
+
+def test_config_refuses_a_beta_max_the_solve_cannot_survive():
+    """The ceiling is load-bearing, so it is enforced rather than documented.
+
+    `beta_max > 2` makes the delta update expand instead of reflect, and the
+    UT/WY inverse grows geometrically in `chunk_size`.  The relative decay hides
+    it while forgetting is fast and stops hiding it as `alpha -> 1`, so it is a
+    value that works until a model learns to remember.
+    """
+    with pytest.raises(ValueError, match="beta_max must be <= 2"):
+        GatedDeltaNetConfig(d_model=64, layout=HeadLayout.shared_key(8), beta_max=2.5)
+    # and the boundary itself is allowed, since that is where reflections live
+    assert GatedDeltaNetConfig(
+        d_model=64, layout=HeadLayout.shared_key(8), beta_max=2.0
+    ).beta_max == 2.0
+
+    with pytest.raises(ValueError, match="decay must be"):
+        GatedDeltaNetConfig(d_model=64, layout=HeadLayout.shared_key(8), decay="per_head")
 
 
 def test_centring_cost_is_two_centres_per_head():
