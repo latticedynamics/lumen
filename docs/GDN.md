@@ -121,11 +121,14 @@ construction. Deriving it makes disagreement *unrepresentable* rather than
 *detected*, which is the stronger guarantee: there is no state in which the two
 are both present and wrong.
 
-Two things worth knowing before choosing one. `α` and `β` live on the **key
-group**, so the layout also decides how many independent forgetting timescales
-the layer has — `shared_key` has one. And `diagonal` is the ordinary
-one-key-one-value arrangement, which is there so this layer has something
-outside itself to be compared against.
+Two things worth knowing before choosing one. `β` lives on the **key group**, and
+so does `α` by default — so the layout also decides how many independent
+forgetting timescales the layer has, and `shared_key` has one. That coupling is
+breakable: `decay="state"` gives every state its own timescale without touching
+the addresses, which is the dial to reach for if what you wanted from a layout
+was horizon diversity. And `diagonal` is the ordinary one-key-one-value
+arrangement, which is there so this layer has something outside itself to be
+compared against.
 
 ## Widths
 
@@ -146,8 +149,46 @@ one training scale on one corpus — if your setting differs, measure.
 |---|---|---|
 | `chunk_size` | 64 | Parallel block size. A power of two. **Performance only** — it does not enter the answer, and it does not bound what the layer can represent. See below. |
 | `conv_size` | 4 | Short causal depthwise convolution on q/k/v. Local mixing, not a positional code — it carries relative offsets only. `0` disables it. |
-| `beta_max` | 2.0 | Write-strength ceiling. Above 1 the update becomes a reflection rather than only a contraction. |
+| `beta_max` | 2.0 | Write-strength ceiling. Above 1 the update becomes a reflection rather than only a contraction. **2 is also the maximum**, and it is refused above that — see below. |
 | `centre` | `False` | Learned per-head key/query centres, subtracted before the l2 norm. Zero-initialised, so switching it on is an exact no-op until training moves it. |
+| `decay` | `"key_group"` | Where the forgetting timescale lives. `"state"` gives every state its own, via a zero-initialised offset — so switching it on is an identity at init and diverges under training. Off by default because it is an experiment nobody has run, not because it lost one. |
+
+### Why `beta_max` stops at 2
+
+Not taste. The triangular solve inside the chunkwise form advances by
+`(I − β k kᵀ)`, whose spectral norm is `max(1, |1 − β|)` — exactly 1 for every
+`β` in `[0, 2]`, and greater than 1 past it. At 2 the update is a reflection and
+norm-preserving; beyond, it expands, and the inverse grows *geometrically in
+`chunk_size`*. On one machine, near-identical unit keys in fp64, the largest
+entry of that inverse is flat at 1.98 from `C = 16` to `C = 256` at `β_max = 2`,
+and runs 5.8 → 1.7e8 over the same range at 2.1.
+
+The failure is worse than it looks because it hides: the decay damps the solve,
+so a too-large `beta_max` works while the model forgets quickly and breaks once
+it learns to remember. It is refused on construction instead.
+
+### Per-state decay
+
+`decay="state"` adds one learned scalar per state inside the softplus:
+
+```python
+config = GatedDeltaNetConfig(
+    d_model=512, layout=HeadLayout.shared_key(8), expand_k=2.0, decay="state"
+)
+```
+
+It costs `H` scalars — not a wider projection — and the `O(C³)` triangular solve
+is still built once per key group, so the arrangement does not undo what the head
+layout buys. A **fixed geometric band of timescales** is an init of that same
+parameter rather than a separate option:
+
+```python
+with torch.no_grad():
+    layer.a_offset.copy_(torch.linspace(-2.0, 2.0, m).view(g_k, m))
+```
+
+Checkpoints do not cross the boundary silently: `a_offset` is a new parameter, so
+loading between the two arrangements raises rather than quietly dropping it.
 | `norm_eps` | 1e-5 | Output RMSNorm epsilon. |
 | `dropout` | 0.0 | Applied after the output projection. |
 

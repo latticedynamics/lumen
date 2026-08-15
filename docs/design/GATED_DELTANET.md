@@ -39,7 +39,8 @@ key width is `expand_k · d_model` and total value width `expand_v · d_model`, 
 `d_k` and `d_v` are those divided by the number of states.
 
 **Heads.** A head *is* a state, and a state is a `(key group, value group)`
-pair — §3.1. `α` and `β` are per key group; `q` is per state.
+pair — §3.1. `β` is per key group by necessity and `q` is per state; `α` is
+either, selected by `decay=` and defaulting to the key group — §3.4.1.
 
 **Output.** Per-head RMSNorm over `d_v`, a SiLU gate, then a projection —
 matching Undertow's output side, so a block can hold either mixer without
@@ -292,7 +293,7 @@ library to choose. **Centring ships zero-initialised and off by default** — it
 costs almost nothing, it is bit-identical when off, and the case for turning it
 on has not been made.
 
-### 3.4 `β` must live on the key group; `α` need not — and that seam is documented
+### 3.4 `β` must live on the key group; `α` need not — and that seam is now taken
 
 The layout of §3.1 binds three things at once: which addresses a state uses,
 which payload it writes, and **how fast it forgets** — because the lineage it
@@ -312,9 +313,10 @@ an ungated delta rule whose transform never sees `α`. Therefore:
 - **`β` is per key group by necessity.** It enters the inverse that the layout
   shares. Varying it per state would mean a different `A` per state, and the
   reuse that makes the crossed layout cheap disappears.
-- **`α` could be per state at essentially no cost.** The in-chunk rescaling of
-  `v` is already full-width, and the chunk-boundary factor broadcasts. It would
-  still be one matmul per chunk.
+- **`α` can be per state, and the `O(C³)` solve stays shared.** Not "at
+  essentially no cost", which is what this section claimed while the seam was
+  still hypothetical — see §3.4.1 for what it actually costs and what it does
+  not. The loop is still one matmul per chunk.
 
 That asymmetry is not idle, because of what §3.2 found. Crossing's promised
 benefit *was* horizon diversity, and it obtained that diversity by splitting the
@@ -329,11 +331,86 @@ That reframes the negative result rather than softening it: the crossed layout
 was not wrong to want several timescales, it was wrong about what it had to give
 up to get them.
 
-This is stated as an **open seam, not a decision.** Version 1 places `α` where
-the contributing lineages place it. The record names the constraint, the
-freedom, and the reason anyone would spend the freedom — which is what a
-subclass or a later version needs in order to act on it without re-deriving the
-chunkwise form.
+The seam is now **taken**, as `decay="key_group" | "state"`. What follows is why
+it is a name rather than a boolean, what it costs, and the one claim above that
+did not survive contact with the 0.3 kernel.
+
+### 3.4.1 Taking it: solve-then-damp, and why `β_max = 2` is what makes it free
+
+**A name, not a flag.** The obvious surface is `per_state_decay: bool = False`.
+It was rejected because this section names *three* arrangements, not two — the
+third is the geometric band of fixed timescales, which is not a projection at
+all. A boolean can only say *not the other thing*, so admitting the band later
+would mean a second flag cross-checked against the first, which is exactly the
+failure mode §6.4 of the 0.2 record climbed out of by deriving `n_heads` from
+the layout. `decay="state"` says what the layer *is* and leaves room.
+
+**The parameterisation is an offset, not a wider projection.** `log_alpha[h] =
+−softplus(a_proj(x)[g(h)] + a_offset[h])`, with `a_offset` zero-initialised.
+Three things follow, and the first is why it is shaped this way: at zero it is
+the shared layer exactly, so the arrangement can be turned on without also
+changing what the layer computes. It costs `H` scalars rather than
+`d_model · (H − G_k)` weights. And the geometric band becomes a different *init*
+of this same parameter instead of a third code path. Symmetry breaks as soon as
+training starts, because each state's `α` now multiplies a different `M`.
+
+**The cost, corrected.** The claim above — "essentially no cost" — was written
+against the pre-0.3 kernel and is not right for the one that shipped. `E` reads
+`γ_C`, the chunk-exit factor and `Ŵ`, all of which carry `α`, so the transition
+becomes per state. Two consequences:
+
+- `w` (`O(C²d_k)`) and `transition` (`O(C·d_k²)`) go `m×`, and the `m`-into-the-
+  value-axis fold in the loop is unavailable, since it exists precisely because
+  `E` is shared. Same FLOPs in the loop, one more batched axis.
+- **The `O(C³)` triangular solve does *not*.** This is the part worth the
+  section.
+
+Everything downstream reads `A ⊙ rel`, and `inv((I+N) ⊙ rel) = inv(I+N) ⊙ rel`
+by the homomorphism §3.8 already relies on. So there are two routes: **damp then
+solve** (fold each state's `rel` in, solve `m` times — the rectangle rule's
+`O(C³)`-paid-`G_k`-times gone) or **solve then damp** (solve `I + N` once, since
+it holds no `α` at all, and scale each state's copy after). The second is only
+safe if the *undamped* inverse stays bounded, because nothing shrinks it on the
+way through.
+
+It does, and `β_max = 2` is exactly why. Forward substitution on `I + N` is the
+delta rule itself: with `Z_i = Σ_{m≤i} k_m ⊗ X[m]`,
+
+```
+X[i] = e_i − β_i k_iᵀ Z_{i−1},    Z_i = (I − β_i k_i k_iᵀ) Z_{i−1} + k_i ⊗ e_i
+```
+
+and for a unit key `‖I − β k kᵀ‖₂ = max(1, |1 − β|)` — **exactly 1 for every β in
+[0, 2]**. Identity at 0, reflection at 2, expanding only past it. So `‖Z‖` grows
+at most linearly in `C` and the inverse cannot blow up.
+
+Measured on one machine, near-identical unit keys, fp64, `max|inv(I+N)|`:
+
+| `β_max` | C=16 | C=64 | C=256 |
+|---|---|---|---|
+| 1.00 | 1.000 | 1.000 | 1.000 |
+| 2.00 | 1.981 | 1.982 | 1.983 |
+| 2.10 | 5.79 | 176 | 1.7e8 |
+| 2.50 | 546 | 5.7e10 | 7.0e42 |
+
+Flat in `C` up to the ceiling, geometric past it. And in fp32 against an fp64
+oracle, across correlation, half-life and timescale-spread grids, solve-then-damp
+was **equal or better** than damp-then-solve everywhere — never worse.
+
+This is a *different object* from the `1/γ` that §3.8 rejects, and the difference
+is the whole argument: `1/γ` is unbounded above and reaches fp32's ceiling at
+accumulated decay 88.7, while this is bounded by 2 however long the chunk. The
+resemblance is superficial and the conclusion inverts.
+
+**So `β_max = 2` stops being a taste ceiling and becomes an invariant**, and it
+is enforced on construction rather than documented. Note this was *already* true
+of the shared path: `rel → 1` as `α → 1`, so slow forgetting leaves the solve
+undamped either way. A `β_max` of 3 worked while a model forgot quickly and broke
+once it learned to remember — which is the worst shape a bug can have.
+
+**Still open**, and deliberately not chosen: whether per-state decay is *better*.
+It is an arrangement the layer can now express and an experiment nobody has run.
+The default stays where the contributing lineages put it.
 
 ### 3.5 Defaults are earned, and these two were
 
@@ -598,8 +675,10 @@ ordinary arrangement is reachable:
   is, and a library that rejects one is a library every caller wraps
 - `expand_k` and `expand_v` as dials, defaulted (§3.5)
 - learned key/query centres, zero-initialised, off by default (§3.3)
-- `β ∈ (0, β_max)`, `β_max = 2`; scalar per-key-group `α` and `β`, with §3.4's
-  seam documented
+- `β ∈ (0, β_max)`, `β_max = 2` and **enforced as a ceiling**, because past it
+  the UT/WY solve expands geometrically in `chunk_size` (§3.4.1); scalar
+  per-key-group `β`, and `α` per key group *or* per state via `decay=` (§3.4.1),
+  defaulting to the key group
 - an in-chunk decay clamp, bounding `1/γ` within a chunk
 - fp32 chunkwise, `chunk_size` a power of two, no Triton dependency (§3.6)
 - the sequential single-step form retained, both as the decode path and as the
@@ -611,7 +690,8 @@ Deliberately **out** of this version:
 |---|---|
 | kNN episodic store | an orthogonal memory *architecture* — it carries its own gate and a contrast-loss stash. Its own component, not a layer detail |
 | channel-wise decoupled erase/write gates | scalar decay commutes out of the recurrence, which is what makes the chunkwise form work; a diagonal decay does not factor the same way. New derivation *and* new kernel |
-| per-state decay | the seam is documented (§3.4); turning it on is an experiment, not a default |
+| ~~per-state decay~~ | **landed** as `decay="state"` (§3.4.1). Off by default: it is an arrangement the layer can express and an experiment nobody has run |
+| a fixed geometric band of timescales | reachable as an init of `a_offset` rather than new code, which is why `decay` is a name and not a boolean (§3.4.1). Not canonised — the comparison against a learned per-state decay has not been run |
 | accelerated kernels | ship when measured to win here (§3.6) |
 | byte tokenizer, corpus handling | not the layer's business — this coupling is what made one lineage the longest of the four |
 
@@ -650,5 +730,30 @@ Before any project switches to this layer:
 9. **The shortest expressible half-life does not depend on the chunk size.**
    Driving `α` low yields the same half-life at every chunk size, and one below
    `C · ln2 / 8` — the floor the removed ceiling would have imposed.
+10. **Per-state decay reaches the oracle**, to `1e-9` in fp64 at every layout,
+    across a chunk-size sweep, and across a split-and-resume — the same bar
+    gate 1 sets for the shared arrangement, because it is the same recurrence.
+11. **Per-state decay does not widen the solve.** The triangular inverse is
+    built once per key group in *both* arrangements. Held structurally, by
+    recording the shape the solve is called with, rather than in a benchmark
+    that nobody runs (§3.4.1).
+12. **Zero-initialised `decay="state"` is the shared layer** — to the fp64 gate,
+    not bit for bit, and the difference is the point: the offset is zero so the
+    decay values are identical, but a per-state `log_alpha` sends the kernel
+    down solve-then-damp while the shared one damps first. Claiming bit-identity
+    here, as gate 5 does for centring, would be false.
+13. ~~**Turning on per-state decay does not change the shared path**~~ —
+    **discharged at merge, and not runnable afterwards.** The kernel reproduced
+    the pre-`decay` implementation **bit for bit** — not within a tolerance — over
+    96 configurations: every named layout × {fp32, fp64} × `C ∈ {8,16,32,64}` ×
+    `T ∈ {64, 100}`, checked with `torch.equal` against the implementation
+    extracted from the preceding commit. Like gate 3, it compares against
+    something that no longer exists once it has passed, so it is history rather
+    than a check. What makes it hold is structural and does survive: the shared
+    arrangement keeps damp-then-solve, and the state axis is carried as size 1
+    rather than sliced away, which is a shape change and not an arithmetic one.
+14. **`β_max > 2` is refused on construction.** The ceiling is an invariant of
+    the UT/WY solve, not a preference (§3.4.1), and it is unsafe in the *shared*
+    arrangement too.
 
 Merge → verify → switch → evolve, as four steps. Not one.

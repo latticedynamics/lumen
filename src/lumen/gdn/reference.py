@@ -73,13 +73,48 @@ Shape convention used throughout this package
     k          [B, G_k, 1, T, d_k]      one key per key group
     v          [B, G_k, m, T, d_v]      assembled by `assign_values`
     beta       [B, G_k, 1, T]           write strength, per key group
-    log_alpha  [B, G_k, 1, T]           decay, per key group, <= 0
+    log_alpha  [B, G_k, 1|m, T]         decay, per key group OR per state, <= 0
     M          [B, G_k, m, d_k, d_v]
 
 `beta` is per key group **by necessity** — it enters the UT/WY inverse that the
-key group shares.  `log_alpha` is per key group **by choice**: the inverse never
-sees it, so it could carry an `m` axis at essentially no cost.  See the design
-record; that seam is documented rather than taken.
+key group shares.  `log_alpha` may be either, and the axis is what selects it.
+
+Per-state decay and the shared solve
+------------------------------------
+The seam §3.4 documents is open here.  `log_alpha` with a state axis of `m`
+gives every state its own forgetting timescale; with an axis of `1` it is the
+shared arrangement, and that path is byte-for-byte the one that shipped.
+
+The obvious worry is that per-state decay costs `H` triangular solves instead of
+`G_k` — the exact expense the rectangle rule exists to avoid.  It does not, and
+the reason is worth stating because it is not obvious.
+
+Everything reads `A ⊙ rel`, and by the homomorphism above `inv((I+N) ⊙ rel) =
+inv(I+N) ⊙ rel`.  So there are two routes: **damp then solve** (fold each state's
+`rel` in, solve `m` times) or **solve then damp** (solve `I + N` once — it holds
+no `α` at all — and scale each state's copy after).  The second keeps the solve
+per key group.  It is only safe if the *undamped* inverse stays bounded, since
+nothing shrinks it on the way through.
+
+It does, and `beta_max = 2` is exactly why.  Forward substitution on `I + N` is
+the delta rule itself: with `Z_i = Σ_{m≤i} k_m ⊗ X[m]`,
+
+    X[i] = e_i − β_i k_iᵀ Z_{i−1},   Z_i = (I − β_i k_i k_iᵀ) Z_{i−1} + k_i ⊗ e_i
+
+and for a unit key `‖I − β k kᵀ‖₂ = max(1, |1 − β|)`, which is **exactly 1 for
+every β in [0, 2]** — identity at 0, reflection at 2, expanding only past it.
+So `‖Z‖` grows at most linearly in `C` and the inverse cannot blow up.  Measured
+on near-identical unit keys in fp64, `max|inv(I+N)|` is 1.98 at `C = 16` and 1.98
+at `C = 256` — flat — and at `β = 2.1` it is 5.8 rising to 1.7e8 over the same
+range.  The boundary is sharp and the shipped ceiling sits on the safe side of it.
+
+This is a *different* object from the `1/γ` that §3.8 rejects.  That one is
+unbounded above and reaches fp32's ceiling at accumulated decay 88.7; this one is
+bounded by 2 however long the chunk.  Hence: solve then damp.
+
+**`beta_max > 2` breaks this**, and it breaks the shared path too — `rel → 1` as
+`α → 1`, so slow forgetting leaves the solve undamped either way.  See
+:func:`chunk_gated_delta`.
 """
 
 from __future__ import annotations
@@ -232,16 +267,43 @@ def chunk_gated_delta(
         q: `(B, G_k, m, T, d_k)`, unit-norm.
         k: `(B, G_k, 1, T, d_k)`, unit-norm.
         v: `(B, G_k, m, T, d_v)` — see :func:`assign_values`.
-        beta: `(B, G_k, 1, T)` write strength.
-        log_alpha: `(B, G_k, 1, T)` log decay, `<= 0`.
+        beta: `(B, G_k, 1, T)` write strength.  The `1` is **forced**: `beta`
+            enters the UT/WY inverse the key group shares.
+        log_alpha: `(B, G_k, 1, T)` for one timescale per key group, or
+            `(B, G_k, m, T)` to give every state its own.  Log decay, `<= 0`.
         chunk_size: `C`, a power of two dividing `T`.
         state: `(B, G_k, m, d_k, d_v)` incoming state, or ``None`` for zeros.
 
     Returns:
         `(B, G_k, m, T, d_v)` outputs and the `(B, G_k, m, d_k, d_v)` final state.
+
+    Raises:
+        ValueError: if the state axis of `beta` or `log_alpha` is neither `1`
+            nor (for `log_alpha`) `m`.  Checked rather than broadcast: a wide
+            `log_alpha` used to flow through several `[:, :, 0]` slices that
+            silently applied **state 0's decay to every state** and returned a
+            plausible tensor of the right shape.  A wrong answer that does not
+            raise is the one failure this module can least afford.
     """
     batch, n_key_groups, per_group, seq_len, d_k = q.shape
     d_v = v.shape[-1]
+
+    if beta.shape[2] != 1:
+        raise ValueError(
+            f"beta must be per key group, got state axis {beta.shape[2]}; it "
+            f"enters the UT/WY inverse that the key group shares, so varying it "
+            f"per state would need a different inverse per state"
+        )
+    n_decay = log_alpha.shape[2]
+    if n_decay not in (1, per_group):
+        raise ValueError(
+            f"log_alpha's state axis must be 1 (one timescale per key group) or "
+            f"{per_group} (one per state), got {n_decay}"
+        )
+    # Which of the two routes above.  The shared case keeps the shipped path
+    # exactly -- decay folded in before the solve -- because every experimental
+    # record downstream was produced by it.
+    per_state_decay = n_decay != 1
 
     # A sequence that does not fill its last chunk is padded rather than
     # rejected.  Callers do not get to choose their sequence lengths -- a
@@ -269,10 +331,10 @@ def chunk_gated_delta(
     k = chunkify(k, d_k)
     v = chunkify(v, d_v)
     beta = beta.reshape(batch, n_key_groups, 1, n_chunks, chunk_size)
-    # The `1` here is the documented seam: nothing below this line reads
-    # log_alpha through the UT/WY inverse, so it could carry `per_group` and
-    # give every state its own timescale.  Left as-is in this version.
-    log_alpha = log_alpha.reshape(batch, n_key_groups, 1, n_chunks, chunk_size)
+    # The seam of §3.4, now taken.  This axis is 1 or `m`, and every decay-derived
+    # quantity below inherits it -- so the shared case broadcasts against the
+    # per-state ones exactly as it always did, and the per-state case does not.
+    log_alpha = log_alpha.reshape(batch, n_key_groups, n_decay, n_chunks, chunk_size)
 
     # ── decay absorption, in relative form ────────────────────────────────
     # `g` is non-increasing, so for the only entries anything reads -- `i <= t`
@@ -300,68 +362,106 @@ def chunk_gated_delta(
     strict = torch.ones(
         chunk_size, chunk_size, device=q.device, dtype=torch.bool
     ).tril(-1)
-    # The decay rides INSIDE the inverse rather than around it, which costs
-    # nothing and is the whole trick.  For lower-triangular `A`, `B` and
-    # `D[i,j] = d_i/d_j`, `(A*D)(B*D) = (AB)*D` -- so `A -> A*D` is an algebra
-    # homomorphism on lower-triangular matrices and therefore commutes with
-    # inversion.  Folding `rel` into `N` before the solve yields exactly
-    # `inv(I + N) * rel`, with no intermediate outside (0, 1] ever formed.
-    transform = inv_unit((beta_k @ k.transpose(-1, -2)) * strict * rel)[:, :, 0]
+    # For lower-triangular `A`, `B` and `D[i,j] = d_i/d_j`, `(A*D)(B*D) = (AB)*D`
+    # -- so `A -> A*D` is an algebra homomorphism on lower-triangular matrices
+    # and therefore commutes with inversion.  `rel` is such a `D`.  Which side of
+    # the solve it goes on is therefore free to choose, and the two cases choose
+    # differently; see the module docstring for why both are safe.
+    #
+    # Either way the state axis is KEPT rather than sliced away with `[:, :, 0]`.
+    # Carrying a size-1 axis through costs nothing -- the arithmetic is identical
+    # and the shared path stays bit-for-bit what it was -- and it means the
+    # per-state case is the same expressions with a wider axis, instead of a
+    # second copy of the kernel.
+    strict_n = (beta_k @ k.transpose(-1, -2)) * strict
+    if per_state_decay:
+        # Solve once, undamped, then damp per state: `inv(I+N) * rel`.  `N` holds
+        # no alpha, so this is still ONE solve per key group and the rectangle
+        # rule's O(C^3)-paid-G_k-times survives per-state decay intact.
+        transform = inv_unit(strict_n) * rel
+    else:
+        # Damp first: `inv((I+N) * rel)`.  Identical object, and no intermediate
+        # outside (0, 1] is ever formed.  This is the shipped path, unchanged.
+        transform = inv_unit(strict_n * rel)
 
     # ── everything state-free, batched over all chunks ────────────────────
     # Hatted quantities carry a factor of gamma_i relative to the unscaled ones:
     # `w_hat[i] = gamma_i w[i]` and `pseudo_hat[i] = gamma_i pseudo[i]`.  That
     # factor is what the readout and the state update would otherwise have had
     # to divide back out.
-    w = transform @ (gamma[..., None] * beta_k)[:, :, 0]
-    pseudo = transform[:, :, None] @ (beta[..., None] * v)
-    k_t = k.transpose(-1, -2)[:, :, 0]
+    w = transform @ (gamma[..., None] * beta_k)
+    pseudo = transform @ (beta[..., None] * v)
+    k_t = k.transpose(-1, -2)
     # E = gamma_C I - K^T diag(exp(g_C - g)) W_hat.  The chunk-boundary decay is
     # inside the transition now instead of multiplying the loop body, because
     # the two terms it used to scale together no longer share a factor.
-    transition = gamma[..., -1][:, :, 0][..., None, None] * torch.eye(
+    transition = gamma[..., -1][..., None, None] * torch.eye(
         d_k, device=q.device, dtype=q.dtype
-    ) - k_t @ (exit_decay[:, :, 0][..., None] * w)
+    ) - k_t @ (exit_decay[..., None] * w)
     causal = torch.ones(chunk_size, chunk_size, device=q.device, dtype=torch.bool).tril(0)
-    intra = (q @ k_t[:, :, None]) * causal * rel
+    intra = (q @ k_t) * causal * rel
 
-    # The `m` axis is folded into the value axis: `transition` is shared across
-    # states in a key group, so this makes `E @ M` one batched matmul over
-    # B*G_k with no broadcast.  Expanding it every iteration costs more than
-    # the matmul does.
-    carry = (
-        (k_t[:, :, None] @ (exit_decay[..., None] * pseudo))
-        .permute(0, 1, 3, 4, 2, 5)
-        .reshape(batch, n_key_groups, n_chunks, d_k, per_group * d_v)
-    )
-    memory = (
-        q.new_zeros(batch, n_key_groups, d_k, per_group * d_v)
-        if state is None
-        else state.permute(0, 1, 3, 2, 4).reshape(
-            batch, n_key_groups, d_k, per_group * d_v
-        )
-    )
+    carry = k_t @ (exit_decay[..., None] * pseudo)
 
     # ── the only sequential part: one matmul per chunk ────────────────────
-    # unbind, NOT transition[:, :, n].  Slicing inside the loop makes autograd
-    # allocate and accumulate into a full-size zero buffer once *per iteration*;
-    # on this layer's shapes that memory traffic dominated the step.  unbind's
-    # backward is a single stack.
-    transitions = transition.unbind(2)
-    carries = carry.unbind(2)
+    # unbind, NOT transition[..., n, :, :].  Slicing inside the loop makes
+    # autograd allocate and accumulate into a full-size zero buffer once *per
+    # iteration*; on this layer's shapes that memory traffic dominated the step.
+    # unbind's backward is a single stack.
+    if per_state_decay:
+        # `E` reads gamma, exit_decay and w -- all alpha -- so it is per state
+        # now and cannot be shared across the states of a key group.  The fold
+        # below is therefore unavailable: same FLOPs in the loop, one more
+        # batched axis instead of a wider value axis.
+        memory = (
+            q.new_zeros(batch, n_key_groups, per_group, d_k, d_v)
+            if state is None
+            else state
+        )
+        transitions = transition.unbind(3)
+        carries = carry.unbind(3)
 
-    entering = []
-    for n in range(n_chunks):
-        entering.append(memory)
-        # No boundary factor out front any more -- it is folded into both terms.
-        memory = transitions[n] @ memory + carries[n]
-    stacked = torch.stack(entering, dim=2)
+        entering = []
+        for n in range(n_chunks):
+            entering.append(memory)
+            memory = transitions[n] @ memory + carries[n]
+        unfolded = torch.stack(entering, dim=3)
+    else:
+        # The `m` axis is folded into the value axis: `transition` is shared
+        # across states in a key group, so this makes `E @ M` one batched matmul
+        # over B*G_k with no broadcast.  Expanding it every iteration costs more
+        # than the matmul does.
+        folded = carry.permute(0, 1, 3, 4, 2, 5).reshape(
+            batch, n_key_groups, n_chunks, d_k, per_group * d_v
+        )
+        memory = (
+            q.new_zeros(batch, n_key_groups, d_k, per_group * d_v)
+            if state is None
+            else state.permute(0, 1, 3, 2, 4).reshape(
+                batch, n_key_groups, d_k, per_group * d_v
+            )
+        )
+        transitions = transition[:, :, 0].unbind(2)
+        carries = folded.unbind(2)
+
+        entering = []
+        for n in range(n_chunks):
+            entering.append(memory)
+            # No boundary factor out front any more -- it is folded into both.
+            memory = transitions[n] @ memory + carries[n]
+        stacked = torch.stack(entering, dim=2)
+
+        unfolded = stacked.reshape(
+            batch, n_key_groups, n_chunks, d_k, per_group, d_v
+        ).permute(0, 1, 4, 2, 3, 5)
+        memory = (
+            memory.reshape(batch, n_key_groups, d_k, per_group, d_v)
+            .permute(0, 1, 3, 2, 4)
+            .contiguous()
+        )
 
     # ── readout, all chunks at once ───────────────────────────────────────
-    unfolded = stacked.reshape(
-        batch, n_key_groups, n_chunks, d_k, per_group, d_v
-    ).permute(0, 1, 4, 2, 3, 5)
-    u = pseudo - w[:, :, None] @ unfolded
+    u = pseudo - w @ unfolded
     # carry term + intra-chunk term.  The causal mask is diagonal-INCLUSIVE:
     # position t reads its own write.
     #
@@ -372,11 +472,6 @@ def chunk_gated_delta(
     # factor computed apart from each other.
     out = (q @ unfolded) * gamma[..., None] + intra @ u
 
-    memory = (
-        memory.reshape(batch, n_key_groups, d_k, per_group, d_v)
-        .permute(0, 1, 3, 2, 4)
-        .contiguous()
-    )
     out = out.reshape(batch, n_key_groups, per_group, padded_len, d_v)
     return out[..., :seq_len, :], memory
 
@@ -393,7 +488,14 @@ def recurrent_gated_delta(
 
     Same shapes as :func:`chunk_gated_delta` with the time axis removed:
     `q (B, G_k, m, d_k)`, `k (B, G_k, 1, d_k)`, `v (B, G_k, m, d_v)`,
-    `beta`/`alpha` `(B, G_k, 1)`, `state (B, G_k, m, d_k, d_v)`.
+    `beta (B, G_k, 1)`, `alpha (B, G_k, 1|m)`, `state (B, G_k, m, d_k, d_v)`.
+
+    Per-state decay needs no code here — `alpha[..., None, None]` broadcasts
+    against a state of `(B, G_k, m, d_k, d_v)` whether the axis is `1` or `m`.
+    That is not an accident worth relying on silently, so it is a stated part of
+    the contract and there is a test for it: the specification was per-state
+    ready before the fast path was, which is the order that lets the fast path
+    be checked at all.
 
     Written to be read, not to be fast.  Every optimisation in
     :func:`chunk_gated_delta` is answerable to this function.
