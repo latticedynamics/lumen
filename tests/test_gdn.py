@@ -13,6 +13,7 @@ consistent with fp32, never the fp64 one.
 
 from __future__ import annotations
 
+import itertools
 import math
 
 import pytest
@@ -869,6 +870,111 @@ def test_decay_arrangements_do_not_silently_mix_checkpoints():
         shared.load_state_dict(per_state.state_dict())
     with pytest.raises(RuntimeError, match="[Mm]issing key"):
         per_state.load_state_dict(shared.state_dict())
+
+
+@pytest.mark.parametrize("name", ["shared_key", "diagonal", "crossed_2x4", "single"])
+def test_state_gated_reaches_the_oracle(name):
+    """`state_gated` is a wider projection, not a different recurrence."""
+    torch.manual_seed(0)
+    layer = make_layer(LAYOUTS[name], d_model=64 if LAYOUTS[name].n_heads > 1 else 8,
+                       decay="state_gated")
+    with torch.no_grad():
+        layer.a_proj.weight.normal_(0.0, 0.5)  # break the shared-gate init
+    x = torch.randn(2, 32, layer.config.d_model, dtype=torch.float64)
+
+    q, k, v, beta, log_alpha, _ = layer._features(x)
+    assert log_alpha.shape[2] == LAYOUTS[name].states_per_key_group
+
+    out, state = layer._scan(q, k, v, beta, log_alpha, None)
+    out_seq, state_seq = sequential_gated_delta(q, k, v, beta, log_alpha)
+    assert (out - out_seq).abs().max() < EXACT
+    assert (state - state_seq).abs().max() < EXACT
+
+
+def test_state_gated_starts_in_the_key_group_arrangement():
+    """The weaker of the two init guarantees, stated as the weaker one.
+
+    `state` is an EXACT identity with `key_group` — it adds zero to the same
+    projection.  `state_gated` cannot be: a wider `nn.Linear` draws a different
+    number of values, so its rates are not the rates the narrow layer would have
+    had from the same seed.  What it *does* guarantee is the ARRANGEMENT — every
+    state in a key group on one gate, so the layer has to earn its way out.
+    Asserting the stronger claim here would be false, and asserting nothing
+    would let the init silently stop mattering.
+    """
+    torch.manual_seed(0)
+    gated = make_layer(decay="state_gated")
+    torch.manual_seed(0)
+    shared = make_layer(decay="key_group")
+    x = torch.randn(2, 32, 64, dtype=torch.float64)
+
+    *_, log_alpha, _ = gated._features(x)
+    assert torch.equal(log_alpha, log_alpha[:, :, :1].expand_as(log_alpha)), (
+        "states within a key group do not start on one gate"
+    )
+    # ...and it is its own layer, not a re-spelling of the narrow one.
+    with torch.no_grad():
+        assert not torch.allclose(gated(x), shared(x))
+
+
+def test_state_gated_is_live_and_independently_modulated():
+    """The property that separates it from `state`: each rate moves on its own.
+
+    Under `state` the eight rates share one data-dependent signal, so perturbing
+    the input moves them together.  Under `state_gated` they are eight functions
+    and need not agree.
+    """
+    torch.manual_seed(0)
+    layer = make_layer(decay="state_gated")
+    with torch.no_grad():
+        layer.a_proj.weight.normal_(0.0, 1.0)
+    x = torch.randn(2, 64, 64, dtype=torch.float64)
+
+    *_, log_alpha, _ = layer._features(x)
+    # across time, do the states' rates vary independently rather than in lockstep?
+    series = log_alpha[0, 0]                      # (m, T)
+    centred = series - series.mean(dim=-1, keepdim=True)
+    corr = torch.corrcoef(centred)
+    off = corr[~torch.eye(corr.shape[0], dtype=torch.bool)]
+    assert off.abs().max() < 0.99, (
+        f"state rates move in lockstep (max |corr| {off.abs().max():.3f}); "
+        f"that is the `state` arrangement, not `state_gated`"
+    )
+
+
+def test_the_two_per_state_arrangements_cost_different_things():
+    """`state` buys baselines for H scalars; `state_gated` buys gates for weights."""
+    layout = LAYOUTS["shared_key"]
+    base = sum(p.numel() for p in make_layer(layout).parameters())
+    band = sum(p.numel() for p in make_layer(layout, decay="state").parameters())
+    gated = sum(p.numel() for p in make_layer(layout, decay="state_gated").parameters())
+
+    config = make_layer(layout).config
+    extra = layout.n_heads - layout.n_key_groups
+    assert band - base == layout.n_heads
+    # a wider projection: weights and biases for the states beyond the first
+    assert gated - base == extra * (config.d_model + 1)
+    assert gated > band, "the gated arrangement should be the expensive one"
+
+
+def test_state_gated_backward_reaches_every_gate():
+    torch.manual_seed(0)
+    layer = make_layer(decay="state_gated")
+    x = torch.randn(2, 32, 64, dtype=torch.float64, requires_grad=True)
+    layer(x).square().mean().backward()
+
+    grad = layer.a_proj.weight.grad
+    assert grad is not None and torch.isfinite(grad).all()
+    # every state's gate must receive its own signal, not just the first
+    assert (grad.abs().sum(dim=-1) > 0).all(), "some state's gate got no gradient"
+
+
+def test_the_three_decay_arrangements_do_not_mix_checkpoints():
+    layers = {name: make_layer(decay=name)
+              for name in ("key_group", "state", "state_gated")}
+    for a, b in itertools.permutations(layers, 2):
+        with pytest.raises(RuntimeError):
+            layers[a].load_state_dict(layers[b].state_dict())
 
 
 def test_config_refuses_a_beta_max_the_solve_cannot_survive():
