@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from lumen.gdn import GatedDeltaNet, GatedDeltaNetConfig, HeadLayout
-from lumen.nn import RMSNorm, rms_norm
+from lumen.nn import RMSNorm, SwiGLU, rms_norm
 from lumen.undertow import UndertowAttention, UndertowConfig
 
 
@@ -63,6 +63,46 @@ def test_module_computes_in_fp32_and_restores_the_input_dtype():
     # Bit-identical to promoting by hand, which is what "computed in fp32" means.
     expected = rms_norm(x.float(), norm.weight, norm.eps).to(torch.float16)
     assert torch.equal(out, expected)
+
+
+def test_swiglu_is_the_arrangement_it_claims_to_be():
+    """``down(up(x) * silu(gate(x)))``, spelled out.
+
+    Worth pinning because the class exists to be *the same arrangement* the
+    mixers already carry on their output path. If the two drift apart, the
+    claim that a block adding one of these is duplicating a function the mixer
+    already has stops being true, and that claim is load-bearing — it is why
+    ``d_mlp`` has no default.
+    """
+    torch.manual_seed(0)
+    mlp = SwiGLU(32, 64)
+    x = torch.randn(2, 8, 32)
+    expected = mlp.down_proj(mlp.up(x) * torch.nn.functional.silu(mlp.gate(x)))
+    assert torch.equal(mlp(x), expected)
+
+
+def test_swiglu_keys_match_the_lineage():
+    """``up`` / ``gate`` / ``down_proj`` are checkpoint keys, not style.
+
+    The asymmetry is inherited on purpose: renaming ``down_proj`` to match its
+    two bare siblings would invalidate every archived state dict for a
+    cosmetic gain.
+    """
+    assert set(SwiGLU(32, 64).state_dict()) == {
+        "up.weight",
+        "gate.weight",
+        "down_proj.weight",
+    }
+
+
+def test_swiglu_declares_its_residual_write():
+    mlp = SwiGLU(32, 64)
+    assert mlp.residual_out_projections() == (mlp.down_proj,)
+
+
+def test_swiglu_rejects_a_degenerate_width():
+    with pytest.raises(ValueError):
+        SwiGLU(32, 0)
 
 
 LAYERS = [

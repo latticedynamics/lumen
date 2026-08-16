@@ -39,13 +39,14 @@ or from Python::
 from __future__ import annotations
 
 from lumen.bench import BenchResult, benchmark_layer, compare, format_table
+from lumen.block import Block, BlockState
 from lumen.gdn import (
     GatedDeltaNet,
     GatedDeltaNetConfig,
     GatedDeltaNetState,
     HeadLayout,
 )
-from lumen.nn import RMSNorm, rms_norm
+from lumen.nn import RMSNorm, SwiGLU, rms_norm
 from lumen.undertow import UndertowAttention, UndertowConfig
 from lumen.probe import (
     ArchFacts,
@@ -89,7 +90,11 @@ __all__ = [
     "HeadLayout",
     # nn
     "RMSNorm",
+    "SwiGLU",
     "rms_norm",
+    # block
+    "Block",
+    "BlockState",
     # undertow
     "UndertowAttention",
     "UndertowConfig",
