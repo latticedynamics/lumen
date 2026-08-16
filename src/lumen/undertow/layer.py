@@ -320,6 +320,25 @@ class UndertowAttention(nn.Module):
         o = o.reshape(batch, seq_len, self.config.d_model).to(gate.dtype)
         return self.dropout(self.o_proj(o * F.silu(gate)))
 
+    def residual_out_projections(self) -> tuple[nn.Module, ...]:
+        """The projections whose output is added to a residual stream.
+
+        A *structural* fact about the layer, not a hook for any particular
+        caller.  The full argument for why this is a method, and why it returns
+        modules rather than parameters, is in
+        :meth:`lumen.gdn.GatedDeltaNet.residual_out_projections` — the two
+        output paths are deliberately the same shape and so is this.
+
+        ⚠️ **`zero_init` and depth-scaled initialisation both write here, and
+        they disagree.**  ``zero_init=True`` zeroes ``o_proj`` so a fresh layer
+        spliced into a trained stack is an exact identity at step 0; a caller
+        that rescales what this method returns would overwrite those zeros and
+        destroy that guarantee without any error.  This method reports the write
+        either way, because the write *is* there — resolving the precedence is
+        the caller's problem and it is not allowed to be a silent one.
+        """
+        return (self.o_proj,)
+
     # ── streaming ─────────────────────────────────────────────────────────
 
     def init_state(

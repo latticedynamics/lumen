@@ -116,3 +116,67 @@ def test_head_norm_stays_a_flat_parameter(build):
     keys = build().state_dict()
     assert "head_norm" in keys
     assert "head_norm.weight" not in keys
+
+
+@pytest.mark.parametrize("build", LAYERS, ids=["gdn", "undertow"])
+def test_residual_out_projections_are_the_layer_output(build):
+    """The claim, checked against the code rather than against a name.
+
+    ``residual_out_projections()`` says *this is where the layer's contribution
+    leaves it*.  If that is true, zeroing what it returns must zero the layer's
+    output exactly -- these projections are bias-free, so nothing downstream of
+    them can put a value back.
+
+    This is the test that survives a refactor.  Asserting the method returns
+    something called ``o_proj`` would pass for a layer whose output path had
+    moved on without it; this cannot.
+    """
+    torch.manual_seed(0)
+    layer = build().eval()
+    x = torch.randn(2, 16, 128)
+
+    with torch.no_grad():
+        assert layer(x).abs().max() > 0, "probe is invalid: layer was already silent"
+        for projection in layer.residual_out_projections():
+            for parameter in projection.parameters():
+                parameter.zero_()
+        assert torch.equal(layer(x), torch.zeros_like(x))
+
+
+@pytest.mark.parametrize("build", LAYERS, ids=["gdn", "undertow"])
+def test_residual_out_projections_match_the_name_sweep(build):
+    """The bridge: asking returns exactly what grepping used to find.
+
+    A depth-scaled initialiser conventionally sweeps ``named_parameters()`` for
+    an ``o_proj.weight`` suffix.  That works until somebody renames an
+    attribute, at which point it silently initialises one tensor fewer.  This
+    asserts the two agree *today*, which is what lets a caller switch from the
+    fragile mechanism to the checkable one without changing any weights.
+
+    Delete this test when no caller sweeps names any more.  Until then it is the
+    only thing tying the new answer to the old behaviour.
+    """
+    layer = build()
+    declared = {
+        id(parameter)
+        for projection in layer.residual_out_projections()
+        for parameter in projection.parameters()
+    }
+    swept = {
+        id(parameter)
+        for name, parameter in layer.named_parameters()
+        if name.endswith("o_proj.weight")
+    }
+    assert declared and declared == swept
+
+
+@pytest.mark.parametrize("build", LAYERS, ids=["gdn", "undertow"])
+def test_residual_out_projections_adds_no_checkpoint_key(build):
+    """Additive means additive: a method is not a parameter.
+
+    Phase 1 of this release exists to land ahead of the block, and the reason it
+    is allowed to land alone is that it cannot move a checkpoint.  A fresh layer
+    must load an identically-configured layer's state dict under ``strict``.
+    """
+    source, destination = build(), build()
+    destination.load_state_dict(source.state_dict(), strict=True)

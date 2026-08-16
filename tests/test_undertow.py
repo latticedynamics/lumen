@@ -333,6 +333,36 @@ def test_zero_init_is_an_exact_identity_noop() -> None:
     assert torch.equal(y, torch.zeros_like(y))
 
 
+def test_zero_init_collides_with_depth_scaled_init() -> None:
+    """Pins a hazard rather than a behaviour, so the collision cannot go quiet.
+
+    ``zero_init`` and a depth-scaled initialiser both write to exactly the
+    projections :meth:`residual_out_projections` reports, and they want opposite
+    things: one wants zeros so a spliced layer contributes nothing at step 0,
+    the other wants ``normal_(std=...)``.  Whichever runs second wins, and if
+    that is the depth sweep the identity guarantee is gone with no error raised.
+
+    This asserts the overlap is real, so a caller that rescales the reported
+    projections is provably overwriting something deliberate.  It fails if a
+    future change quietly moves ``zero_init`` off the reported write, which
+    would make the collision invisible instead of resolved.
+    """
+    config = UndertowConfig(d_model=32, n_heads=4, window=8, zero_init=True)
+    layer = UndertowAttention(config)
+
+    zeroed = {
+        id(parameter)
+        for parameter in layer.parameters()
+        if not parameter.any()
+    }
+    reported = {
+        id(parameter)
+        for projection in layer.residual_out_projections()
+        for parameter in projection.parameters()
+    }
+    assert reported and reported <= zeroed
+
+
 def test_causality_no_leak_from_the_future() -> None:
     """Perturbing position t must not change any output before t."""
     torch.manual_seed(31)
