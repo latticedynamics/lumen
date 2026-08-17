@@ -60,6 +60,41 @@ after which the chunk recurrence is **affine in `M`**, so everything that does
 not depend on `M` is hoisted out and batched across all chunks, leaving a loop
 body of exactly one matmul per chunk.
 
+**On the loop that remains.** That last sentence describes a real Python `for`
+over `T / chunk_size` iterations, and it is the obvious thing to want gone. What
+the chunkwise form eliminates is the loop over *positions*; what is left is a
+loop over *chunks*, which at a chunk size of 64 is 64× shorter and not zero.
+
+It is not structurally irreducible. `M_n = E_n M_{n−1} + C_n` is a first-order
+linear recurrence, so its transition-and-offset pairs compose —
+
+```
+(E₂, C₂) ∘ (E₁, C₁)  =  (E₂E₁,  E₂C₁ + C₂)
+```
+
+— and an associative scan would reach `log₂(n_chunks)` sequential steps instead
+of `n_chunks`. Anyone who tells you a delta-rule scan is inherently serial is
+wrong about that.
+
+**What makes it a bad trade is not the depth, it is the price of the depth.**
+Composing transitions multiplies `[d_k, d_k]` matrices — `d_k³` per composition,
+`O(n log n)` of them — where the loop as written only ever forms
+`[d_k, d_k] @ [d_k, m·d_v]` once per chunk. The scan buys shallower depth by
+spending more total work, so it wins only where the loop is *latency*-bound.
+
+On the development bench it is not. Holding total work and batch size×length
+constant while cutting the chunk count 16× — which is exactly the swap an
+associative scan makes, minus its extra work — moves end-to-end throughput by
+about 2%, in the losing direction. There is no latency there to recover, so
+paying arithmetic for it is a straight loss.
+
+Two limits on that, since it is one machine and one region of the parameter
+space. On hardware where a GEMM is much cheaper relative to launch overhead, the
+balance shifts. And the depth term grows with `n_chunks` while the work argument
+does not, so a crossover exists at long sequences with small chunks; it is simply
+nowhere near the shapes this layer is used at. If a scan is ever built, it is a
+component with its own record and its own measurement, not a refactor.
+
 **Streaming state.** The matrix `M` per state, plus the short-conv cache.
 Constant in generated length — a fixed-size memory is the whole proposition.
 
