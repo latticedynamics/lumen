@@ -213,7 +213,7 @@ suite checks against; they are deliberately not exported.
 
 ## Status
 
-`0.3.0` — alpha, and versioned honestly. The *interface* is the thing this
+`0.4.1` — alpha, and versioned honestly. The *interface* is the thing this
 library exists to protect, so it changes slowly and visibly; a merged component
 is required to reproduce the outputs of what it replaces, to a stated tolerance,
 before anything switches to it. Internals are fair game.

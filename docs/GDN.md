@@ -151,7 +151,7 @@ one training scale on one corpus — if your setting differs, measure.
 | `conv_size` | 4 | Short causal depthwise convolution on q/k/v. Local mixing, not a positional code — it carries relative offsets only. `0` disables it. |
 | `beta_max` | 2.0 | Write-strength ceiling. Above 1 the update becomes a reflection rather than only a contraction. **2 is also the maximum**, and it is refused above that — see below. |
 | `centre` | `False` | Learned per-head key/query centres, subtracted before the l2 norm. Zero-initialised, so switching it on is an exact no-op until training moves it. |
-| `decay` | `"key_group"` | Where the forgetting timescale lives. `"state"` gives every state its own, via a zero-initialised offset — so switching it on is an identity at init and diverges under training. Off by default because it is an experiment nobody has run, not because it lost one. |
+| `decay` | `"key_group"` | Where the forgetting timescale lives. `"state"` gives every state its own, via a zero-initialised offset — so switching it on is an identity at init and diverges under training. `"state_gated"` gives every state its own *and* its own input modulation, by widening `a_proj`. Off by default because it is an experiment nobody has run, not because it lost one. |
 
 ### Why `beta_max` stops at 2
 
@@ -189,6 +189,27 @@ with torch.no_grad():
 
 Checkpoints do not cross the boundary silently: `a_offset` is a new parameter, so
 loading between the two arrangements raises rather than quietly dropping it.
+
+### Per-state decay that is also gated
+
+`decay="state_gated"` gives every state its own timescale *and* its own
+modulation by the input, by widening `a_proj` from one output per key group to
+one per state. It is the more expensive of the two — `d_model × (H − G_k)`
+weights against `state`'s `H` scalars — and it is a different model, not a
+second spelling of one.
+
+Its init guarantee is deliberately the weaker of the two, and the difference is
+worth reading before comparing runs. `state` is an **exact identity** with
+`key_group` at init, because it adds zero to the same projection. `state_gated`
+reproduces the **arrangement** only — every state in a key group starts on one
+gate, so the layer has to earn its way out of `key_group` — but a wider
+`nn.Linear` draws a different number of values, so its rates are not the rates a
+`key_group` layer built from the same seed would have had.
+
+That arrangement is re-established by `apply_init_structure()` rather than by the
+constructor alone, because a trunk-level init redraws the layer's projections
+afterwards. See [BLOCK.md](./BLOCK.md#structure-among-a-sub-layers-weights); if
+you write your own trunk that redraws `nn.Linear` weights, call it.
 | `norm_eps` | 1e-5 | Output RMSNorm epsilon. |
 | `dropout` | 0.0 | Applied after the output projection. |
 
