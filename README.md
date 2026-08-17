@@ -109,6 +109,7 @@ it was written on.
 | [`lumen.undertow`](./docs/UNDERTOW.md) | Fixed-window causal attention, no positional encoding, optional graded boundary. Streaming with constant memory, opt-in Triton path. [Design record](./docs/design/UNDERTOW.md) |
 | [`lumen.gdn`](./docs/GDN.md) | Gated DeltaNet — a fixed-size associative memory with a delta-rule write. Linear in sequence length, constant-memory generation, configurable head layout. [Design record](./docs/design/GATED_DELTANET.md) |
 | [`lumen.block`](./docs/BLOCK.md) | A residual `Block` and a `Stack` of them — the level a result is actually read off. Modality-free, sub-layer instances rather than a config, and the depth-scaled init that cannot live any lower. [Design record](./docs/design/BLOCK.md) |
+| [`lumen.pytree`](./docs/PYTREE.md) | Every streaming state is a pytree node, so `vmap`, `functional_call` and `torch.compile` can traverse one. The state is half the mixer contract; this is what keeps it from being where the abstraction stops |
 
 A roadmap of things that do not exist yet is a promise, not a description, so
 there isn't one here.
@@ -189,6 +190,7 @@ instead of asserting version floors that are wrong.
 | [`docs/UNDERTOW.md`](./docs/UNDERTOW.md) | Using Undertow — configuration, streaming, splicing into a trained stack |
 | [`docs/BLOCK.md`](./docs/BLOCK.md) | Using Block and Stack — composition, streaming, initialisation, checkpoint keys |
 | [`docs/GDN.md`](./docs/GDN.md) | Using Gated DeltaNet — head layout, widths, generation, subclassing |
+| [`docs/PYTREE.md`](./docs/PYTREE.md) | States as pytrees — `tree_map` over a stream, and many parameter sets in one batched call |
 | [`docs/design/UNDERTOW.md`](./docs/design/UNDERTOW.md) | Undertow design record — lineages, decisions, evidence, open questions |
 | [`docs/design/GATED_DELTANET.md`](./docs/design/GATED_DELTANET.md) | Gated DeltaNet design record — same |
 
