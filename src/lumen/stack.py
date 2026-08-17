@@ -87,8 +87,10 @@ class Stack(nn.Module):
         norm_eps: Epsilon for the final norm. Required, no default — see
                   :class:`~lumen.block.Block` and `latticedynamics/lumen#6`.
         init_std: Base standard deviation for every ``nn.Linear`` weight in the
-                  trunk. Residual writes are then rescaled by
-                  ``1/sqrt(2·n_layers)`` on top of it.
+                  trunk. A sub-layer may then rearrange its own share of that
+                  draw, and residual writes are rescaled by
+                  ``1/sqrt(2·n_layers)`` on top of both — see
+                  :meth:`reset_parameters`.
     """
 
     def __init__(
@@ -119,7 +121,7 @@ class Stack(nn.Module):
     # ── initialisation ────────────────────────────────────────────────────
 
     def reset_parameters(self) -> None:
-        """Both passes: base, then the depth-scaled rescale of residual writes.
+        """Base draw, then sub-layer structure, then the depth-scaled rescale.
 
         Called from ``__init__``, so a `Stack` is fully initialised the moment it
         exists and a consumer that constructs its trunk *first* gets a stable
@@ -136,10 +138,35 @@ class Stack(nn.Module):
         and ``b_proj``, deliberately zero) and it removes a branch whose
         correctness depended on "deliberate biases are nonzero" staying true.
 
-        **The depth pass runs second and therefore wins**, including over a
+        **The base pass would otherwise erase structure a sub-layer's
+        constructor established.** It redraws every ``nn.Linear`` weight in the
+        trunk, including any arrangement a sub-layer had imposed *among* its own
+        weights — ``GatedDeltaNet(decay="state_gated")``, whose states share one
+        gate within a key group, being the case that exists
+        (`latticedynamics/lumen#8`). A sub-layer with such an arrangement
+        implements ``apply_init_structure()`` and the second pass here calls it,
+        exactly once, on the fresh draw. The division is what makes this safe to
+        extend: **the stack owns the distribution and the sub-layer owns the
+        structure among the values drawn from it**, so a sub-layer nobody here
+        anticipated needs no support from this class.
+
+        Duck-typed rather than declared, matching how a block reads
+        statefulness off its sub-layers: having no structure to restore is the
+        normal case, so absence must be legal. That is the one thing separating
+        it from :meth:`residual_out_projections`, where absence is an error.
+
+        *Skipping* such weights in the base pass instead was considered and
+        refused twice over. It leaves them wherever ``nn.Linear`` happened to
+        draw them rather than at ``init_std``, which is a second, unchosen
+        distribution inside the trunk — and a skipped draw consumes no
+        randomness, so it shifts every weight drawn after it, which is precisely
+        what the seed contract above must not do.
+
+        **The depth pass runs last and therefore wins**, including over a
         sub-layer that deliberately initialised its own output projection —
-        ``UndertowConfig(zero_init=True)`` being the case that exists. That is
-        the documented precedence rather than an accident: the alternative
+        ``UndertowConfig(zero_init=True)`` being the case that exists — and
+        equally over anything the structure pass wrote to a residual write. That
+        is the documented precedence rather than an accident: the alternative
         available shortcut, skipping projections that are currently all-zero,
         would make initialisation depend on parameter *values*, and the seed
         contract above needs it to depend only on the seed. A caller splicing a
@@ -149,6 +176,14 @@ class Stack(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.normal_(module.weight, std=self.init_std)
+
+        # A separate sweep, not a branch in the one above: `modules()` yields a
+        # parent before its children, so a sub-layer reached in the first sweep
+        # would be restructuring weights the same sweep had not drawn yet.
+        for module in self.modules():
+            structure = getattr(module, "apply_init_structure", None)
+            if structure is not None:
+                structure()
 
         depth_std = self.init_std / math.sqrt(_WRITES_PER_BLOCK * self.n_layers)
         for projection in self.residual_out_projections():

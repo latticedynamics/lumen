@@ -426,6 +426,104 @@ around it, and "reconstruct this model from its seed" is well-defined without
 enforced one — there is no way to enforce it — so it is stated in the class
 docstring and checked by acceptance gate 4 rather than asserted at runtime.
 
+### 4.5 The base pass restores the structure it would otherwise erase
+
+Taken 2026-08-17, from `latticedynamics/lumen#8`. This is §4.2's reasoning
+applied to the half of the init it did not reach.
+
+§4.2 worked out precedence for the **depth** pass: it runs last, so it wins over
+a sub-layer that initialised its own output projection, and `zero_init` is the
+case that exists. The **base** pass has the same hazard and a wider reach — it
+touches every `nn.Linear` in the trunk, not only the residual writes — and it
+was not addressed at all. So a sub-layer whose constructor established structure
+*among* its own weights lost it the moment that sub-layer entered a `Stack`.
+
+`GatedDeltaNet(decay="state_gated")` is the instance: its states begin sharing
+one gate per key group, so the layer starts in the `key_group` arrangement and
+has to earn its way out. Inside a trunk it did not.
+
+Three properties of the failure are worth keeping, because they are what a
+similar one will look like:
+
+- **It is silent.** The model trains. It simply does not start where its own
+  documentation says it starts.
+- **It landed on the weaker of two sibling guarantees.** `decay="state"` gets
+  the same discipline from a zero-initialised bare `nn.Parameter`, which the
+  base pass does not touch; `state_gated` gets it from a structured
+  `nn.Linear.weight`, which it does. The mechanism decided the outcome, not the
+  intent.
+- **The test passed.** It built the layer standalone — the one configuration in
+  which nothing writes to those weights afterwards. A guarantee tested only
+  where it holds is not tested.
+
+**The fix: a sub-layer may declare `apply_init_structure()`, and the base pass
+calls it.** Three passes now — base draw, sub-layer structure, depth rescale —
+with the same precedence as before, so the depth sweep still wins over anything
+the middle pass wrote to a residual write.
+
+##### Why restore rather than skip, which is the load-bearing part
+
+The obvious alternative is a `self_initialised_parameters()` contract that the
+base pass **skips**, in the same refuse-to-guess style as
+`residual_out_projections()`. It is the wrong shape here for two independent
+reasons, and the second is decisive.
+
+It leaves those weights wherever `nn.Linear.reset_parameters` happened to put
+them — a second, unchosen distribution sitting inside a trunk that otherwise has
+exactly one. At `d_model = 64` that is a standard deviation near `0.072` against
+the trunk's `0.02`, and nothing chose the factor.
+
+And **a skipped draw consumes no randomness**, so every weight drawn after it
+moves. Turning on `state_gated` in one layer would silently change every weight
+in every layer above it. §4.4's whole reason for existing is that the trunk
+occupies a stable prefix of the RNG sequence; a skip is the one mechanism that
+breaks it from the inside.
+
+Restoring has neither problem. It rearranges values the trunk already drew, so
+it consumes nothing and changes nothing outside the tensor it owns — measured
+across three `decay` settings and both block arrangements, `0.4.0` against
+`0.4.1`, 403 initial tensors compared: the six that move are exactly the
+`a_proj.weight` of a `state_gated` mixer in a `Stack`.
+
+##### Why a verb here, when §4.2 argued hard for a noun
+
+§4.2 refused `residual_out_parameters()` because it would have been an
+init-policy concept wearing a layer-interface costume, canonising the *form* of
+a policy that belongs to the stack. That argument is intact and it points the
+other way here, for the mirror-image reason.
+
+What varies there is the **caller's** policy, so the interface must not encode
+it — hence a structural fact the caller interprets. What varies here is the
+**sub-layer's** structure, and there is no vocabulary for "these weights are
+tied in this pattern" that would not canonise a form far more specific than
+anything in the package needs. A verb that says only *re-establish whatever you
+guarantee* leaves the sub-layer's own arrangement opaque to the stack, which is
+the same discipline in the other direction.
+
+It is also why the method is **not** named `reset_parameters`. That name is
+taken, by torch, on every `nn.Linear` in the trunk — a sweep calling it would
+kaiming-redraw everything the base pass had just drawn. A sub-layer that
+implemented it in torch's sense would silently defeat the base pass instead of
+cooperating with it, which is the same class of bug this section is fixing.
+
+##### Duck-typed, and that is the difference from §4.2's contract
+
+`residual_out_projections()` refuses to guess: a sub-layer that does not
+implement it raises, because a silently skipped residual write is a model that
+trains and is wrong. Here absence is the normal case — most sub-layers have no
+structure to restore — so `getattr` and move on, matching how `Block` reads
+statefulness off its sub-layers rather than off a flag.
+
+##### What stays open
+
+Whether the base pass should be initialising sub-layer internals **at all**.
+`Stack`'s irreducible job is the depth-scaled rescale, which cannot live lower
+down; redrawing every weight in the trunk is a separate policy that arrived
+alongside it, and a sub-layer arguably knows better than the stack does how its
+own projections should start. Not answered here, and `0.4.1` is not where it
+could be: removing the base pass changes every initial weight in every trunk,
+which is a release with a migration, not a fix.
+
 ---
 
 ## 5. What is deliberately not canonised
@@ -533,6 +631,14 @@ class Stack(nn.Module):
 `init_state` follow the module's own parameters unless overridden, matching the
 mixers.
 
+Two methods on the **sub-layer** side of the surface, which is where the stack's
+init policy reaches:
+
+```python
+def residual_out_projections(self) -> tuple[nn.Module, ...]: ...  # §4.2, required
+def apply_init_structure(self) -> None: ...                       # §4.5, optional
+```
+
 ---
 
 ## 7. Acceptance
@@ -560,6 +666,12 @@ here is cheap because there is exactly one incumbent.
 6. **Streaming agrees with parallel.** `forward(x, return_state=True)` on a
    prefix, then `step` through the remainder, equals `forward` on the whole —
    at the stack level, which nothing currently tests.
+7. **A sub-layer's init guarantee is asserted inside a `Stack`** (§4.5, added
+   2026-08-17). Standalone construction is the configuration in which nothing
+   writes to those weights afterwards, so it is the one place the guarantee
+   cannot fail — asserting it only there is what let `lumen#8` sit undetected
+   through the whole of `0.4.0`. Paired with gate 4: the structure pass draws no
+   randomness, so it must move the tensor it owns and nothing else.
 
 ---
 

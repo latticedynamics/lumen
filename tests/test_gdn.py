@@ -917,6 +917,55 @@ def test_state_gated_starts_in_the_key_group_arrangement():
         assert not torch.allclose(gated(x), shared(x))
 
 
+def test_apply_init_structure_restores_the_arrangement_after_a_redraw():
+    """The guarantee above, as something a later caller can re-establish.
+
+    The test above builds the layer and looks at it, which is the one situation
+    where nothing writes to `a_proj` after the constructor does.  A trunk-level
+    init does — `lumen#8` — so the arrangement has to be a hook that survives
+    being redrawn over, not three lines that ran once.
+
+    `crossed(4, 2)` rather than `shared_key`, so "every row equal" and "equal
+    within a key group" are different assertions and only the second passes.
+    """
+    torch.manual_seed(0)
+    layer = make_layer(LAYOUTS["crossed_4x2"], decay="state_gated")
+    groups = layer.config.layout.n_key_groups
+    rows = layer.a_proj.weight.view(groups, -1, layer.a_proj.in_features)
+    assert torch.equal(rows, rows[:, :1].expand_as(rows))
+    assert not torch.equal(rows[0, 0], rows[1, 0]), "key groups share one gate"
+
+    with torch.no_grad():
+        torch.nn.init.normal_(layer.a_proj.weight, std=0.02)
+    rows = layer.a_proj.weight.view(groups, -1, layer.a_proj.in_features)
+    assert not torch.equal(rows, rows[:, :1].expand_as(rows)), (
+        "probe is invalid: the redraw did not disturb the arrangement"
+    )
+
+    layer.apply_init_structure()
+    rows = layer.a_proj.weight.view(groups, -1, layer.a_proj.in_features)
+    assert torch.equal(rows, rows[:, :1].expand_as(rows))
+    assert not torch.equal(rows[0, 0], rows[1, 0])
+
+
+@pytest.mark.parametrize("decay", ["key_group", "state"])
+def test_apply_init_structure_is_a_no_op_for_the_other_arrangements(decay):
+    """Absence of structure is the normal case, so the hook has to be safe.
+
+    Neither of these has an arrangement among its weights to lose: `state`'s
+    per-state offset is a separate zeroed parameter and `key_group`'s rates are
+    one row each.  A caller invokes the hook without asking which `decay` it
+    holds, so "no structure" must mean "changes nothing" rather than "does
+    something defensible".
+    """
+    torch.manual_seed(0)
+    layer = make_layer(decay=decay)
+    before = {name: p.clone() for name, p in layer.named_parameters()}
+    layer.apply_init_structure()
+    for name, parameter in layer.named_parameters():
+        assert torch.equal(before[name], parameter), name
+
+
 def test_state_gated_is_live_and_independently_modulated():
     """The property that separates it from `state`: each rate moves on its own.
 

@@ -233,6 +233,135 @@ def test_the_depth_pass_runs_second_and_wins_over_zero_init():
     assert stack.blocks[0].local.o_proj.weight.abs().max() > 0
 
 
+# ── sub-layer structure ───────────────────────────────────────────────────
+#
+# `lumen#8`. The base pass redraws every `nn.Linear` in the trunk, so any
+# arrangement a sub-layer's constructor imposed *among* its own weights was
+# erased the moment that sub-layer entered a `Stack` — silently, since the model
+# still trains. It was tested only standalone, which is the one configuration
+# where nothing writes to those weights afterwards.
+
+
+STRUCTURED = GatedDeltaNetConfig(
+    d_model=D_MODEL,
+    # `crossed(4, 2)`, not `shared_key`: with one key group "every row equal"
+    # and "equal within a key group" are the same assertion, and the weaker one
+    # would pass against an init that had collapsed the groups together.
+    layout=HeadLayout.crossed(4, 2),
+    expand_k=2.0,
+    decay="state_gated",
+)
+
+
+def structured(index: int) -> Block:
+    return Block(D_MODEL, GatedDeltaNet(STRUCTURED), norm_eps=1e-5, d_mlp=0)
+
+
+def gate_rows(mixer: GatedDeltaNet) -> torch.Tensor:
+    """`a_proj`'s rows grouped by key group — ``(n_key_groups, m, d_model)``."""
+    return mixer.a_proj.weight.view(
+        STRUCTURED.layout.n_key_groups, -1, mixer.a_proj.in_features
+    )
+
+
+def test_a_sub_layers_init_structure_survives_the_trunks_base_pass():
+    """Every state in a key group on one gate, *inside a `Stack`*.
+
+    The assertion the standalone test makes, in the configuration where it used
+    to fail. Both halves matter: the states of a key group agree, and the key
+    groups still differ from each other — an init that made every rate equal
+    would satisfy the first alone.
+    """
+    torch.manual_seed(0)
+    stack = Stack(D_MODEL, 2, structured, norm_eps=1e-5)
+    for index, block in enumerate(stack.blocks):
+        rows = gate_rows(block.mixer)
+        assert torch.equal(rows, rows[:, :1].expand_as(rows)), (
+            f"block {index}: states within a key group are not on one gate"
+        )
+        assert not torch.equal(rows[0, 0], rows[1, 0]), (
+            f"block {index}: the key groups were collapsed onto one gate"
+        )
+
+
+def test_the_structure_pass_touches_nothing_but_its_own_weights():
+    """It rearranges an existing draw; it does not draw, and it does not spread.
+
+    This is the property that makes the fix a change to `a_proj` alone rather
+    than to the whole trunk, and it is why the base pass restructures rather
+    than *skipping* those weights: a skipped draw consumes no randomness, so
+    every weight drawn after it would move too.
+
+    Measured against the same stack with the hook disabled, which is the only
+    comparison that isolates the pass from the seed.
+    """
+
+    class Unstructured(GatedDeltaNet):
+        def apply_init_structure(self) -> None:
+            pass
+
+    def without(index: int) -> Block:
+        return Block(D_MODEL, Unstructured(STRUCTURED), norm_eps=1e-5, d_mlp=0)
+
+    torch.manual_seed(0)
+    with_hook = Stack(D_MODEL, 2, structured, norm_eps=1e-5)
+    torch.manual_seed(0)
+    without_hook = Stack(D_MODEL, 2, without, norm_eps=1e-5)
+
+    moved = {
+        name
+        for (name, left), (_, right) in zip(
+            with_hook.named_parameters(), without_hook.named_parameters()
+        )
+        if not torch.equal(left, right)
+    }
+    assert moved == {"blocks.0.mixer.a_proj.weight", "blocks.1.mixer.a_proj.weight"}
+
+
+def test_the_structure_pass_is_re_callable_with_the_rest_of_the_init():
+    """`reset_parameters()` restores the arrangement rather than compounding it.
+
+    The layer-level hook reads the rows it writes, so it is not idempotent —
+    run twice on its own output it collapses the key groups together. What makes
+    that safe is that it is only ever reached through a fresh base draw, so the
+    thing to hold is *this* method, not the hook, against being called twice.
+    """
+    torch.manual_seed(0)
+    stack = Stack(D_MODEL, 1, structured, norm_eps=1e-5)
+    torch.manual_seed(1)
+    stack.reset_parameters()
+
+    rows = gate_rows(stack.blocks[0].mixer)
+    assert torch.equal(rows, rows[:, :1].expand_as(rows))
+    assert not torch.equal(rows[0, 0], rows[1, 0])
+
+
+def test_the_depth_pass_still_wins_over_a_sub_layer_that_restructures():
+    """The structure pass sits between the two, so it cannot defend a write.
+
+    Same precedence `zero_init` already meets, stated for the new pass too: a
+    sub-layer restructuring one of its *residual writes* is overwritten by the
+    depth sweep exactly as a zero-initialised one is. Nothing in the package
+    does this today, which is why it is worth pinning before something does.
+    """
+
+    class WritesToItsOutput(GatedDeltaNet):
+        def apply_init_structure(self) -> None:
+            with torch.no_grad():
+                self.o_proj.weight.fill_(1.0)
+
+    def factory(index: int) -> Block:
+        return Block(
+            D_MODEL, WritesToItsOutput(STRUCTURED), norm_eps=1e-5, d_mlp=0
+        )
+
+    torch.manual_seed(0)
+    stack = Stack(D_MODEL, 2, factory, norm_eps=1e-5)
+    written = stack.blocks[0].mixer.o_proj.weight
+    assert not torch.equal(written, torch.ones_like(written))
+    assert_drawn_at(written, 0.02 / math.sqrt(2 * 2), "a residual write")
+
+
 def test_residual_out_projections_reach_every_block():
     stack = build(n_layers=3, d_mlp=128, local=True)
     declared = {

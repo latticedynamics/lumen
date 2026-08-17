@@ -116,9 +116,12 @@ future.
 ## Initialisation
 
 `Stack` initialises itself completely in `__init__` and exposes
-`reset_parameters()`. Two passes: every `nn.Linear` weight at `init_std`, then
-the projections that write to the residual stream rescaled by
-`1/sqrt(2·n_layers)`.
+`reset_parameters()`. Three passes:
+
+1. every `nn.Linear` weight in the trunk drawn at `init_std`;
+2. every sub-layer that has one asked to re-impose its own structure;
+3. the projections that write to the residual stream rescaled by
+   `1/sqrt(2·n_layers)`.
 
 It finds those projections by **asking**:
 
@@ -141,9 +144,33 @@ Three consequences worth knowing before you build one:
 - **Biases are never touched**, so a sub-layer that deliberately sets one keeps
   it.
 
+### Structure among a sub-layer's weights
+
+The base pass redraws *every* `nn.Linear` in the trunk, so an arrangement a
+sub-layer's constructor established **among** its own weights does not survive
+being placed in a `Stack` on its own. A sub-layer that has one implements the
+second pass's hook:
+
+```python
+def apply_init_structure(self) -> None: ...     # in-place, no return
+```
+
+`GatedDeltaNet(decay="state_gated")` is the case in the package: every state in
+a key group starts on one gate, and it re-establishes that on the trunk's draw.
+Having nothing to restore is the normal case, so unlike
+`residual_out_projections()` this one is optional — a sub-layer without it is
+not an error.
+
+The division is what to hold onto when writing one: **the stack owns the
+distribution, the sub-layer owns the structure among the values drawn from it.**
+So the hook rearranges what it is given rather than drawing anything, and it is
+called exactly once per fresh draw — the implementation in this package reads
+the rows it writes and is not idempotent.
+
 **The depth pass runs last and therefore wins**, including over a sub-layer that
 zero-initialised its own output projection — `UndertowConfig(zero_init=True)`
-being the case that exists. Splicing a zero-initialised layer into an
+being the case that exists — and equally over anything `apply_init_structure()`
+wrote to a residual write. Splicing a zero-initialised layer into an
 *already-trained* trunk does not construct a fresh `Stack` and never meets this;
 building a fresh stack out of such layers does. The obvious alternative — skip
 projections that are currently all-zero — is refused, because it would make

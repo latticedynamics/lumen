@@ -366,22 +366,55 @@ class GatedDeltaNet(nn.Module):
         nn.init.constant_(self.a_proj.bias, -3.0)
         nn.init.zeros_(self.b_proj.bias)
 
-        if config.decay == "state_gated":
-            # Every state in a key group starts on the SAME gate, so the layer
-            # begins in the `key_group` arrangement and has to earn its way out
-            # of it -- the same discipline `state`'s zero-init offset enforces.
-            #
-            # It is a weaker guarantee than `state`'s, and the difference is
-            # worth naming: `state` is an EXACT identity with `key_group`
-            # because it adds zero to the same projection, while this one only
-            # reproduces the ARRANGEMENT.  A wider `nn.Linear` draws a different
-            # number of values, so its rates are not the rates a `key_group`
-            # layer built from the same seed would have had.  Structurally
-            # equal at init, numerically its own layer.
-            m = layout.states_per_key_group
-            with torch.no_grad():
-                shared = self.a_proj.weight[:n_key_groups].clone()
-                self.a_proj.weight.copy_(shared.repeat_interleave(m, dim=0))
+        self.apply_init_structure()
+
+    # ── initialisation ────────────────────────────────────────────────────
+
+    def apply_init_structure(self) -> None:
+        """Put `a_proj`'s rows back into the key-group arrangement, in place.
+
+        Every state in a key group starts on the SAME gate, so a `state_gated`
+        layer begins in the `key_group` arrangement and has to earn its way out
+        of it -- the same discipline `state`'s zero-init offset enforces.  A
+        no-op under either other `decay`, which have no structure among their
+        weights to lose: `state`'s offset is a separate zeroed `nn.Parameter`
+        and `key_group`'s rates are one row each.
+
+        It is a weaker guarantee than `state`'s, and the difference is worth
+        naming: `state` is an EXACT identity with `key_group` because it adds
+        zero to the same projection, while this one only reproduces the
+        ARRANGEMENT.  A wider `nn.Linear` draws a different number of values, so
+        its rates are not the rates a `key_group` layer built from the same seed
+        would have had.  Structurally equal at init, numerically its own layer.
+
+        **A method rather than three lines in the constructor, because the
+        constructor is not the last thing that writes to these weights.**  Any
+        caller that redraws the layer's projections afterwards destroys the
+        arrangement -- and does it silently, since the layer then trains from an
+        init its own documentation disclaims.  :class:`lumen.stack.Stack` sweeps
+        every ``nn.Linear`` in a trunk at its own ``init_std`` and is exactly
+        that caller (`latticedynamics/lumen#8`).  This is the hook it invokes to
+        put the arrangement back, and the split of duties is the point: the
+        caller owns the *distribution*, this layer owns the *structure* among
+        the values drawn from it, and neither has to know the other's policy.
+
+        **It reads the rows it writes, so it is not idempotent** and must not be
+        re-run on its own output: applied twice, key group 1 ends up on key
+        group 0's gate and the groups stop being distinct.  The contract is one
+        call per fresh draw of ``a_proj.weight``, which is what both callers do.
+
+        It cannot defend a projection the caller writes to *after* it -- the
+        depth-scaled rescale of a residual write being the case that exists.
+        See :meth:`lumen.stack.Stack.reset_parameters` for that precedence.
+        """
+        if self.config.decay != "state_gated":
+            return
+
+        layout = self.config.layout
+        m = layout.states_per_key_group
+        with torch.no_grad():
+            shared = self.a_proj.weight[: layout.n_key_groups].clone()
+            self.a_proj.weight.copy_(shared.repeat_interleave(m, dim=0))
 
     # ── seams ─────────────────────────────────────────────────────────────
 
