@@ -99,11 +99,15 @@ class SwiGLU(nn.Module):
     their own output path — ``v_proj`` up, ``g_proj`` gate, ``o_proj`` down.
     That is the reason this class is worth having rather than being a detail of
     whatever holds it: **the mixers contain one of these already**, so a block
-    that adds a second is making a claim about what the mixer's own is short of,
-    not following a convention.  A layer can reach the latent one by driving its
-    decay to zero and giving up its memory; the two compete for one piece of
-    hardware, and this one holds no state, which is the whole point of putting
-    it beside a mixer rather than inside one.
+    that adds a second is duplicating a shape that is present either way, and
+    saying so is a claim rather than a convention.
+
+    What that does not license is treating a short-horizon mixer as a spare
+    slot for one of these.  A mixer that forgets quickly is still running its
+    recurrence, and a short-lived store addressed by key does something a
+    position-wise feed-forward cannot.  This class holds no state at all, which
+    is the whole point of putting one beside a mixer rather than in place of
+    one.
 
     No bias on any of the three, matching the mixers.
 

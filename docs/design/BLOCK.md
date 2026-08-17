@@ -249,8 +249,8 @@ keeps construction declarative and serialisable. The lineage breaks the tie.
 where its mixer would be. So the config-parameterised block already needs to
 know about layer indices and a set of them, in order to express heterogeneity
 across the stack — and heterogeneity is live work, not hypothetical, because
-that mechanism is how a consumer acts on what it has measured about which
-layers are actually using their state.
+that mechanism is how a consumer acts on what it has measured about its own
+stacks.
 
 Under instance parameterisation this is not a feature. The stack builds whatever
 it likes for index `i` and the block holds it. **The substitution stops being an
@@ -452,9 +452,16 @@ than one. Two experiments go on the list, not one.
 
 Per §2.1: the mixer's output path is already an up/gate/down arrangement, so
 "block = mixer + MLP" is a claim about what the layer is short of, not a neutral
-convention. A layer can reach that latent gated MLP by driving its decay toward
-zero and giving up its memory, so the two functions compete for one piece of
-hardware; adding a second MLP alongside changes what that trade costs.
+convention — the shape is present either way, and a second one duplicates it.
+
+**What that does *not* license is reading a short horizon as a spare layer.**
+The tempting inference — this layer forgets in a few positions, so it has become
+an MLP, so give it a real one — treats decay as the whole of what a mixer does.
+It is not: the delta rule is still running, and a short-lived store that
+retrieves by key is doing something a position-wise feed-forward cannot do at
+all. Fast-forgetting is not not-remembering. Whether a second MLP is worth its
+parameters is therefore not answerable from horizon measurements, which is
+another reason this argument has no default attached to it.
 
 `d_mlp` has no default. `d_mlp=0` (no MLP sub-layer) and `d_mlp>0` are two
 models, and the caller says which. Same shape as `expand_k`.
