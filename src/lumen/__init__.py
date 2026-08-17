@@ -48,6 +48,7 @@ from lumen.gdn import (
 )
 from lumen.nn import RMSNorm, SwiGLU, rms_norm
 from lumen.undertow import UndertowAttention, UndertowConfig
+from lumen.stack import Stack, StackState
 from lumen.probe import (
     ArchFacts,
     DeviceInfo,
@@ -95,6 +96,9 @@ __all__ = [
     # block
     "Block",
     "BlockState",
+    # stack
+    "Stack",
+    "StackState",
     # undertow
     "UndertowAttention",
     "UndertowConfig",
