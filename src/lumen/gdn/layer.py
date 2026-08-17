@@ -499,6 +499,40 @@ class GatedDeltaNet(nn.Module):
         o = o.reshape(batch, seq_len, config.n_heads * config.d_v).to(x.dtype)
         return self.dropout(self.o_proj(o * F.silu(self.g_proj(x))))
 
+    def residual_out_projections(self) -> tuple[nn.Module, ...]:
+        """The projections whose output is added to a residual stream.
+
+        A *structural* fact about the layer, not a hook for any particular
+        caller: it says where this layer's contribution leaves it, which is
+        true whether or not anybody ever initialises, inspects or rescales it.
+
+        Callers so far are depth-scaled initialisation — whose whole job is to
+        shrink exactly these, so that the variance a residual stream accumulates
+        does not grow with the number of layers writing to it — and anything
+        else that needs to reason about the write rather than the layer.
+
+        **Why this exists rather than a caller matching parameter names.** The
+        obvious implementation of a depth-scaled init is a sweep over
+        ``named_parameters()`` for suffixes like ``o_proj.weight``.  That
+        couples the caller to this layer's internals in the direction nothing
+        checks, and it fails *silently*: rename the attribute and the sweep
+        initialises one fewer tensor, producing a model that trains and is
+        wrong.  Asking is loud, because an answer can be asserted against.
+
+        **Why it returns modules rather than parameters.**  Returning "the
+        tensors to scale" would make this an initialisation-policy concept
+        wearing a layer-interface costume, and would quietly canonise the shape
+        of that policy — that depth scaling is a per-tensor multiply applied at
+        construction, which is not true of every scheme.  A projection is a
+        thing the layer has; what a caller does with its weight and its bias is
+        the caller's business.
+
+        Override this alongside :meth:`_out` — they describe the same path, and
+        a subclass that replaces one and not the other is making a claim about
+        its output that is no longer true.
+        """
+        return (self.o_proj,)
+
     # ── streaming ─────────────────────────────────────────────────────────
 
     def init_state(

@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from lumen.gdn import GatedDeltaNet, GatedDeltaNetConfig, HeadLayout
-from lumen.nn import RMSNorm, rms_norm
+from lumen.nn import RMSNorm, SwiGLU, rms_norm
 from lumen.undertow import UndertowAttention, UndertowConfig
 
 
@@ -65,6 +65,46 @@ def test_module_computes_in_fp32_and_restores_the_input_dtype():
     assert torch.equal(out, expected)
 
 
+def test_swiglu_is_the_arrangement_it_claims_to_be():
+    """``down(up(x) * silu(gate(x)))``, spelled out.
+
+    Worth pinning because the class exists to be *the same arrangement* the
+    mixers already carry on their output path. If the two drift apart, the
+    claim that a block adding one of these is duplicating a function the mixer
+    already has stops being true, and that claim is load-bearing — it is why
+    ``d_mlp`` has no default.
+    """
+    torch.manual_seed(0)
+    mlp = SwiGLU(32, 64)
+    x = torch.randn(2, 8, 32)
+    expected = mlp.down_proj(mlp.up(x) * torch.nn.functional.silu(mlp.gate(x)))
+    assert torch.equal(mlp(x), expected)
+
+
+def test_swiglu_keys_match_the_lineage():
+    """``up`` / ``gate`` / ``down_proj`` are checkpoint keys, not style.
+
+    The asymmetry is inherited on purpose: renaming ``down_proj`` to match its
+    two bare siblings would invalidate every archived state dict for a
+    cosmetic gain.
+    """
+    assert set(SwiGLU(32, 64).state_dict()) == {
+        "up.weight",
+        "gate.weight",
+        "down_proj.weight",
+    }
+
+
+def test_swiglu_declares_its_residual_write():
+    mlp = SwiGLU(32, 64)
+    assert mlp.residual_out_projections() == (mlp.down_proj,)
+
+
+def test_swiglu_rejects_a_degenerate_width():
+    with pytest.raises(ValueError):
+        SwiGLU(32, 0)
+
+
 LAYERS = [
     lambda: GatedDeltaNet(GatedDeltaNetConfig(d_model=128, layout=HeadLayout.shared_key(4), expand_k=2.0)),
     lambda: UndertowAttention(UndertowConfig(d_model=128, n_heads=4, window=8)),
@@ -116,3 +156,67 @@ def test_head_norm_stays_a_flat_parameter(build):
     keys = build().state_dict()
     assert "head_norm" in keys
     assert "head_norm.weight" not in keys
+
+
+@pytest.mark.parametrize("build", LAYERS, ids=["gdn", "undertow"])
+def test_residual_out_projections_are_the_layer_output(build):
+    """The claim, checked against the code rather than against a name.
+
+    ``residual_out_projections()`` says *this is where the layer's contribution
+    leaves it*.  If that is true, zeroing what it returns must zero the layer's
+    output exactly -- these projections are bias-free, so nothing downstream of
+    them can put a value back.
+
+    This is the test that survives a refactor.  Asserting the method returns
+    something called ``o_proj`` would pass for a layer whose output path had
+    moved on without it; this cannot.
+    """
+    torch.manual_seed(0)
+    layer = build().eval()
+    x = torch.randn(2, 16, 128)
+
+    with torch.no_grad():
+        assert layer(x).abs().max() > 0, "probe is invalid: layer was already silent"
+        for projection in layer.residual_out_projections():
+            for parameter in projection.parameters():
+                parameter.zero_()
+        assert torch.equal(layer(x), torch.zeros_like(x))
+
+
+@pytest.mark.parametrize("build", LAYERS, ids=["gdn", "undertow"])
+def test_residual_out_projections_match_the_name_sweep(build):
+    """The bridge: asking returns exactly what grepping used to find.
+
+    A depth-scaled initialiser conventionally sweeps ``named_parameters()`` for
+    an ``o_proj.weight`` suffix.  That works until somebody renames an
+    attribute, at which point it silently initialises one tensor fewer.  This
+    asserts the two agree *today*, which is what lets a caller switch from the
+    fragile mechanism to the checkable one without changing any weights.
+
+    Delete this test when no caller sweeps names any more.  Until then it is the
+    only thing tying the new answer to the old behaviour.
+    """
+    layer = build()
+    declared = {
+        id(parameter)
+        for projection in layer.residual_out_projections()
+        for parameter in projection.parameters()
+    }
+    swept = {
+        id(parameter)
+        for name, parameter in layer.named_parameters()
+        if name.endswith("o_proj.weight")
+    }
+    assert declared and declared == swept
+
+
+@pytest.mark.parametrize("build", LAYERS, ids=["gdn", "undertow"])
+def test_residual_out_projections_adds_no_checkpoint_key(build):
+    """Additive means additive: a method is not a parameter.
+
+    Phase 1 of this release exists to land ahead of the block, and the reason it
+    is allowed to land alone is that it cannot move a checkpoint.  A fresh layer
+    must load an identically-configured layer's state dict under ``strict``.
+    """
+    source, destination = build(), build()
+    destination.load_state_dict(source.state_dict(), strict=True)

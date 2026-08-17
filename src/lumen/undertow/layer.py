@@ -320,6 +320,25 @@ class UndertowAttention(nn.Module):
         o = o.reshape(batch, seq_len, self.config.d_model).to(gate.dtype)
         return self.dropout(self.o_proj(o * F.silu(gate)))
 
+    def residual_out_projections(self) -> tuple[nn.Module, ...]:
+        """The projections whose output is added to a residual stream.
+
+        A *structural* fact about the layer, not a hook for any particular
+        caller.  The full argument for why this is a method, and why it returns
+        modules rather than parameters, is in
+        :meth:`lumen.gdn.GatedDeltaNet.residual_out_projections` — the two
+        output paths are deliberately the same shape and so is this.
+
+        ⚠️ **`zero_init` and depth-scaled initialisation both write here, and
+        they disagree.**  ``zero_init=True`` zeroes ``o_proj`` so a fresh layer
+        spliced into a trained stack is an exact identity at step 0; a caller
+        that rescales what this method returns would overwrite those zeros and
+        destroy that guarantee without any error.  This method reports the write
+        either way, because the write *is* there — resolving the precedence is
+        the caller's problem and it is not allowed to be a silent one.
+        """
+        return (self.o_proj,)
+
     # ── streaming ─────────────────────────────────────────────────────────
 
     def init_state(
@@ -336,16 +355,23 @@ class UndertowAttention(nn.Module):
         and the failure mode was the bad one: correct on a CPU-only box and in
         CI, a device mismatch on the first decode of a GPU run.
 
-        Dtype does **not** follow the module, and that asymmetry with
-        :meth:`GatedDeltaNet.init_state` is deliberate: the buffer is fp32
-        because the kernels are, whatever the surrounding module has been cast
-        to.  ``dtype`` is offered for callers who have measured that something
+        Dtype follows the module, promoted to *at least* fp32 -- the same rule
+        the compute path uses, so a buffer never silently caps a stream that the
+        rest of the layer would have carried at higher precision.  It used to be
+        pinned at fp32 on the grounds that the kernels are; what that actually
+        guaranteed was the Triton path's input dtype, and
+        :func:`~lumen.undertow.triton_kernels.usable` now checks that directly
+        rather than relying on a cast three call levels away.
+
+        ``dtype`` is still offered for callers who have measured that something
         else works on their hardware.
         """
         config = self.config
         shape = (batch, config.n_heads, config.window - 1, config.d_head)
         device = self.q_proj.weight.device if device is None else device
-        zeros = torch.zeros(shape, device=device, dtype=dtype or torch.float32)
+        if dtype is None:
+            dtype = torch.promote_types(self.q_proj.weight.dtype, torch.float32)
+        zeros = torch.zeros(shape, device=device, dtype=dtype)
         return UndertowState(keys=zeros, values=zeros.clone(), seen=0)
 
     def _next_state(
@@ -399,10 +425,14 @@ class UndertowAttention(nn.Module):
         window = self.config.window
         q, k, v, gate = self._project(x)
 
-        keys = torch.cat([state.keys, k.float()], dim=2)
-        values = torch.cat([state.values, v.float()], dim=2)
+        # See `forward`: promote, never demote.  The incoming buffer is brought
+        # along rather than being required to match, so a state built under one
+        # dtype policy still continues into a module cast to another.
+        compute = torch.promote_types(q.dtype, torch.float32)
+        keys = torch.cat([state.keys.to(compute), k.to(compute)], dim=2)
+        values = torch.cat([state.values.to(compute), v.to(compute)], dim=2)
 
-        scores = torch.matmul(q.float(), keys.transpose(-2, -1)) / self.scale
+        scores = torch.matmul(q.to(compute), keys.transpose(-2, -1)) / self.scale
         scores = scores + self.log_profile.to(scores.dtype)
 
         n_valid = min(state.seen + 1, window)
@@ -444,7 +474,13 @@ class UndertowAttention(nn.Module):
         """
         seq_len = x.shape[1]
         q, k, v, gate = self._project(x)
-        q, k, v = q.float(), k.float(), v.float()
+        # Promote to *at least* fp32, never down to it.  `.float()` casts to
+        # exactly fp32 -- a promotion for fp16 and bf16 and a silent demotion
+        # for fp64 -- which floors every whole-layer fp64 check at fp32
+        # precision.  Same correction `_out` took; this is the attention body,
+        # which the audit that found the first one did not reach.
+        compute = torch.promote_types(q.dtype, torch.float32)
+        q, k, v = q.to(compute), k.to(compute), v.to(compute)
 
         if state is None:
             window = min(self.config.window, seq_len)

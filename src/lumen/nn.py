@@ -24,8 +24,9 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-__all__ = ["RMSNorm", "rms_norm"]
+__all__ = ["RMSNorm", "SwiGLU", "rms_norm"]
 
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -89,3 +90,54 @@ class RMSNorm(nn.Module):
 
     def extra_repr(self) -> str:
         return f"dim={self.weight.numel()}, eps={self.eps}"
+
+
+class SwiGLU(nn.Module):
+    """A gated feed-forward sub-layer: ``down(up(x) * silu(gate(x)))``.
+
+    Three projections in the arrangement this package's mixers already use on
+    their own output path — ``v_proj`` up, ``g_proj`` gate, ``o_proj`` down.
+    That is the reason this class is worth having rather than being a detail of
+    whatever holds it: **the mixers contain one of these already**, so a block
+    that adds a second is making a claim about what the mixer's own is short of,
+    not following a convention.  A layer can reach the latent one by driving its
+    decay to zero and giving up its memory; the two compete for one piece of
+    hardware, and this one holds no state, which is the whole point of putting
+    it beside a mixer rather than inside one.
+
+    No bias on any of the three, matching the mixers.
+
+    The attribute names — ``up``, ``gate``, ``down_proj`` — are **checkpoint
+    keys** and are chosen to match the lineage this was extracted from rather
+    than for symmetry.  ``down_proj`` looking odd next to two bare names is the
+    cost of not invalidating archived state dicts, and it is the cheaper side of
+    that trade.
+
+    Args:
+        d_model: Width in and out.
+        d_mlp:   Hidden width.  Deliberately no default — see
+                 :class:`lumen.block.Block`, where whether a block carries one
+                 of these at all is a modelling decision the caller makes.
+    """
+
+    def __init__(self, d_model: int, d_mlp: int) -> None:
+        super().__init__()
+        if d_mlp <= 0:
+            raise ValueError(f"d_mlp must be positive, got {d_mlp}")
+        self.up = nn.Linear(d_model, d_mlp, bias=False)
+        self.gate = nn.Linear(d_model, d_mlp, bias=False)
+        self.down_proj = nn.Linear(d_mlp, d_model, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(self.up(x) * F.silu(self.gate(x)))
+
+    def residual_out_projections(self) -> tuple[nn.Module, ...]:
+        """The projection whose output is added to a residual stream.
+
+        Same contract as the mixers' — see
+        :meth:`lumen.gdn.GatedDeltaNet.residual_out_projections`.
+        """
+        return (self.down_proj,)
+
+    def extra_repr(self) -> str:
+        return f"d_model={self.up.in_features}, d_mlp={self.up.out_features}"

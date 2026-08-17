@@ -333,6 +333,36 @@ def test_zero_init_is_an_exact_identity_noop() -> None:
     assert torch.equal(y, torch.zeros_like(y))
 
 
+def test_zero_init_collides_with_depth_scaled_init() -> None:
+    """Pins a hazard rather than a behaviour, so the collision cannot go quiet.
+
+    ``zero_init`` and a depth-scaled initialiser both write to exactly the
+    projections :meth:`residual_out_projections` reports, and they want opposite
+    things: one wants zeros so a spliced layer contributes nothing at step 0,
+    the other wants ``normal_(std=...)``.  Whichever runs second wins, and if
+    that is the depth sweep the identity guarantee is gone with no error raised.
+
+    This asserts the overlap is real, so a caller that rescales the reported
+    projections is provably overwriting something deliberate.  It fails if a
+    future change quietly moves ``zero_init`` off the reported write, which
+    would make the collision invisible instead of resolved.
+    """
+    config = UndertowConfig(d_model=32, n_heads=4, window=8, zero_init=True)
+    layer = UndertowAttention(config)
+
+    zeroed = {
+        id(parameter)
+        for parameter in layer.parameters()
+        if not parameter.any()
+    }
+    reported = {
+        id(parameter)
+        for projection in layer.residual_out_projections()
+        for parameter in projection.parameters()
+    }
+    assert reported and reported <= zeroed
+
+
 def test_causality_no_leak_from_the_future() -> None:
     """Perturbing position t must not change any output before t."""
     torch.manual_seed(31)
@@ -407,9 +437,17 @@ def test_init_state_follows_the_module() -> None:
     device mismatch on the first `step()` of a GPU run.  A default that is
     right exactly where it is tested is the one worth pinning.
 
-    Dtype deliberately does NOT follow the module here -- the buffer is fp32
-    because the kernels are.  That differs from GatedDeltaNet and the
-    docstring says why, so it is asserted rather than left to drift.
+    Dtype follows the module, promoted to *at least* fp32 -- the same rule the
+    compute path uses.
+
+    This assertion used to be its opposite: the buffer was pinned at fp32 on the
+    grounds that "the kernels are", and this test pinned that.  It was correct
+    to exist and the decision under it was wrong.  What the pin actually bought
+    was the Triton path's input dtype, three call levels away from where it was
+    relied on, at the price of capping every fp64 stream at fp32 -- which is the
+    same silent demotion `_out` was corrected for, in the one place the audit
+    that found it did not look.  `triton_kernels.usable` now checks dtype
+    directly and this follows the module.
     """
     layer = _layer(window=8)
     reference = layer.q_proj.weight
@@ -417,8 +455,9 @@ def test_init_state_follows_the_module() -> None:
     assert state.keys.device == reference.device
     assert state.keys.dtype == torch.float32
 
-    layer = layer.double()
-    assert layer.init_state(batch=2).keys.dtype == torch.float32
+    # Promote, never demote: fp16 comes up to fp32, fp64 stays fp64.
+    assert layer.half().init_state(batch=2).keys.dtype == torch.float32
+    assert layer.double().init_state(batch=2).keys.dtype == torch.float64
 
 
 @pytest.mark.gpu

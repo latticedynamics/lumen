@@ -39,14 +39,16 @@ or from Python::
 from __future__ import annotations
 
 from lumen.bench import BenchResult, benchmark_layer, compare, format_table
+from lumen.block import Block, BlockState
 from lumen.gdn import (
     GatedDeltaNet,
     GatedDeltaNetConfig,
     GatedDeltaNetState,
     HeadLayout,
 )
-from lumen.nn import RMSNorm, rms_norm
+from lumen.nn import RMSNorm, SwiGLU, rms_norm
 from lumen.undertow import UndertowAttention, UndertowConfig
+from lumen.stack import Stack, StackState
 from lumen.probe import (
     ArchFacts,
     DeviceInfo,
@@ -61,7 +63,7 @@ from lumen.probe import (
     probe_triton,
 )
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "__version__",
@@ -89,7 +91,14 @@ __all__ = [
     "HeadLayout",
     # nn
     "RMSNorm",
+    "SwiGLU",
     "rms_norm",
+    # block
+    "Block",
+    "BlockState",
+    # stack
+    "Stack",
+    "StackState",
     # undertow
     "UndertowAttention",
     "UndertowConfig",
