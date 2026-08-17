@@ -300,5 +300,14 @@ def windowed_aggregate(
 
 
 def usable(tensor: torch.Tensor) -> bool:
-    """Can the Triton path run on this tensor?  CUDA-only, by construction."""
-    return HAS_TRITON and tensor.is_cuda
+    """Can the Triton path run on this tensor?  CUDA-only and fp32.
+
+    The dtype check used to be unnecessary rather than absent: the layer cast
+    everything with ``.float()`` before dispatching, so nothing else could
+    arrive.  That cast was a silent demotion for fp64 and has been replaced by a
+    promotion, which means the guarantee has to be stated where it is relied on
+    instead of inherited from a cast three call levels away.  An fp64 caller now
+    takes the reference path, which is the correct answer rather than a
+    limitation -- these kernels are compiled for fp32.
+    """
+    return HAS_TRITON and tensor.is_cuda and tensor.dtype is torch.float32

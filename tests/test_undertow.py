@@ -437,9 +437,17 @@ def test_init_state_follows_the_module() -> None:
     device mismatch on the first `step()` of a GPU run.  A default that is
     right exactly where it is tested is the one worth pinning.
 
-    Dtype deliberately does NOT follow the module here -- the buffer is fp32
-    because the kernels are.  That differs from GatedDeltaNet and the
-    docstring says why, so it is asserted rather than left to drift.
+    Dtype follows the module, promoted to *at least* fp32 -- the same rule the
+    compute path uses.
+
+    This assertion used to be its opposite: the buffer was pinned at fp32 on the
+    grounds that "the kernels are", and this test pinned that.  It was correct
+    to exist and the decision under it was wrong.  What the pin actually bought
+    was the Triton path's input dtype, three call levels away from where it was
+    relied on, at the price of capping every fp64 stream at fp32 -- which is the
+    same silent demotion `_out` was corrected for, in the one place the audit
+    that found it did not look.  `triton_kernels.usable` now checks dtype
+    directly and this follows the module.
     """
     layer = _layer(window=8)
     reference = layer.q_proj.weight
@@ -447,8 +455,9 @@ def test_init_state_follows_the_module() -> None:
     assert state.keys.device == reference.device
     assert state.keys.dtype == torch.float32
 
-    layer = layer.double()
-    assert layer.init_state(batch=2).keys.dtype == torch.float32
+    # Promote, never demote: fp16 comes up to fp32, fp64 stays fp64.
+    assert layer.half().init_state(batch=2).keys.dtype == torch.float32
+    assert layer.double().init_state(batch=2).keys.dtype == torch.float64
 
 
 @pytest.mark.gpu
