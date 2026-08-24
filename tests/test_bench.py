@@ -82,13 +82,24 @@ def test_benchmark_layer_runs_on_cpu():
     unconditionally, and `ValueError: Expected a cuda device` was captured as
     data rather than raised.  A quiet failure in a measurement tool reads
     exactly like a measurement.
+
+    It also used to assert `fwd_bwd_ms >= fwd_ms` and flake at ~10% (#11).
+    Raising `warmup` was measured to fix it -- 0/40 at `warmup=5` against 1/40
+    at `warmup=1` -- but that buys a lower failure rate, not a sound assertion:
+    the ordering of two independent timings remains a fact about the machine.
+    So the flaky claim is dropped here rather than made rarer, and the
+    deterministic one it was standing in for is tested directly instead.
     """
     result = benchmark_layer(_mlp(), label="mlp", batch=2, seq_len=128, d_model=64,
                              device="cpu", warmup=1, reps=3)
     assert result.error is None, f"CPU benchmark failed: {result.error}"
     assert result.fwd_ms > 0
-    assert result.fwd_bwd_ms >= result.fwd_ms
+    assert result.fwd_bwd_ms > 0
     assert result.tokens_per_s > 0
+    # Same reasoning as the CUDA sibling: the ordering of two independent
+    # timings is not assertable, only the promise that an inversion is never
+    # rendered as a number.
+    assert not re.search(r"-\d+\.\d", format_table([result]))
 
 
 def test_compare_produces_a_real_table_on_cpu():
