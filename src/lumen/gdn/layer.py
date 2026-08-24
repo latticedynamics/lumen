@@ -156,6 +156,13 @@ class GatedDeltaNetConfig:
                   is `flash-linear-attention`'s, and an archived config should
                   say which code ran.  See :mod:`lumen.gdn.fla_backend`.
 
+                  **Not installed by default.**  ``pip install lumen[fla]``,
+                  which pins an exact version rather than a floor — it is
+                  someone else's research code, and a kernel that changed its
+                  ``beta`` convention between minor releases would change the
+                  model without changing anything here.
+                  ``tests/test_gdn_backend.py`` is what would catch that.
+
                   **``chunk_size`` is inert under ``"fla"``** — fla chooses its
                   own chunking and Lumen's value cannot reach it.  That is
                   numerically safe, because the answer is independent of the
