@@ -321,10 +321,11 @@ learned* centre finds that solution and benefits from it. It does not, here.
 A centring tied to a running mean rather than learned would test the geometric
 claim directly. It is a different component and nobody has run it.
 
-**`expand_k` remains a required argument with no default** (§3.5). The result
-above is one training scale on one corpus, and it favours the wide setting
-consistently; that is a reason for the record to say so, not a reason for the
-library to choose. **Centring ships zero-initialised and off by default** — it
+**`expand_k` therefore defaults wide** (§3.5). The result above is one training
+scale on one corpus, and it favours the wide setting consistently with disjoint
+ranges at both centring settings — which is enough to make it the default while
+the record keeps stating the strength of the evidence rather than presenting it
+as settled. **Centring ships zero-initialised and off by default** — it
 costs almost nothing, it is bit-identical when off, and the case for turning it
 on has not been made.
 

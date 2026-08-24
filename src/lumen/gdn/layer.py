@@ -19,10 +19,14 @@ are worth repeating where the code lives:
   the crossed layout cannot express the ordinary one-key-one-value arrangement
   at all, which would leave it with no published reference point to check
   itself against.
-* **`expand_k` has no default.**  The comparison that would justify one — key
-  width against key centring, which are the same claim bought at very different
-  prices — has not been run to conclusion.  Consolidating is not a licence to
-  pick.
+* **`expand_k` defaults wide, and that default was earned.**  Key width and key
+  centring are the same claim bought at very different prices, so the four-arm
+  comparison ran both at once (§3.3): key width won by several times the
+  seed-noise floor with disjoint ranges, at *both* centring settings, and
+  centring came back inside seed noise at both widths.  A library that refuses
+  to have a default forces every caller to invent one with less evidence than
+  that (§3.5).  It is one training scale on one corpus, which is why the record
+  states the strength of the result rather than presenting it as settled.
 * **Centring is zero-initialised**, so a checkpoint from an uncentred model
   loads and behaves identically by construction.  There is a test for that;
   a construction claim deserves better than a comment.
@@ -91,11 +95,14 @@ class GatedDeltaNetConfig:
                   ``HeadLayout.shared_key(8)`` is the ordinary one.  See
                   :mod:`lumen.gdn.layout`.
         expand_k: Total key width as a multiple of ``d_model``; per-state
-                  ``d_k = expand_k · d_model / H``.  **Required.**  Since
+                  ``d_k = expand_k · d_model / H``.  Since
                   ``rank(M) ≤ min(d_k, d_v)``, this is the dial that buys
-                  non-interfering addresses — and it is also the dial that
-                  ``centre`` may make unnecessary, which is why it gets no
-                  default until that comparison is settled.
+                  non-interfering addresses.  **Defaults wide (2.0), inverting
+                  the more common ratio**, on §3.3's evidence — the obvious
+                  alternative was that ``centre`` makes the width unnecessary,
+                  and the comparison closed that: narrow-and-centred, the
+                  cheapest outcome and the most interesting one, was decisively
+                  worse than wide-and-uncentred.
         expand_v: Total value width as a multiple of ``d_model``.  Buys
                   embedding room in front of the output gate rather than more
                   addresses.
