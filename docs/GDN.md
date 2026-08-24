@@ -212,6 +212,7 @@ afterwards. See [BLOCK.md](./BLOCK.md#structure-among-a-sub-layers-weights); if
 you write your own trunk that redraws `nn.Linear` weights, call it.
 | `norm_eps` | 1e-5 | Output RMSNorm epsilon. |
 | `dropout` | 0.0 | Applied after the output projection. |
+| `backend` | `"reference"` | `"reference"` or `"fla"` — see [backends](#backends). Opt-in, never auto-detected. |
 
 ### Why `chunk_size` is only performance
 
@@ -260,12 +261,110 @@ Reuse is by subclassing. Three methods are the seams:
 interchangeability with Undertow, and the per-head normalisation it performs is
 relied on elsewhere. Know that before you replace it.
 
-## Precision and hardware
+## Backends
 
-The reference path is fp32 and depends on nothing but `torch`, because that is
-the path that runs everywhere. There is no accelerated kernel in this version —
-one ships when it has been measured to beat the reference here, the way
-Undertow's was.
+The reference path is fp32, depends on nothing but `torch`, and is the default.
+An accelerated path is available beside it and is **opt-in**:
+
+```python
+config = GatedDeltaNetConfig(
+    d_model=2048, layout=HeadLayout.diagonal(32),
+    expand_k=1.0, expand_v=4.0, backend="fla",
+)
+```
+
+It dispatches to [`flash-linear-attention`][fla]'s Triton chunk kernels. Install
+it yourself and pin it — it is someone else's research code and moves without
+warning.
+
+[fla]: https://github.com/fla-org/flash-linear-attention
+
+It is called `"fla"` rather than `"triton"` on purpose. Undertow's
+`backend="triton"` means *Lumen's own* Triton kernels; this is a third-party
+dependency. One word cannot name both, or an archived config no longer says
+which code ran — and it leaves `"triton"` free here for a kernel Lumen writes.
+
+Not auto-detected, and that is deliberate rather than cautious. A fast path that
+switches itself on whenever a package happens to be importable means two
+installations of this layer are no longer running the same object, and a
+difference in their numbers stops being a difference in their experiment. Ask
+for it, measure it on your hardware, and record that you did.
+
+### What it needs
+
+Refused at construction, not at the first forward:
+
+| requirement | why |
+|---|---|
+| `HeadLayout.diagonal(...)` | fla implements one key per head; `crossed`, `shared_key` and `shared_value` have no kernel |
+| `decay` is `"key_group"` or `"state"` | on a diagonal layout these are the same object (`G_k = H`, `m = 1`). `"state_gated"` widens `a_proj` to `H` independent signals and is a different model |
+| `fla` importable | requesting a backend that cannot be built is an error, not a silent downgrade |
+
+A CUDA-only path meeting a CPU or fp64 tensor falls back quietly instead —
+that is a device or dtype gap, not a missing capability, and an fp64 oracle run
+taking the reference is the right answer rather than a limitation of it.
+
+**`chunk_size` is inert under `"fla"`.** fla chooses its own chunking and this
+value cannot reach it. That is numerically safe because the answer does not
+depend on the chunk size at all (see [below](#why-chunk_size-is-only-performance)),
+but it is worth knowing before you read a value back out of an archived config.
+
+### Measured, on one machine
+
+One layer, `d_model=2048`, `diagonal(32)`, `expand_k=1.0`, `expand_v=4.0`,
+`B=4`, `T=1024`, forward+backward, on an A100-SXM4-40GB. Both sides
+58,900,800 parameters:
+
+| path | ms | vs reference |
+|---|---|---|
+| reference, fp32 | 116.6 | 1.00× |
+| fla, fp32 | 87.3 | 1.33× |
+| reference, bf16 autocast | 36.5 | 3.20× |
+| **fla, bf16 autocast** | **11.4** | **10.3×** |
+
+Evidence, not specification — and the mechanism does not generalise the way
+Undertow's does. Undertow's Triton win is bandwidth and launch overhead, which
+is why it holds on a card without tensor cores. This one is largely
+*arithmetic*: the chunk inner loop is matmul-dense, so expect it to shrink
+sharply without tensor cores.
+
+How sharply depends on the configuration, not just the card. On a Tesla P40
+(SM 6.1, no tensor cores), fp32, `d_model=512`, `diagonal(8)`, `expand_v=4.0`,
+`T=512`: fla takes the forward and **loses the backward**, netting roughly
+1.2× end to end. At the crossed layout `lumen.bench`'s docstring records, the
+same card gives the reference ~1.6× overall. Same hardware, opposite verdict,
+because the two configurations put different amounts of work in the part fla
+accelerates.
+
+> Those P40 figures were taken while the card was running an unrelated job at
+> ~50% utilisation, so treat the ratio as indicative and the *direction* as the
+> claim. The A100 table above was measured on an idle device.
+
+So: none of these numbers is a property of the implementations. Measure the
+configuration you actually train, on the card you actually train it on, and
+report the backward separately — an accelerated forward attached to a slower
+backward is how a kernel wins every microbenchmark and loses the run.
+
+### It computes the same function
+
+Not a claim about speed, and the one that licenses switching at all. Against
+Lumen's own fp64 sequential oracle:
+
+| | relative error |
+|---|---|
+| reference chunkwise vs oracle | 2.07e-7 |
+| fla vs oracle | 2.24e-7 |
+| gradients, fla vs reference | 2.4e-7 … 5.3e-7, all five inputs |
+
+fla lands the same distance from the oracle as the chunkwise path does — one
+algorithm reached by two routes, rather than two algorithms for one function.
+`tests/test_gdn_backend.py` holds this as a standing test, and asserts fla is
+no worse than the path already trusted rather than merely under a threshold.
+
+Switching backend mid-experiment still changes your numbers at fp32 round-off.
+That is small, and it is not zero.
+
+## Precision and hardware
 
 Run the GPU-marked tests locally before relying on a GPU path; CI is CPU-only:
 

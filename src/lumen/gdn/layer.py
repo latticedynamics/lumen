@@ -19,10 +19,14 @@ are worth repeating where the code lives:
   the crossed layout cannot express the ordinary one-key-one-value arrangement
   at all, which would leave it with no published reference point to check
   itself against.
-* **`expand_k` has no default.**  The comparison that would justify one — key
-  width against key centring, which are the same claim bought at very different
-  prices — has not been run to conclusion.  Consolidating is not a licence to
-  pick.
+* **`expand_k` defaults wide, and that default was earned.**  Key width and key
+  centring are the same claim bought at very different prices, so the four-arm
+  comparison ran both at once (§3.3): key width won by several times the
+  seed-noise floor with disjoint ranges, at *both* centring settings, and
+  centring came back inside seed noise at both widths.  A library that refuses
+  to have a default forces every caller to invent one with less evidence than
+  that (§3.5).  It is one training scale on one corpus, which is why the record
+  states the strength of the result rather than presenting it as settled.
 * **Centring is zero-initialised**, so a checkpoint from an uncentred model
   loads and behaves identically by construction.  There is a test for that;
   a construction claim deserves better than a comment.
@@ -49,11 +53,14 @@ import torch.nn.functional as F
 
 from lumen.gdn.layout import HeadLayout
 from lumen.nn import rms_norm
+from lumen.gdn import fla_backend
 from lumen.gdn.reference import (
     assign_values,
     chunk_gated_delta,
     recurrent_gated_delta,
 )
+
+BACKENDS = ("reference", "fla")
 
 
 @dataclass(frozen=True)
@@ -91,11 +98,14 @@ class GatedDeltaNetConfig:
                   ``HeadLayout.shared_key(8)`` is the ordinary one.  See
                   :mod:`lumen.gdn.layout`.
         expand_k: Total key width as a multiple of ``d_model``; per-state
-                  ``d_k = expand_k · d_model / H``.  **Required.**  Since
+                  ``d_k = expand_k · d_model / H``.  Since
                   ``rank(M) ≤ min(d_k, d_v)``, this is the dial that buys
-                  non-interfering addresses — and it is also the dial that
-                  ``centre`` may make unnecessary, which is why it gets no
-                  default until that comparison is settled.
+                  non-interfering addresses.  **Defaults wide (2.0), inverting
+                  the more common ratio**, on §3.3's evidence — the obvious
+                  alternative was that ``centre`` makes the width unnecessary,
+                  and the comparison closed that: narrow-and-centred, the
+                  cheapest outcome and the most interesting one, was decisively
+                  worse than wide-and-uncentred.
         expand_v: Total value width as a multiple of ``d_model``.  Buys
                   embedding room in front of the output gate rather than more
                   addresses.
@@ -133,6 +143,32 @@ class GatedDeltaNetConfig:
                   of them is a band.
         norm_eps: Per-head output RMSNorm epsilon.
         dropout:  Applied to the layer output, after the output projection.
+        backend:  ``"reference"`` (default) or ``"fla"``.  **Opt-in, and
+                  deliberately not auto-detected**, for the reason Undertow
+                  gives at `docs/design/UNDERTOW.md` §3.4: a fast path that
+                  switches itself on whenever a package happens to be
+                  importable means two projects sharing this layer are no
+                  longer running the same object, and then a difference in
+                  their numbers stops being a difference in their experiment.
+
+                  Named for the dependency rather than the technology.
+                  ``"triton"`` in Undertow means *Lumen's* Triton kernels; this
+                  is `flash-linear-attention`'s, and an archived config should
+                  say which code ran.  See :mod:`lumen.gdn.fla_backend`.
+
+                  **Not installed by default.**  ``pip install lumen[fla]``,
+                  which pins an exact version rather than a floor — it is
+                  someone else's research code, and a kernel that changed its
+                  ``beta`` convention between minor releases would change the
+                  model without changing anything here.
+                  ``tests/test_gdn_backend.py`` is what would catch that.
+
+                  **``chunk_size`` is inert under ``"fla"``** — fla chooses its
+                  own chunking and Lumen's value cannot reach it.  That is
+                  numerically safe, because the answer is independent of the
+                  chunk size and there is a test for it (§3.8), but a field
+                  that quietly stops meaning anything is worth saying out loud
+                  rather than discovering in an archived config later.
     """
 
     d_model: int
@@ -146,6 +182,7 @@ class GatedDeltaNetConfig:
     decay: Literal["key_group", "state", "state_gated"] = "key_group"
     norm_eps: float = 1e-5
     dropout: float = 0.0
+    backend: str = "reference"
 
     def __post_init__(self) -> None:
         if self.d_model < 1:
@@ -189,6 +226,18 @@ class GatedDeltaNetConfig:
             raise ValueError(f"norm_eps must be > 0, got {self.norm_eps}")
         if not 0.0 <= self.dropout < 1.0:
             raise ValueError(f"dropout must be in [0, 1), got {self.dropout}")
+        if self.backend not in BACKENDS:
+            raise ValueError(
+                f"backend must be one of {BACKENDS}, got {self.backend!r}"
+            )
+        if self.backend == "fla":
+            # Checked here, on the config alone, rather than at the first
+            # forward: an unsupported arrangement is a fact about the
+            # configuration and should be refused where the configuration is
+            # written, not several thousand steps into a run.
+            reason = fla_backend.unsupported(self.layout, self.decay)
+            if reason is not None:
+                raise ValueError(f'backend="fla" cannot run this config: {reason}')
 
         for name, expand in (("expand_k", self.expand_k), ("expand_v", self.expand_v)):
             if expand <= 0:
@@ -305,6 +354,16 @@ class GatedDeltaNet(nn.Module):
     def __init__(self, config: GatedDeltaNetConfig) -> None:
         super().__init__()
         self.config = config
+
+        # Requesting a backend that cannot be built is an error here, not a
+        # silent downgrade -- degrading quietly is for capabilities nobody
+        # asked for.  (A CUDA-only path meeting a CPU tensor is a different
+        # matter and falls back in `_scan`: that is a device gap.)
+        if config.backend == "fla" and not fla_backend.HAS_FLA:
+            raise RuntimeError(
+                'backend="fla" was requested but flash-linear-attention did '
+                "not import. Install it, or use the reference backend."
+            )
 
         d_model = config.d_model
         layout = config.layout
@@ -507,7 +566,16 @@ class GatedDeltaNet(nn.Module):
         log_alpha: torch.Tensor,
         memory: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """The recurrence.  Override to swap in an accelerated kernel."""
+        """The recurrence, on whichever backend is configured.
+
+        Override to swap in an accelerated kernel.  The fla path falls back to
+        the reference for tensors it cannot take -- CPU, or fp64 -- because
+        that is a device or dtype gap rather than a missing capability, and an
+        fp64 oracle run taking the reference is the right answer rather than a
+        limitation of it.
+        """
+        if self.config.backend == "fla" and fla_backend.usable(q):
+            return fla_backend.chunk_gated_delta_fla(q, k, v, beta, log_alpha, memory)
         return chunk_gated_delta(
             q, k, v, beta, log_alpha, self.config.chunk_size, memory
         )
@@ -671,5 +739,6 @@ class GatedDeltaNet(nn.Module):
             f"d_model={config.d_model}, layout={config.layout.describe()}, "
             f"d_k={config.d_k}, d_v={config.d_v}, "
             f"expand_k={config.expand_k}, expand_v={config.expand_v}, "
-            f"centre={config.centre}, decay={config.decay}"
+            f"centre={config.centre}, decay={config.decay}, "
+            f"backend={config.backend}"
         )

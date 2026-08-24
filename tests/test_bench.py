@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 import pytest
 import torch
 import torch.nn as nn
@@ -121,9 +123,56 @@ def test_compare_builds_a_fresh_layer_per_cell():
 
 @requires_cuda
 def test_benchmark_layer_on_a_real_module():
+    """The measured fields are real; the ordering of the two is not asserted.
+
+    This used to assert `fwd_bwd_ms >= fwd_ms` and flaked on a shared card.
+    That is not a warmup problem and no amount of tuning fixes it: the two are
+    independent timings of a sub-millisecond workload, so their ordering is a
+    property of what else the device was doing, not of the layer.  A
+    measurement tool whose own tests assert unresolvable orderings is arguing
+    against itself.
+
+    What *is* deterministic is that the result must never present the inversion
+    as a number -- see `test_an_unresolved_backward_is_not_rendered_as_a_time`.
+    """
     result = benchmark_layer(_mlp(), label="mlp", batch=2, seq_len=128, d_model=64,
                              warmup=1, reps=3)
     assert result.error is None
     assert result.fwd_ms > 0
-    assert result.fwd_bwd_ms >= result.fwd_ms
+    assert result.fwd_bwd_ms > 0
     assert result.tokens_per_s > 0
+    # Whatever the ordering came out as, the table must not contain a negative
+    # duration.  Matched by pattern rather than by cell index, so this keeps
+    # meaning the same thing if a column is ever added.
+    assert not re.search(r"-\d+\.\d", format_table([result]))
+
+
+def test_an_unresolved_backward_is_not_rendered_as_a_time():
+    """A backward under the noise floor renders as absent, not as a negative number.
+
+    Constructed rather than measured, because the condition being tested is one
+    a healthy machine will not reliably produce -- and a test that can only
+    fail on a busy device is the flake this replaces.
+    """
+    inverted = BenchResult(label="mlp", dtype="float32", seq_len=128, batch=2,
+                           params=8320, fwd_ms=5.06, fwd_bwd_ms=1.49)
+
+    assert inverted.bwd_ms < 0, "the difference itself stays raw, not clamped"
+    assert not inverted.bwd_resolved
+
+    table = format_table([inverted])
+    assert "<noise" in table
+    assert "-3.6" not in table
+
+    healthy = BenchResult(label="mlp", dtype="float32", seq_len=128, batch=2,
+                          params=8320, fwd_ms=1.0, fwd_bwd_ms=3.0)
+    assert healthy.bwd_resolved
+    assert "2.0" in format_table([healthy])
+
+
+def test_an_errored_row_never_claims_a_resolved_backward():
+    """Failures are data, and a failed row's derived fields are not measurements."""
+    failed = BenchResult(label="mlp", dtype="float32", seq_len=128, batch=2,
+                         params=0, fwd_ms=float("nan"), fwd_bwd_ms=float("nan"),
+                         error="RuntimeError: out of memory")
+    assert not failed.bwd_resolved

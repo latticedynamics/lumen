@@ -58,7 +58,26 @@ class BenchResult:
 
     @property
     def bwd_ms(self) -> float:
+        """The backward, by difference.  May be non-positive -- see `bwd_resolved`."""
         return self.fwd_bwd_ms - self.fwd_ms
+
+    @property
+    def bwd_resolved(self) -> bool:
+        """Did this run actually resolve the backward, or is it under the noise?
+
+        `bwd_ms` is a *difference of two independent timings*, so it inherits
+        both their errors and can come out negative when the layer is small,
+        the reps are few, or the device is shared.  A negative duration is not
+        a slow backward; it is the measurement saying it could not see one.
+
+        Deliberately not clamped.  Clamping to zero would fabricate a number
+        and hide the condition, and this module exists to argue that a
+        forward-only benchmark reports the opposite conclusion with a straight
+        face -- printing a negative backward with equal confidence is the same
+        failure with the sign flipped.  So the difference stays raw and this
+        flag says whether to believe it.
+        """
+        return self.error is None and self.bwd_ms > 0.0
 
     @property
     def tokens_per_s(self) -> float:
@@ -205,9 +224,15 @@ def format_table(results: Sequence[BenchResult]) -> str:
                              "-", "-", "FAILED", "-", r.error[:30]))
                 continue
             ratio = f"{r.fwd_bwd_ms / best:.2f}x" if best else "-"
+            # Only the backward cell can be nonsense: `fwd_ms` and `fwd_bwd_ms`
+            # are measured, while `bwd_ms` is their difference and can invert.
+            # Rendering that as "-3.6" would put a negative duration in a
+            # results table, which reads as a number rather than as the absence
+            # of one.
+            backward = f"{r.bwd_ms:.1f}" if r.bwd_resolved else "<noise"
             rows.append((
                 str(seq_len), r.label, r.dtype, f"{r.params/1e6:.2f}M",
-                f"{r.fwd_ms:.1f}", f"{r.bwd_ms:.1f}", f"{r.fwd_bwd_ms:.1f}",
+                f"{r.fwd_ms:.1f}", backward, f"{r.fwd_bwd_ms:.1f}",
                 f"{r.tokens_per_s/1000:.1f}k", ratio,
             ))
 

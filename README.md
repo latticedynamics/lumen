@@ -107,7 +107,7 @@ it was written on.
 | | |
 |---|---|
 | [`lumen.undertow`](./docs/UNDERTOW.md) | Fixed-window causal attention, no positional encoding, optional graded boundary. Streaming with constant memory, opt-in Triton path. [Design record](./docs/design/UNDERTOW.md) |
-| [`lumen.gdn`](./docs/GDN.md) | Gated DeltaNet — a fixed-size associative memory with a delta-rule write. Linear in sequence length, constant-memory generation, configurable head layout. [Design record](./docs/design/GATED_DELTANET.md) |
+| [`lumen.gdn`](./docs/GDN.md) | Gated DeltaNet — a fixed-size associative memory with a delta-rule write. Linear in sequence length, constant-memory generation, configurable head layout, opt-in `fla` kernel path verified against the fp64 oracle. [Design record](./docs/design/GATED_DELTANET.md) |
 | [`lumen.block`](./docs/BLOCK.md) | A residual `Block` and a `Stack` of them — the level a result is actually read off. Modality-free, sub-layer instances rather than a config, and the depth-scaled init that cannot live any lower. [Design record](./docs/design/BLOCK.md) |
 | [`lumen.pytree`](./docs/PYTREE.md) | Every streaming state is a pytree node, so `vmap`, `functional_call` and `torch.compile` can traverse one. The state is half the mixer contract; this is what keeps it from being where the abstraction stops |
 
@@ -215,7 +215,7 @@ suite checks against; they are deliberately not exported.
 
 ## Status
 
-`0.4.1` — alpha, and versioned honestly. The *interface* is the thing this
+`0.5.0` — alpha, and versioned honestly. The *interface* is the thing this
 library exists to protect, so it changes slowly and visibly; a merged component
 is required to reproduce the outputs of what it replaces, to a stated tolerance,
 before anything switches to it. Internals are fair game.

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lumen"
-version = "0.4.1"
+version = "0.5.0"
 description = "One place for the components worth keeping: consolidated architectures, measured hardware capability, no assumptions."
 readme = "README.md"
 license = { text = "MIT" }
@@ -36,6 +36,14 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7"]
+# The house rule, applied: pin what you import from someone else's *research*
+# code, because that is what moves without warning.  `backend="fla"` is opt-in
+# and this extra is not installed by default -- the layer runs its own fp32
+# reference with torch alone, and a missing fla is an error only if you asked
+# for it.  The pin is exact rather than a floor because a kernel that changes
+# its beta convention between minor versions would change the model silently,
+# and `tests/test_gdn_backend.py` is what would catch it.
+fla = ["flash-linear-attention==0.5.2"]
 
 [project.urls]
 Repository = "https://github.com/latticedynamics/lumen"

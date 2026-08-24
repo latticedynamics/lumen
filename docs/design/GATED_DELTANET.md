@@ -104,7 +104,7 @@ Constant in generated length — a fixed-size memory is the whole proposition.
 
 | lineage | uniquely had |
 |---|---|
-| **Consuming model** | crossed key/value grouping (§3.1); independent `expand_k`/`expand_v` with the argument for expanding the *key* side; a frozen config dataclass; the in-chunk decay clamp; fp32 and no Triton, by design |
+| **Consuming model** | crossed key/value grouping (§3.1); independent `expand_k`/`expand_v` with the argument for expanding the *key* side; a frozen config dataclass; the in-chunk decay clamp; fp32 by default, an accelerated path only once measured |
 | **Streaming** | `init_state()` / `step()` / `forward(..., state=, return_state=)`; per-head learned `β` via sigmoid, zero-initialised so `β` starts *exactly* at the fixed-strength engine it replaced; a per-head geometric decay band, optionally learnable; structural masking |
 | **Trained** | the lineage with real training behind it — and, on inspection, little else the others lack: most of its length is tokenizer and corpus handling, which is exactly the coupling §5 excludes |
 | **Episodic** | **key/query centring** (§3.3); an optional kNN episodic store with a gated read |
@@ -321,10 +321,11 @@ learned* centre finds that solution and benefits from it. It does not, here.
 A centring tied to a running mean rather than learned would test the geometric
 claim directly. It is a different component and nobody has run it.
 
-**`expand_k` remains a required argument with no default** (§3.5). The result
-above is one training scale on one corpus, and it favours the wide setting
-consistently; that is a reason for the record to say so, not a reason for the
-library to choose. **Centring ships zero-initialised and off by default** — it
+**`expand_k` therefore defaults wide** (§3.5). The result above is one training
+scale on one corpus, and it favours the wide setting consistently with disjoint
+ranges at both centring settings — which is enough to make it the default while
+the record keeps stating the strength of the evidence rather than presenting it
+as settled. **Centring ships zero-initialised and off by default** — it
 costs almost nothing, it is bit-identical when off, and the case for turning it
 on has not been made.
 
@@ -478,19 +479,97 @@ evidence.
 `β_max = 2` is the easy case: all four lineages already agree, and it is an
 existing option in delta-rule implementations generally.
 
-### 3.6 fp32 reference, no accelerated path in this version
+### 3.6 fp32 reference, and an accelerated path that had to earn it
 
 The reference path is fp32 and depends on nothing but `torch`, because that is
-the path that runs everywhere.
+the path that runs everywhere. It remains the default.
 
-There is no Triton path here, and the reason is the house rule rather than
-neglect: **an accelerated path ships when it has been measured to beat the
-reference on the target machine, and not before.** Undertow's did, and shipped
-opt-in with its numbers in the record; this one has not been written, so there
-is nothing to report and nothing is claimed. When it is, the same standard
-applies — measured here, on this implementation, labelled as one machine's
-numbers, and selected explicitly rather than auto-detected, so that two installs
-of this layer are never quietly two different objects.
+`backend="fla"` is opt-in beside it, dispatching to `flash-linear-attention`'s
+Triton chunk kernels. It arrived under the house rule rather than around it:
+**an accelerated path ships when it has been measured to beat the reference on
+the target machine, and not before** — and, because this is a consolidation
+library, when it has been shown to compute the same function.
+
+**Measured, on one machine.** One layer, `d_model=2048`, `diagonal(32)`,
+`expand_k=1.0`, `expand_v=4.0`, `B=4`, `T=1024`, fwd+bwd, matched parameter
+count (58,900,800 both sides):
+
+| path | ms | vs reference |
+|---|---|---|
+| reference, fp32 | 116.6 | 1.00× |
+| fla, fp32 | 87.3 | 1.33× |
+| reference, bf16 autocast | 36.5 | 3.20× |
+| **fla, bf16 autocast** | **11.4** | **10.3×** |
+
+One machine's numbers, and evidence rather than specification. What generalises
+is the mechanism, and it is the *opposite* of Undertow's: Undertow's Triton win
+is bandwidth and launch overhead, explicitly not arithmetic, which is why it
+holds on a card with no tensor cores. This win is largely arithmetic — the
+chunk inner loop is matmul-dense — so it should be expected to shrink sharply
+on hardware without tensor cores.
+
+**And the amount it shrinks is a property of the configuration too, not only of
+the card.** Measured on the Pascal bench, fp32, `d_model=512`, `diagonal(8)`,
+`expand_v=4.0`, `T=512`: fla wins the forward, **loses the backward** — exactly
+the split `lumen.bench`'s docstring describes — and nets roughly 1.2× end to
+end. At the crossed layout that docstring records, the same card returns ~1.6×
+the other way.
+
+That Pascal run was taken with an unrelated job holding the card at ~50%
+utilisation, which is enough to move a ratio and not enough to flip a sign.
+The direction is the claim; the number wants re-measuring on an idle device
+before it is quoted. The A100 figures above came from an idle card.
+
+Same hardware, opposite verdict, from a different arrangement of heads. That is
+worth stating plainly because the tempting summary — "Triton wins on Ampere,
+torch wins on Pascal" — is false in both directions and would have been written
+confidently from either measurement alone. `backend` is a decision someone
+makes, on their configuration and their card, rather than something detected.
+
+**Verified to compute the same function**, against Lumen's own fp64 sequential
+oracle, forward and backward:
+
+| | relative error |
+|---|---|
+| reference chunkwise vs oracle | 2.07e-7 |
+| fla vs oracle | 2.24e-7 |
+| gradients, fla vs reference | 2.4e-7 … 5.3e-7 (all five inputs) |
+
+fla lands the same distance from the oracle as the chunkwise path does. That is
+§3.7's *"one algorithm reached by two routes"*, not two algorithms for one
+function, which is what earns the tight tolerance rather than Undertow's looser
+one. `tests/test_gdn_backend.py` holds this as a standing test, and asserts fla
+is no worse than the path already trusted rather than merely under a threshold.
+
+**Selected explicitly, never auto-detected**, for Undertow's reason (§3.4 there):
+a fast path that switches itself on whenever a package happens to be importable
+means two projects sharing this layer are no longer running the same object.
+Requesting it without fla installed is an error at construction; a CPU or fp64
+tensor falls back, because that is a device gap rather than a missing
+capability.
+
+**Named for the dependency, not the technology.** `backend="fla"`, not
+`"triton"`. Undertow's `"triton"` means *Lumen's* kernels; this is someone
+else's, pinned. One word cannot mean both, or an archived config stops saying
+which code ran — and it leaves `"triton"` free here for a kernel Lumen writes.
+
+**What the accelerated path cannot express**, refused at construction rather
+than at the first forward:
+
+- every layout but the diagonal one — fla implements one key per head, so
+  `crossed`, `shared_key` and `shared_value` are out. Broadcasting a shared key
+  across heads would be numerically identical and do `m`× redundant solve work;
+  whether that still wins is unmeasured, and §3.5's rule applies.
+- `decay="state_gated"`, which widens `a_proj` to `H` independent signals.
+  `decay="state"` **is** accepted, because on a diagonal layout `G_k = H` and
+  `m = 1`, so per-key-group and per-state are the same object — refusing it
+  would make the supported set a statement about spelling.
+
+**`chunk_size` is inert under `backend="fla"`.** fla chooses its own chunking
+and Lumen's value cannot reach it. That is numerically safe precisely because
+§3.8 holds — the answer does not depend on the chunk size, and there is a test —
+but a config field that quietly stops meaning anything is worth stating, since
+it will be read back out of an archived config by someone who was not here.
 
 Two numerical traps from the contributing lineage are preserved in the reference
 because both are expensive to rediscover:
@@ -715,7 +794,8 @@ ordinary arrangement is reachable:
   per-key-group `β`, and `α` per key group *or* per state via `decay=` (§3.4.1),
   defaulting to the key group
 - an in-chunk decay clamp, bounding `1/γ` within a chunk
-- fp32 chunkwise, `chunk_size` a power of two, no Triton dependency (§3.6)
+- fp32 chunkwise by default, `chunk_size` a power of two; an opt-in
+  `backend="fla"` beside it, measured and verified against the oracle (§3.6)
 - the sequential single-step form retained, both as the decode path and as the
   oracle the chunkwise path is verified against
 
