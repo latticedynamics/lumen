@@ -9,9 +9,14 @@ Public surface is the layer, its config, and the head layout::
     )
     mixer = GatedDeltaNet(config)
 
+Reads that do not write: ``forward(..., return_cache=True)`` hands back a
+:class:`GatedDeltaNetReadCache`, and ``reread(x, cache)`` reads that pass's
+trajectory with fresh queries; ``read(x, state)`` does the same for one
+position against a streaming state.
+
 The kernels in :mod:`lumen.gdn.reference` are not exported.  Reuse is by
-subclassing — override ``_features``, ``_scan`` or ``_out`` — and tests import
-the kernels by path.
+subclassing — override ``_features``, ``_scan``, ``_out`` or ``_reread_query``
+— and tests import the kernels by path.
 """
 
 from __future__ import annotations
@@ -19,6 +24,7 @@ from __future__ import annotations
 from lumen.gdn.layer import (
     GatedDeltaNet,
     GatedDeltaNetConfig,
+    GatedDeltaNetReadCache,
     GatedDeltaNetState,
     ShortConv,
 )
@@ -27,6 +33,7 @@ from lumen.gdn.layout import HeadLayout
 __all__ = [
     "GatedDeltaNet",
     "GatedDeltaNetConfig",
+    "GatedDeltaNetReadCache",
     "GatedDeltaNetState",
     "HeadLayout",
     "ShortConv",

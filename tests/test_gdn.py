@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from lumen.gdn import (
     GatedDeltaNet,
     GatedDeltaNetConfig,
+    GatedDeltaNetReadCache,
     GatedDeltaNetState,
     HeadLayout,
     ShortConv,
@@ -33,6 +34,9 @@ from lumen.gdn.reference import (
     inv_unit,
     inv_unit_lower,
     inv_unit_lower_small,
+    read_gated_delta,
+    recurrent_gated_delta,
+    reread_gated_delta,
     sequential_gated_delta,
 )
 
@@ -1272,6 +1276,300 @@ def test_it_is_interchangeable_with_undertow():
         assert y.shape == (2, 1, 64)
         y, state = mixer(x[:, :8], state=state, return_state=True)
         assert y.shape == (2, 8, 64)
+
+
+# ── reads that do not write (§3.9) ────────────────────────────────────────
+
+
+def fresh_query(layout, seed, **kwargs):
+    """A second query on the same shapes -- the thing a re-read substitutes."""
+    torch.manual_seed(seed)
+    return make_inputs(layout, **kwargs)[0]
+
+
+@pytest.mark.parametrize("name", ["shared_key", "crossed_2x4", "single"])
+def test_reread_with_the_original_query_is_the_readout(name):
+    """Bit for bit, not within tolerance: the readout IS `_readout(q, cache)`."""
+    torch.manual_seed(0)
+    layout = LAYOUTS[name]
+    q, k, v, beta, log_alpha = make_inputs(layout)
+
+    out, _, cache = chunk_gated_delta(q, k, v, beta, log_alpha, 32, return_cache=True)
+    assert torch.equal(reread_gated_delta(q, cache), out)
+
+
+def test_return_cache_does_not_change_the_answer():
+    """Asking for the cache must not touch the two values every caller already gets."""
+    torch.manual_seed(0)
+    layout = LAYOUTS["crossed_4x2"]
+    q, k, v, beta, log_alpha = make_inputs(layout, seq_len=100)
+
+    out, memory = chunk_gated_delta(q, k, v, beta, log_alpha, 16)
+    out_c, memory_c, _ = chunk_gated_delta(q, k, v, beta, log_alpha, 16, return_cache=True)
+    assert torch.equal(out, out_c) and torch.equal(memory, memory_c)
+
+
+@pytest.mark.parametrize("name", list(LAYOUTS))
+@pytest.mark.parametrize("decay", ["shared", "per_state"])
+def test_reread_matches_the_oracle_with_a_substituted_query(name, decay):
+    """Acceptance §6.15 -- the gate that was free before the code existed.
+
+    Same keys, values, write strengths and decays; a different query.  The
+    sequential path run on the substituted query is what the re-read claims
+    to equal, and it already existed.
+    """
+    torch.manual_seed(0)
+    layout = LAYOUTS[name]
+    q, k, v, beta, log_alpha = make_inputs(layout, decay=decay)
+    q_new = fresh_query(layout, 1, decay=decay)
+
+    _, _, cache = chunk_gated_delta(q, k, v, beta, log_alpha, 32, return_cache=True)
+    expected, _ = sequential_gated_delta(q_new, k, v, beta, log_alpha)
+
+    assert (reread_gated_delta(q_new, cache) - expected).abs().max() < EXACT
+
+
+@pytest.mark.parametrize(
+    "seq_len, chunk",
+    [(1, 16), (7, 16), (17, 16), (100, 16), (100, 1), (100, 8), (128, 128)],
+)
+def test_reread_is_exact_at_any_length_and_chunk_size(seq_len, chunk):
+    """The re-read pads its query the way the pass padded its own."""
+    torch.manual_seed(0)
+    layout = LAYOUTS["shared_key"]
+    q, k, v, beta, log_alpha = make_inputs(layout, seq_len=seq_len)
+    q_new = fresh_query(layout, 1, seq_len=seq_len)
+
+    _, _, cache = chunk_gated_delta(q, k, v, beta, log_alpha, chunk, return_cache=True)
+    expected, _ = sequential_gated_delta(q_new, k, v, beta, log_alpha)
+
+    out = reread_gated_delta(q_new, cache)
+    assert out.shape == expected.shape
+    assert (out - expected).abs().max() < EXACT
+
+
+def test_reread_from_a_carried_state():
+    """The trajectory includes where it started."""
+    torch.manual_seed(0)
+    layout = LAYOUTS["crossed_2x4"]
+    q, k, v, beta, log_alpha = make_inputs(layout, seq_len=64)
+    q_new = fresh_query(layout, 1, seq_len=64)
+    state = torch.randn(2, 2, 4, 16, 12, dtype=torch.float64)
+
+    _, _, cache = chunk_gated_delta(q, k, v, beta, log_alpha, 16, state, return_cache=True)
+    expected, _ = sequential_gated_delta(q_new, k, v, beta, log_alpha, state)
+
+    assert (reread_gated_delta(q_new, cache) - expected).abs().max() < EXACT
+
+
+def test_reread_refuses_a_query_that_does_not_match_the_cache():
+    """A narrower query would broadcast to a plausible wrong answer.  Checked."""
+    torch.manual_seed(0)
+    layout = LAYOUTS["shared_key"]
+    q, k, v, beta, log_alpha = make_inputs(layout, seq_len=64)
+    _, _, cache = chunk_gated_delta(q, k, v, beta, log_alpha, 16, return_cache=True)
+
+    with pytest.raises(ValueError, match="does not match the cache"):
+        reread_gated_delta(q[..., :32, :], cache)  # wrong length
+    with pytest.raises(ValueError, match="does not match the cache"):
+        reread_gated_delta(q[:, :, :1], cache)  # one query for eight states
+
+
+def test_the_gradient_of_a_reread_reaches_the_writes_through_the_cache():
+    """The cache is a live part of the graph, and the original query is not.
+
+    Two claims in one: training a re-read updates the projections that wrote
+    the memory, and the cache is q-free -- the original query receives nothing
+    from a loss on the re-read.
+    """
+    torch.manual_seed(0)
+    layout = LAYOUTS["shared_key"]
+    q, k, v, beta, log_alpha = make_inputs(layout, seq_len=64)
+    q_new = fresh_query(layout, 1, seq_len=64)
+    leaves = (q, k, v, beta, log_alpha, q_new)
+    for t in leaves:
+        t.requires_grad_(True)
+
+    _, _, cache = chunk_gated_delta(q, k, v, beta, log_alpha, 16, return_cache=True)
+    reread_gated_delta(q_new, cache).square().mean().backward()
+
+    for name, t in zip(("k", "v", "beta", "log_alpha", "q_new"), leaves[1:]):
+        assert t.grad is not None and torch.isfinite(t.grad).all(), name
+    assert q.grad is None, "the cache depends on the original query"
+
+
+def test_read_gated_delta_is_the_decode_readout():
+    """One expression: the decode step reads through the same function."""
+    torch.manual_seed(0)
+    layout = LAYOUTS["crossed_2x4"]
+    q, k, v, beta, log_alpha = make_inputs(layout, seq_len=1)
+    q, k, v = (t[..., 0, :] for t in (q, k, v))
+    beta, alpha = beta[..., 0], log_alpha[..., 0].exp()
+    state = torch.randn(2, 2, 4, 16, 12, dtype=torch.float64)
+
+    out, after = recurrent_gated_delta(q, k, v, beta, alpha, state)
+    assert torch.equal(read_gated_delta(q, after), out)
+    assert torch.equal(read_gated_delta(q, state), (q.unsqueeze(-2) @ state).squeeze(-2))
+
+
+# -- at the layer --
+
+
+@pytest.mark.parametrize("name", ["shared_key", "diagonal", "crossed_2x4"])
+def test_layer_reread_with_the_same_input_is_forward(name):
+    torch.manual_seed(0)
+    layer = make_layer(LAYOUTS[name])
+    x = torch.randn(2, 48, 64, dtype=torch.float64)
+
+    y, cache = layer(x, return_cache=True)
+    assert torch.equal(layer.reread(x, cache), y)
+
+
+@pytest.mark.parametrize("decay", ["key_group", "state"])
+def test_layer_reread_matches_the_oracle_with_substituted_queries(decay):
+    """`x` wrote the memory; `probe` asks it.  The oracle with `probe`'s query
+    and `x`'s writes is what the layer's re-read has to equal."""
+    torch.manual_seed(0)
+    layer = make_layer(decay=decay)
+    if decay == "state":
+        with torch.no_grad():
+            layer.a_offset.normal_()  # a live per-state band, not the zero identity
+    x = torch.randn(2, 48, 64, dtype=torch.float64)
+    probe = torch.randn(2, 48, 64, dtype=torch.float64)
+
+    _, cache = layer(x, return_cache=True)
+    y = layer.reread(probe, cache)
+
+    q_probe, *_ = layer._features(probe)
+    _, k, v, beta, log_alpha, _ = layer._features(x)
+    o, _ = sequential_gated_delta(q_probe, k, v, beta, log_alpha)
+    expected = layer._out(o, probe)
+
+    assert (y - expected).abs().max() < EXACT
+
+
+def test_the_default_reread_query_follows_an_overridden_features():
+    """The seam decision of §3.9, held by a test.
+
+    A subclass that changes how `q` is produced must get re-reads in *its*
+    address space without overriding anything else -- otherwise its forward
+    and its re-read read two different memories, silently, at the right
+    shape.
+    """
+
+    class Mirrored(GatedDeltaNet):
+        def _features(self, x, conv_cache=None):
+            q, k, v, beta, log_alpha, cache = super()._features(x, conv_cache)
+            return -q, k, v, beta, log_alpha, cache  # still unit-norm
+
+    torch.manual_seed(0)
+    config = GatedDeltaNetConfig(d_model=64, layout=LAYOUTS["shared_key"], chunk_size=16)
+    mirrored, plain = Mirrored(config).double(), GatedDeltaNet(config).double()
+    plain.load_state_dict(mirrored.state_dict())
+    x = torch.randn(2, 32, 64, dtype=torch.float64)
+
+    y, cache = mirrored(x, return_cache=True)
+    assert torch.equal(mirrored.reread(x, cache), y)
+    assert (mirrored.reread(x, cache) - plain(x)).abs().max() > 1e-3, "override was not live"
+
+
+def test_the_reread_conv_seed_is_load_bearing():
+    """Same discipline as the state's conv cache: drop it and it must visibly break."""
+    torch.manual_seed(0)
+    layer = make_layer(conv_size=4)
+    x = torch.randn(2, 64, 64, dtype=torch.float64)
+
+    _, state = layer(x[:, :32], return_state=True)
+    y, cache = layer(x[:, 32:], state=state, return_cache=True)
+    assert cache.conv is state.conv
+
+    assert torch.equal(layer.reread(x[:, 32:], cache), y)
+    unseeded = GatedDeltaNetReadCache(trajectory=cache.trajectory, conv=None)
+    assert (layer.reread(x[:, 32:], unseeded) - y).abs().max() > 1e-6
+
+
+@pytest.mark.parametrize("conv_size", [0, 4])
+def test_read_is_a_step_without_a_write(conv_size):
+    """Switch the write off -- `β = 0`, `α = 1`, through the biases -- and
+    `step` and `read` must agree bit for bit while the state does not move.
+
+    This is the whole semantic claim of `read`: the query `step` would have
+    formed, through the conv against the same cache, against the memory as it
+    stands.  With the conv on, it also pins the decision that a read peeks at
+    the conv cache without advancing it.
+    """
+    torch.manual_seed(0)
+    layer = make_layer(conv_size=conv_size)
+    with torch.no_grad():
+        layer.b_proj.weight.zero_(), layer.b_proj.bias.fill_(-1e4)  # sigmoid -> 0.0
+        layer.a_proj.weight.zero_(), layer.a_proj.bias.fill_(-1e4)  # softplus -> 0.0
+    x = torch.randn(2, 8, 64, dtype=torch.float64)
+
+    state = layer.init_state(2, dtype=torch.float64)
+    with torch.no_grad():
+        # A memory with something in it, and a conv cache with history.
+        state = GatedDeltaNetState(memory=torch.randn_like(state.memory), conv=state.conv)
+    for t in range(4):
+        _, state = layer.step(x[:, t : t + 1], state)
+    before = state.memory.clone()
+
+    probe = x[:, 4:5]
+    stepped, after = layer.step(probe, state)
+    read = layer.read(probe, state)
+
+    assert torch.equal(read, stepped)
+    assert torch.equal(after.memory, state.memory), "the write was not off"
+    assert torch.equal(state.memory, before), "read touched the state"
+
+
+def test_read_of_the_post_write_state_is_the_forward_output():
+    """With no conv, reading `M_t` with `q_t` is exactly `forward(x)[:, t]`."""
+    torch.manual_seed(0)
+    layer = make_layer(conv_size=0)
+    x = torch.randn(2, 24, 64, dtype=torch.float64)
+
+    y = layer(x)
+    state = layer.init_state(2, dtype=torch.float64)
+    for t in range(x.shape[1]):
+        _, state = layer.step(x[:, t : t + 1], state)
+        assert (layer.read(x[:, t : t + 1], state) - y[:, t : t + 1]).abs().max() < EXACT
+
+
+def test_read_refuses_a_chunk():
+    layer = make_layer()
+    with pytest.raises(ValueError, match="one position"):
+        layer.read(torch.randn(2, 4, 64, dtype=torch.float64), layer.init_state(2))
+
+
+def test_return_state_and_return_cache_compose():
+    """Four call forms, one output, and a fixed order for the extras."""
+    torch.manual_seed(0)
+    layer = make_layer()
+    x = torch.randn(2, 32, 64, dtype=torch.float64)
+
+    y = layer(x)
+    y_s, state = layer(x, return_state=True)
+    y_c, cache = layer(x, return_cache=True)
+    y_sc, state2, cache2 = layer(x, return_state=True, return_cache=True)
+
+    assert torch.equal(y, y_s) and torch.equal(y, y_c) and torch.equal(y, y_sc)
+    assert isinstance(state, GatedDeltaNetState) and isinstance(state2, GatedDeltaNetState)
+    assert isinstance(cache, GatedDeltaNetReadCache) and isinstance(cache2, GatedDeltaNetReadCache)
+    assert torch.equal(state.memory, state2.memory)
+
+
+def test_layer_reread_backward_reaches_the_write_projections():
+    """A loss on a re-read trains the projections that wrote the memory."""
+    torch.manual_seed(0)
+    layer = make_layer(centre=True)
+    x = torch.randn(2, 32, 64, dtype=torch.float64)
+    probe = torch.randn(2, 32, 64, dtype=torch.float64)
+
+    _, cache = layer(x, return_cache=True)
+    layer.reread(probe, cache).square().mean().backward()
+
+    missing = [n for n, p in layer.named_parameters() if p.grad is None]
+    assert not missing, f"no gradient reached: {missing}"
 
 
 @pytest.mark.gpu

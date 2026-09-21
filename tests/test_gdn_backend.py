@@ -109,6 +109,23 @@ def test_the_backend_is_in_the_repr() -> None:
     assert "backend=reference" in repr(GatedDeltaNet(_config()))
 
 
+@requires_fla
+@needs_fla
+def test_fla_refuses_a_read_cache_on_any_device() -> None:
+    """fla's kernel returns only the final state, so it cannot build a read cache.
+
+    Refused loudly, and on a CPU tensor -- where fla would otherwise fall back
+    to the reference and could have produced one.  A capability present on the
+    CPU box and absent on the GPU the same config trains on is a trap, and the
+    forward without a cache is still allowed to fall back exactly as before.
+    """
+    layer = GatedDeltaNet(_config(backend="fla"))
+    x = torch.randn(2, 32, 256)
+    assert layer(x).shape == x.shape  # the fallback itself is untouched
+    with pytest.raises(RuntimeError, match="cannot build a read cache"):
+        layer(x, return_cache=True)
+
+
 # ── the numerics: this is the part that licenses the switch ───────────────
 
 

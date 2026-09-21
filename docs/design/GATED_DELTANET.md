@@ -721,6 +721,79 @@ two implementations.
 
 ---
 
+### 3.9 The readout is linear in the query, so a read need not write
+
+Every read `forward` performs is paired with a write at the same position, and
+the decode step is write-then-read. Nothing in the recurrence requires that. The
+chunkwise readout, in the relative form of §3.8, is
+
+```
+intra = (q @ kᵀ) ⊙ causal ⊙ rel
+out   = (q @ M_enter) ⊙ γ  +  intra @ u
+```
+
+and `M_enter` (the memory entering each chunk), `u` (the state-corrected
+pseudo-values), `kᵀ`, `γ` and `rel` are all free of `q`. So for any `q'` of the
+same shape, substituting it into those two lines gives *exactly* the output
+`q'` would have produced on the same keys, values, write strengths and decays.
+Three matmuls and a mask, batched over every chunk — no triangular solve and no
+sequential chunk loop, which is the part of the pass that cannot be
+parallelised.
+
+The layer exposes this as `forward(..., return_cache=True)` → `reread(x',
+cache)` for a whole pass, and `read(x', state)` for one position against a
+streaming state (`oᵀ = q'ᵀM`, the state untouched). Three decisions:
+
+**The readout and the re-read are one body.** `chunk_gated_delta` computes its
+own output by building the cache and calling the same `_readout` a re-read
+calls. A re-read with the original query is therefore the readout bit for bit
+by construction, and there is no second copy of the readout to drift.
+The cache's members are tensors autograd already saves for backward — each is
+a matmul or multiply operand — so under a training graph retaining it costs
+nothing; the cache is returned as a frozen value rather than stashed on the
+module, because a cache held on `self` leaks when a block raises and is a
+side effect `torch.compile` cannot trace. It is **not** registered as a pytree
+node: `seq_len` is an int that describes the tree rather than living in it —
+the `UndertowState.seen` case `lumen.pytree` documents — so the registration
+is a hand-rolled flatten with its own round-trip tests, and is its own change.
+Until then a cache is an ordinary value, and a leaf at a `torch.func` boundary.
+
+**The re-read query is formed by `_features`, through the short conv.** The
+memory was written under keys that went through `k_conv`; the address space is
+the projection *and* the conv taps, and a query that skips the conv lives in a
+different cone. So "read with the existing query weights" means the whole
+path — projection, conv, SiLU, centring, normalisation. The default
+`_reread_query` obtains it by calling `_features` and keeping `q`, and it is
+derived that way rather than factored out into a helper both could call, on
+purpose: the helper is cheaper and is a trap for any subclass that overrides
+`_features` to change how `q` is produced, whose forward would then read with
+its own query and its re-read with the base class's — silently, at the right
+shape. Going through `_features` keeps the two coherent for every subclass by
+construction; the price is the unused k/v/β/α projections, a constant factor
+on a path whose saving is the scan. `_reread_query` is the seam for a separate
+re-read projection, or for a subclass that wants the constant factor back.
+
+**The conv cache is read, not advanced.** For `reread`, the cache carries the
+conv state the original pass *started from*, so the re-read query at `t` sees
+`x'_{t−3..t}` as the original saw `x_{t−3..t}`, and `reread(x, cache)` equals
+`forward(x)`. For `read`, the stream's conv cache is used as `step` would use
+it and left alone. A read is a step with the write switched off: same query,
+memory as it stands, no successor. That is what a probe token reads.
+
+The fla backend cannot build a cache — its kernel returns only the final
+state — and `return_cache=True` on such a layer **raises on every device**.
+fla already falls back to the reference for CPU and fp64 tensors, so it *could*
+have produced a cache there; refusing unconditionally is chosen because a
+capability present on a CPU box and absent on the GPU the same configuration
+trains on is the kind of trap a test suite does not catch. `read` needs no
+cache and works on every backend.
+
+What this does **not** claim: that a re-read is useful. It is a mixer-level
+capability that a block above it may or may not want, and no comparison at
+that level is recorded here.
+
+---
+
 ## 4. Relation to existing work
 
 **No novelty is claimed for the recurrence.** It is an established layer and
@@ -798,6 +871,9 @@ ordinary arrangement is reachable:
   `backend="fla"` beside it, measured and verified against the oracle (§3.6)
 - the sequential single-step form retained, both as the decode path and as the
   oracle the chunkwise path is verified against
+- reads that do not write: `forward(..., return_cache=True)` / `reread(x', cache)`
+  for a whole pass and `read(x', state)` for one position, because the readout
+  is linear in the query given the trajectory (§3.9)
 
 Deliberately **out** of this version:
 
@@ -870,5 +946,20 @@ Before any project switches to this layer:
 14. **`β_max > 2` is refused on construction.** The ceiling is an invariant of
     the UT/WY solve, not a preference (§3.4.1), and it is unsafe in the *shared*
     arrangement too.
+15. **A re-read is the oracle with the query substituted.** `reread(q', cache)`
+    equals the sequential path run on `q'` with the original keys, values,
+    write strengths and decays, to `1e-9` in fp64, at every layout, in both
+    decay arrangements, across a chunk-size and sequence-length sweep that
+    exercises padding, and from a carried state. With the *original* query it
+    is the readout `torch.equal`, which holds by construction (§3.9) and is
+    tested anyway. Moving the readout into the shared body reproduced the
+    preceding commit's kernel **bit for bit** over 384 configurations — every
+    named layout × {fp32, fp64} × `C ∈ {8,16,32,64}` × `T ∈ {64, 100}` × both
+    decay arrangements × {from zero, from a carried state} — checked with
+    `torch.equal` at merge and, like gates 3 and 13, history rather than a
+    check afterwards. At the layer: `reread(x, cache)` is `forward(x)`; the
+    default `_reread_query` follows an overridden `_features`; the conv seed
+    is load-bearing; and `read` agrees with `step` bit for bit when the write
+    is switched off through the biases, with the state unmoved.
 
 Merge → verify → switch → evolve, as four steps. Not one.

@@ -88,6 +88,50 @@ convolution's cache. Keep the `GatedDeltaNetState` object; do not rebuild one
 from `state.memory` alone, or the first few positions after a resume will be
 wrong in a way that is easy to miss.
 
+## Reading without writing
+
+Every read the layer performs in `forward` and `step` is paired with a write:
+position `t` writes `k_t, v_t` and then reads with `q_t`. Two methods read
+without writing.
+
+**Re-read a whole pass with fresh queries.** `forward(..., return_cache=True)`
+hands back the pass's write trajectory, and `reread` reads it again:
+
+```python
+y, cache = mixer(x, return_cache=True)         # x wrote the memory
+y2 = mixer.reread(probe, cache)                # probe asks it; nothing is written
+```
+
+`y2` is exactly what `forward` would have produced had `probe` been the query
+side while the keys, values, write strengths and decays stayed those of `x`.
+With `probe = x` it is `y`, bit for bit. The cost is the query projection,
+three matmuls and the output path; the scan — the sequential part — is skipped,
+because the readout is linear in the query once the trajectory is known.
+`return_state` and `return_cache` compose: both together return
+`(y, state, cache)`.
+
+**Read one position against a stream.** `read(x, state)` is `step` with the
+write switched off — the query `step` would form from `x`, applied to the
+memory as it stands, and no successor state:
+
+```python
+y, state = mixer.step(token, state)            # writes, then reads
+peek = mixer.read(probe, state)                # reads what `probe` would see; `state` untouched
+```
+
+Both form the query through the layer's own path — projection, short conv,
+SiLU, centring, normalisation — because that is the address space the memory
+was written under. The short conv runs against the context the original query
+had: for `reread`, the cache carries the conv state the pass started from; for
+`read`, the stream's conv cache is read and not advanced. Keep the
+`GatedDeltaNetReadCache` object whole for the same reason you keep the state
+whole.
+
+`backend="fla"` cannot build a read cache — its kernel returns only the final
+state — and `return_cache=True` on such a layer raises rather than quietly
+producing one from the reference. Use the reference backend where re-reads are
+needed. `read` needs no cache and works on every backend.
+
 ## Sequence length
 
 Any length. A sequence that does not fill its last chunk is padded internally
@@ -256,6 +300,13 @@ Reuse is by subclassing. Three methods are the seams:
 | `_features` | change how q/k/v/β/α are produced |
 | `_scan` | swap in a different kernel |
 | `_out` | change the output path |
+| `_reread_query` | give reads-without-writes their own projection, or skip the unused k/v/β/α work |
+
+`_reread_query`'s default runs `_features` and keeps `q`, so a subclass that
+changes how `q` is produced gets re-reads in its own address space without
+overriding anything else. It is derived that way rather than factored out of
+`_features` precisely so that cannot go wrong silently; the price is the unused
+projections, which is why the seam exists.
 
 `_out` carries an interface commitment: replacing it is what breaks
 interchangeability with Undertow, and the per-head normalisation it performs is
@@ -303,6 +354,12 @@ Refused at construction, not at the first forward:
 A CUDA-only path meeting a CPU or fp64 tensor falls back quietly instead —
 that is a device or dtype gap, not a missing capability, and an fp64 oracle run
 taking the reference is the right answer rather than a limitation of it.
+
+**`return_cache=True` is refused under `"fla"`**, on every device. Its kernel
+returns only the final state, not the per-chunk states a re-read needs. The
+refusal is unconditional rather than a fallback because fla already falls back
+to the reference on CPU, and a capability present on a CPU box and absent on
+the GPU the same config trains on would be a trap.
 
 **`chunk_size` is inert under `"fla"`.** fla chooses its own chunking and this
 value cannot reach it. That is numerically safe because the answer does not
