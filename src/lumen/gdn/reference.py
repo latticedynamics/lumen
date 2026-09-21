@@ -119,6 +119,8 @@ bounded by 2 however long the chunk.  Hence: solve then damp.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 import torch.nn.functional as F
 
@@ -249,6 +251,72 @@ def assign_values(values: torch.Tensor, layout: HeadLayout) -> torch.Tensor:
     )
 
 
+# ── the readout, and re-reading it ────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class ReadCache:
+    """The write trajectory of one chunkwise pass, in the form the readout consumes.
+
+    Everything in :func:`chunk_gated_delta`'s readout that does not depend on
+    `q`.  Hold one of these and the same trajectory can be read again with a
+    fresh query for three matmuls and a mask -- no triangular solve, no
+    sequential chunk loop -- see :func:`reread_gated_delta`.
+
+    Every member is a tensor autograd already saves for the backward pass
+    (each is a matmul or elementwise-multiply operand), so under a training
+    graph retaining the cache costs no additional memory.  Under ``no_grad``
+    the cache is what keeps them alive, and it is sized like the activations
+    of the pass that made it.
+
+    Shapes, with `N` chunks of `C`::
+
+        unfolded  [B, G_k, m, N, d_k, d_v]   the memory ENTERING each chunk
+        u         [B, G_k, m, N, C, d_v]     pseudo-values, state-corrected
+        k_t       [B, G_k, 1, N, d_k, C]     keys, transposed
+        gamma     [B, G_k, 1|m, N, C]        cumulative in-chunk decay
+        rel       [B, G_k, 1|m, N, C, C]     `exp(g_t - g_i)`, the relative form
+
+    ``seq_len`` is the unpadded length, so a re-read can pad a query the way the
+    pass padded its own.  The chunk size is `k_t.shape[-1]`.
+    """
+
+    unfolded: torch.Tensor
+    u: torch.Tensor
+    k_t: torch.Tensor
+    gamma: torch.Tensor
+    rel: torch.Tensor
+    seq_len: int
+
+
+def _readout(q: torch.Tensor, cache: ReadCache) -> torch.Tensor:
+    """`q` already chunked, `(B, G_k, m, N, C, d_k)` → `(B, G_k, m, T, d_v)`.
+
+    The ONLY place the readout is written.  :func:`chunk_gated_delta` calls it
+    for its own output and :func:`reread_gated_delta` calls it for a re-read,
+    so the two cannot drift: a re-read with the original query is the readout,
+    bit for bit, by construction rather than by test.
+    """
+    chunk_size = q.shape[-2]
+    causal = torch.ones(
+        chunk_size, chunk_size, device=q.device, dtype=torch.bool
+    ).tril(0)
+    # carry term + intra-chunk term.  The causal mask is diagonal-INCLUSIVE:
+    # position t reads its own write.
+    #
+    # `gamma` scales only the carry term.  The intra-chunk term already carries
+    # its decay as `rel[t, i]` inside `intra`, which is the whole difference:
+    # the ratio `gamma_t / gamma_i` is formed as a single bounded exponential
+    # rather than as a product of one shrinking and one growing factor computed
+    # apart from each other.
+    intra = (q @ cache.k_t) * causal * cache.rel
+    out = (q @ cache.unfolded) * cache.gamma[..., None] + intra @ cache.u
+
+    batch, n_key_groups, per_group, n_chunks, _, d_v = out.shape
+    out = out.reshape(batch, n_key_groups, per_group, n_chunks * chunk_size, d_v)
+    return out[..., : cache.seq_len, :]
+
+
 # ── the recurrence ────────────────────────────────────────────────────────
 
 
@@ -260,7 +328,8 @@ def chunk_gated_delta(
     log_alpha: torch.Tensor,
     chunk_size: int,
     state: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    return_cache: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, ReadCache]:
     """Chunkwise-parallel gated delta rule.
 
     Args:
@@ -273,9 +342,15 @@ def chunk_gated_delta(
             `(B, G_k, m, T)` to give every state its own.  Log decay, `<= 0`.
         chunk_size: `C`, a power of two dividing `T`.
         state: `(B, G_k, m, d_k, d_v)` incoming state, or ``None`` for zeros.
+        return_cache: also return the :class:`ReadCache` -- the q-free half of
+            the readout -- so the same trajectory can be read again with a
+            fresh query by :func:`reread_gated_delta`.  Off by default, and
+            when off the return is exactly what it was before the cache
+            existed.
 
     Returns:
-        `(B, G_k, m, T, d_v)` outputs and the `(B, G_k, m, d_k, d_v)` final state.
+        `(B, G_k, m, T, d_v)` outputs and the `(B, G_k, m, d_k, d_v)` final
+        state; with ``return_cache`` the :class:`ReadCache` as a third element.
 
     Raises:
         ValueError: if the state axis of `beta` or `log_alpha` is neither `1`
@@ -322,7 +397,6 @@ def chunk_gated_delta(
         beta, log_alpha = (F.pad(t, (0, pad)) for t in (beta, log_alpha))
 
     n_chunks = (seq_len + (chunk_size - remainder if remainder else 0)) // chunk_size
-    padded_len = n_chunks * chunk_size
 
     def chunkify(x: torch.Tensor, last: int) -> torch.Tensor:
         return x.reshape(*x.shape[:3], n_chunks, chunk_size, last)
@@ -398,9 +472,6 @@ def chunk_gated_delta(
     transition = gamma[..., -1][..., None, None] * torch.eye(
         d_k, device=q.device, dtype=q.dtype
     ) - k_t @ (exit_decay[..., None] * w)
-    causal = torch.ones(chunk_size, chunk_size, device=q.device, dtype=torch.bool).tril(0)
-    intra = (q @ k_t) * causal * rel
-
     carry = k_t @ (exit_decay[..., None] * pseudo)
 
     # ── the only sequential part: one matmul per chunk ────────────────────
@@ -462,18 +533,62 @@ def chunk_gated_delta(
 
     # ── readout, all chunks at once ───────────────────────────────────────
     u = pseudo - w @ unfolded
-    # carry term + intra-chunk term.  The causal mask is diagonal-INCLUSIVE:
-    # position t reads its own write.
-    #
-    # `gamma` scales only the carry term now.  The intra-chunk term already
-    # carries its decay as `rel[t, i]` inside `intra`, which is the whole
-    # difference: the ratio `gamma_t / gamma_i` is formed as a single bounded
-    # exponential rather than as a product of one shrinking and one growing
-    # factor computed apart from each other.
-    out = (q @ unfolded) * gamma[..., None] + intra @ u
+    # Everything the readout needs except `q`.  The readout IS a re-read with
+    # the original query -- one body in `_readout`, so a re-read cannot drift
+    # from the output it claims to reproduce.
+    cache = ReadCache(
+        unfolded=unfolded, u=u, k_t=k_t, gamma=gamma, rel=rel, seq_len=seq_len
+    )
+    out = _readout(q, cache)
 
-    out = out.reshape(batch, n_key_groups, per_group, padded_len, d_v)
-    return out[..., :seq_len, :], memory
+    if return_cache:
+        return out, memory, cache
+    return out, memory
+
+
+def reread_gated_delta(q: torch.Tensor, cache: ReadCache) -> torch.Tensor:
+    """Read the write trajectory of a previous pass with a fresh query.
+
+    Exactly the output :func:`chunk_gated_delta` would have produced for `q`
+    on the keys, values, write strengths and decays of the pass that made
+    ``cache`` -- the readout is linear in `q` given the trajectory, and this is
+    that linear map applied to a different `q`.  No state is touched and no
+    recurrence is run: three matmuls and a mask, batched over every chunk.
+
+    Args:
+        q: `(B, G_k, m, T, d_k)`, unit-norm, with `T == cache.seq_len`.  The
+            batch, key-group and state axes must match the cache exactly --
+            a query with a state axis of 1 against a cache with `m` would
+            broadcast to a plausible tensor that reads every state with one
+            query, and that is checked rather than allowed.
+
+    Returns:
+        `(B, G_k, m, T, d_v)`.
+    """
+    batch, n_key_groups, per_group, seq_len, d_k = q.shape
+    expected = (*cache.u.shape[:3], cache.seq_len, cache.k_t.shape[-2])
+    if (batch, n_key_groups, per_group, seq_len, d_k) != expected:
+        raise ValueError(
+            f"query shape {tuple(q.shape)} does not match the cache, which was "
+            f"built for {expected} (B, G_k, m, T, d_k)"
+        )
+
+    n_chunks, chunk_size = cache.k_t.shape[3], cache.k_t.shape[-1]
+    remainder = seq_len % chunk_size
+    if remainder:
+        q = F.pad(q, (0, 0, 0, chunk_size - remainder))
+    q = q.reshape(batch, n_key_groups, per_group, n_chunks, chunk_size, d_k)
+    return _readout(q, cache)
+
+
+def read_gated_delta(q: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
+    """One position, read-only: `oᵀ = qᵀM`.  The state is not touched.
+
+    `q (B, G_k, m, d_k)`, `state (B, G_k, m, d_k, d_v)` → `(B, G_k, m, d_v)`.
+    This is the readout of :func:`recurrent_gated_delta`, which calls it -- so
+    the decode step's read and a read on its own are one expression.
+    """
+    return (q.unsqueeze(-2) @ state).squeeze(-2)
 
 
 def recurrent_gated_delta(
@@ -508,8 +623,7 @@ def recurrent_gated_delta(
     state = decay * (state - write * k.unsqueeze(-1) * read.unsqueeze(-2)) + (
         write * k.unsqueeze(-1) * v.unsqueeze(-2)
     )
-    out = (q.unsqueeze(-2) @ state).squeeze(-2)
-    return out, state
+    return read_gated_delta(q, state), state
 
 
 def sequential_gated_delta(

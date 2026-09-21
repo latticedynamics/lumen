@@ -55,9 +55,12 @@ from lumen.gdn.layout import HeadLayout
 from lumen.nn import rms_norm
 from lumen.gdn import fla_backend
 from lumen.gdn.reference import (
+    ReadCache,
     assign_values,
     chunk_gated_delta,
+    read_gated_delta,
     recurrent_gated_delta,
+    reread_gated_delta,
 )
 
 BACKENDS = ("reference", "fla")
@@ -82,6 +85,31 @@ class GatedDeltaNetState:
     """
 
     memory: torch.Tensor
+    conv: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+
+
+@dataclass(frozen=True)
+class GatedDeltaNetReadCache:
+    """The write trajectory of one ``forward``, held so it can be read again.
+
+    Returned by ``forward(..., return_cache=True)`` and consumed by
+    :meth:`GatedDeltaNet.reread`.  Where a :class:`GatedDeltaNetState` is what
+    you need to *continue* a stream, this is what you need to *ask it another
+    question*: the same keys, values, write strengths and decays, read with a
+    fresh query, with no write and no scan.
+
+    ``trajectory`` is the kernel's :class:`~lumen.gdn.reference.ReadCache`.
+    ``conv`` is the short-conv cache the pass **started from** -- ``None`` for
+    a pass that began a sequence -- so a re-read forms its query from the same
+    left context the original query had.  A re-read with the original input is
+    the original output, exactly, and that is only true if this is kept.
+
+    Frozen, and returned rather than stashed on the module: a cache held on
+    ``self`` leaks when a block raises, has to dodge submodule registration,
+    and does not survive ``torch.compile``.  This one is an ordinary value.
+    """
+
+    trajectory: ReadCache
     conv: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
 
 
@@ -348,7 +376,8 @@ class GatedDeltaNet(nn.Module):
     one it has.
 
     Reuse is by subclassing.  :meth:`_features`, :meth:`_scan` and :meth:`_out`
-    are the seams.
+    are the seams; :meth:`_reread_query` is a fourth, for reads that do not
+    write.
     """
 
     def __init__(self, config: GatedDeltaNetConfig) -> None:
@@ -565,7 +594,8 @@ class GatedDeltaNet(nn.Module):
         beta: torch.Tensor,
         log_alpha: torch.Tensor,
         memory: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return_cache: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, ReadCache]:
         """The recurrence, on whichever backend is configured.
 
         Override to swap in an accelerated kernel.  The fla path falls back to
@@ -573,11 +603,32 @@ class GatedDeltaNet(nn.Module):
         that is a device or dtype gap rather than a missing capability, and an
         fp64 oracle run taking the reference is the right answer rather than a
         limitation of it.
+
+        ``return_cache`` asks for the :class:`~lumen.gdn.reference.ReadCache`
+        as a third element.  A kernel that cannot produce one must raise
+        rather than fall back: the cache is a capability somebody asked for,
+        and a silent substitution would hand back a cache from a different
+        arithmetic than the output beside it.
         """
-        if self.config.backend == "fla" and fla_backend.usable(q):
-            return fla_backend.chunk_gated_delta_fla(q, k, v, beta, log_alpha, memory)
+        if self.config.backend == "fla":
+            if return_cache:
+                # Unconditional on device.  fla falls back to the reference on
+                # CPU, so *this* could too -- and then the capability would be
+                # present on a CPU box and absent on the GPU the same config
+                # trains on, which is the kind of trap a test suite does not
+                # catch.
+                raise RuntimeError(
+                    'backend="fla" cannot build a read cache: its kernel returns '
+                    "only the final state, not the per-chunk states a re-read "
+                    "needs. Use the reference backend for this layer."
+                )
+            if fla_backend.usable(q):
+                return fla_backend.chunk_gated_delta_fla(
+                    q, k, v, beta, log_alpha, memory
+                )
         return chunk_gated_delta(
-            q, k, v, beta, log_alpha, self.config.chunk_size, memory
+            q, k, v, beta, log_alpha, self.config.chunk_size, memory,
+            return_cache=return_cache,
         )
 
     def _out(self, o: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
@@ -599,6 +650,36 @@ class GatedDeltaNet(nn.Module):
         o = rms_norm(o, self.head_norm, config.norm_eps)
         o = o.reshape(batch, seq_len, config.n_heads * config.d_v).to(x.dtype)
         return self.dropout(self.o_proj(o * F.silu(self.g_proj(x))))
+
+    def _reread_query(
+        self,
+        x: torch.Tensor,
+        conv_cache: tuple[torch.Tensor, ...] | None = None,
+    ) -> torch.Tensor:
+        """The query for a read that does not write: `(B, T, d)` → `(B, G_k, m, T, d_k)`.
+
+        By default it is *the query* :meth:`forward` *would have formed* from
+        ``x`` -- projection, short conv from ``conv_cache``, SiLU, centring,
+        l2-normalisation -- obtained by running :meth:`_features` and keeping
+        `q`.  That is the address space the memory was written under, and a
+        read anywhere else is a read of a different memory.
+
+        **Derived from `_features` rather than factored out of it, on purpose.**
+        The obvious cheaper shape -- pull the q chain into a helper both call
+        -- costs nothing for this class and is a trap for every subclass that
+        overrides :meth:`_features` to change how `q` is produced: their
+        forward would read with their query and their re-read with this
+        class's, silently, at the right shape.  Going through `_features`
+        keeps the two coherent by construction, and the price is the unused
+        k/v/β/α projections -- a constant factor on a path whose saving is the
+        scan, not the projections.
+
+        Override this to give re-reads their own projection, or to skip the
+        unused work.  The conv cache it receives is the q-side one; a
+        projection with its own conv owns its own cache.
+        """
+        q, _, _, _, _, _ = self._features(x, conv_cache)
+        return q
 
     def residual_out_projections(self) -> tuple[nn.Module, ...]:
         """The projections whose output is added to a residual stream.
@@ -703,6 +784,27 @@ class GatedDeltaNet(nn.Module):
             memory=memory, conv=conv
         )
 
+    def read(self, x: torch.Tensor, state: GatedDeltaNetState) -> torch.Tensor:
+        """One position, read-only -- `(B, 1, d_model)` → output.  No successor.
+
+        A step with the write switched off.  The query is formed exactly as
+        :meth:`step` would form it from ``x`` and ``state`` -- through the
+        short conv against ``state.conv``, which is read and not advanced --
+        and applied to ``state.memory`` as it stands.  Nothing is written,
+        nothing decays, and the state handed in is the state afterwards.
+
+        This is what a probe token reads: what the memory would answer to
+        ``x`` at this position, without ``x`` becoming part of the memory.
+        """
+        if x.shape[1] != 1:
+            raise ValueError(
+                f"read() consumes one position at a time, got {x.shape[1]}; "
+                f"use reread(x, cache) for a chunk"
+            )
+        q = self._reread_query(x, state.conv)
+        o = read_gated_delta(q[..., 0, :], state.memory)
+        return self._out(o.unsqueeze(-2), x)
+
     # ── forward ───────────────────────────────────────────────────────────
 
     def forward(
@@ -711,7 +813,13 @@ class GatedDeltaNet(nn.Module):
         *,
         state: GatedDeltaNetState | None = None,
         return_state: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, GatedDeltaNetState]:
+        return_cache: bool = False,
+    ) -> (
+        torch.Tensor
+        | tuple[torch.Tensor, GatedDeltaNetState]
+        | tuple[torch.Tensor, GatedDeltaNetReadCache]
+        | tuple[torch.Tensor, GatedDeltaNetState, GatedDeltaNetReadCache]
+    ):
         """`(B, T, d_model)` → `(B, T, d_model)`, optionally continuing a stream.
 
         Args:
@@ -720,18 +828,48 @@ class GatedDeltaNet(nn.Module):
             return_state: also return the state after consuming ``x``, so a
                 prompt can be prefilled in one parallel pass and generation
                 continued with :meth:`step`.
+            return_cache: also return the :class:`GatedDeltaNetReadCache`, so
+                the trajectory this pass wrote can be read again with a fresh
+                query by :meth:`reread`.  Both flags together return
+                ``(y, state, cache)``, in that order.
         """
-        q, k, v, beta, log_alpha, conv = self._features(
-            x, state.conv if state is not None else None
+        incoming_conv = state.conv if state is not None else None
+        q, k, v, beta, log_alpha, conv = self._features(x, incoming_conv)
+        scanned = self._scan(
+            q, k, v, beta, log_alpha,
+            state.memory if state is not None else None,
+            return_cache=return_cache,
         )
-        o, memory = self._scan(
-            q, k, v, beta, log_alpha, state.memory if state is not None else None
-        )
+        o, memory = scanned[0], scanned[1]
         y = self._out(o, x)
 
-        if not return_state:
+        if not return_state and not return_cache:
             return y
-        return y, GatedDeltaNetState(memory=memory, conv=conv)
+        if not return_cache:
+            return y, GatedDeltaNetState(memory=memory, conv=conv)
+        cache = GatedDeltaNetReadCache(trajectory=scanned[2], conv=incoming_conv)
+        if not return_state:
+            return y, cache
+        return y, GatedDeltaNetState(memory=memory, conv=conv), cache
+
+    def reread(self, x: torch.Tensor, cache: GatedDeltaNetReadCache) -> torch.Tensor:
+        """Read a previous ``forward``'s trajectory with fresh queries -- no write.
+
+        `(B, T, d_model)` → `(B, T, d_model)`, with ``T`` the length of the
+        pass that made ``cache``.  The output is what :meth:`forward` would
+        have produced had ``x`` been the *query* side while the keys, values,
+        write strengths and decays stayed those of the original input.  With
+        the original input it is the original output, exactly.
+
+        Nothing is written and no recurrence is run.  The cost is the query
+        projection, three matmuls and the output path -- the scan, which is
+        the sequential part, is skipped entirely.
+
+        The query is formed by :meth:`_reread_query`, from the same short-conv
+        context the original pass started from.
+        """
+        q = self._reread_query(x, cache.conv)
+        return self._out(reread_gated_delta(q, cache.trajectory), x)
 
     def extra_repr(self) -> str:
         config = self.config
