@@ -526,6 +526,35 @@ which is a release with a migration, not a fix.
 
 ---
 
+### 4.6 Activation recompute is an attribute on the stack, off by default
+
+A recurrent mixer's reference path saves intermediates that grow as `T · d` per
+block, so at long sequence lengths a single sequence can exceed a card's memory
+in the forward pass alone, before the optimiser holds anything. The standard
+remedy is per-block activation recompute: drop a block's intermediates after its
+forward and rebuild them in its backward.
+
+`Stack.recompute = True` does that, under non-reentrant
+`torch.utils.checkpoint`, only while `training` and with gradients enabled.
+
+- **An attribute, not a constructor argument.** It is not part of the model. It
+  is not in the `state_dict`, it draws nothing (so the seed contract of §4.4 is
+  untouched), and the same weights are routinely trained with it on and served
+  with it off. A constructor argument would put a training-memory choice into
+  every consumer's config.
+- **The stack, not the block.** The trade is per block, but whether to make it
+  depends on how many blocks there are and how long the sequence is, which only
+  the level that owns depth knows. A consumer that keeps its own stack (§3.6)
+  adds the same dial there; nothing here needs to change for it.
+- **Numerically transparent, by test.** The recomputed forward is the same
+  arithmetic on the same inputs, and `checkpoint` restores the RNG state so a
+  dropout mask is redrawn identically. The tests assert that loss and every
+  gradient agree with the dial on and off, on a fresh and on a continued
+  stream, with dropout inside the recomputed region, and that it holds fewer
+  saved tensors through the forward, which shows that it does something.
+- **Streaming is untouched.** `step` and eval-mode `forward` never consult it.
+  There is no backward to save memory for.
+
 ## 5. What is deliberately not canonised
 
 `CLAUDE.md`: *do not canonise an untested default.* Three live disagreements,
@@ -625,6 +654,7 @@ class Stack(nn.Module):
         norm_eps: float,
     ) -> None: ...
     # same four members; StackState holds tuple[BlockState, ...]
+    recompute: bool = False                   # memory dial, not a ctor arg — §4.6
 ```
 
 `BlockState` and `StackState` are frozen dataclasses (§3.3). Device and dtype on

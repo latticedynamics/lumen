@@ -472,3 +472,98 @@ def test_init_state_follows_the_module():
     assert len(state.blocks) == 2
     assert all(isinstance(block, BlockState) for block in state.blocks)
     assert state.blocks[0].mixer.memory.shape[0] == 3
+
+
+# ── activation recompute ──────────────────────────────────────────────────
+
+
+def a_dropout_stack(n_layers: int = 3, seed: int = 0) -> Stack:
+    """Mixer + MLP + local, and dropout in the mixer: every sub-layer kind, and
+    randomness inside the recomputed region, which is the case that fails if
+    ``checkpoint`` did not restore the RNG state."""
+    torch.manual_seed(seed)
+    config = GatedDeltaNetConfig(
+        d_model=D_MODEL, layout=HeadLayout.shared_key(4), expand_k=2.0, dropout=0.1
+    )
+
+    def factory(index: int) -> Block:
+        return Block(D_MODEL, GatedDeltaNet(config), norm_eps=1e-5, d_mlp=128, local=a_local())
+
+    return Stack(D_MODEL, n_layers, factory, norm_eps=1e-5)
+
+
+def loss_and_grads(stack: Stack, x: torch.Tensor, continue_from: bool) -> tuple[torch.Tensor, dict]:
+    stack.zero_grad(set_to_none=True)
+    torch.manual_seed(123)
+    if continue_from:
+        with torch.no_grad():
+            _, state = stack.eval()(x[:, :4], return_state=True)
+        stack.train()
+        y, _ = stack(x[:, 4:], state=state, return_state=True)
+    else:
+        y = stack.train()(x)
+    loss = y.pow(2).mean()
+    loss.backward()
+    return loss.detach(), {n: p.grad.clone() for n, p in stack.named_parameters()}
+
+
+def test_recompute_is_off_by_default_and_not_part_of_the_model():
+    stack = build()
+    assert stack.recompute is False
+    keys = set(stack.state_dict())
+    stack.recompute = True
+    assert set(stack.state_dict()) == keys, "a memory dial must not move a checkpoint key"
+
+
+@pytest.mark.parametrize("continue_from", [False, True], ids=["fresh", "continued-stream"])
+def test_recompute_changes_memory_not_the_function(continue_from):
+    """Loss and every gradient agree with it on and off, dropout included.
+
+    ``continued-stream`` enters the recomputed blocks with a carried state and
+    asks for the successor back, which is the other branch of ``forward``.
+    """
+    stack = a_dropout_stack()
+    x = torch.randn(2, 12, D_MODEL, requires_grad=False)
+
+    stack.recompute = False
+    loss_off, grads_off = loss_and_grads(stack, x, continue_from)
+    stack.recompute = True
+    loss_on, grads_on = loss_and_grads(stack, x, continue_from)
+
+    assert torch.equal(loss_off, loss_on)
+    assert grads_off.keys() == grads_on.keys()
+    for name in grads_off:
+        assert (grads_off[name] - grads_on[name]).abs().max() < EXACT, name
+
+
+def test_recompute_holds_fewer_saved_tensors_through_the_forward():
+    """The dial does something: autograd keeps fewer tensors alive between the
+    forward and the backward. Counted, not timed, so it runs anywhere."""
+    stack = build(n_layers=4, d_mlp=128)
+    x = torch.randn(2, 16, D_MODEL)
+
+    def saved_during_forward(on: bool) -> int:
+        stack.recompute = on
+        count = 0
+
+        def pack(tensor: torch.Tensor) -> torch.Tensor:
+            nonlocal count
+            count += 1
+            return tensor
+
+        with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
+            stack.train()(x).sum()
+        return count
+
+    assert saved_during_forward(True) < saved_during_forward(False)
+
+
+def test_recompute_is_a_no_op_without_a_backward():
+    """Eval mode and ``no_grad`` both bypass it: same outputs, nothing checkpointed."""
+    stack = build(n_layers=3, d_mlp=128)
+    x = torch.randn(2, 8, D_MODEL)
+    reference = stack(x)
+    stack.recompute = True
+    assert torch.equal(stack(x), reference)
+    with torch.no_grad():
+        assert torch.equal(stack.train()(x), stack.train()(x))
