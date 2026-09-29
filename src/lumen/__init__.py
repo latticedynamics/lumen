@@ -47,6 +47,11 @@ from lumen.gdn import (
     HeadLayout,
 )
 from lumen.nn import RMSNorm, SwiGLU, rms_norm
+from lumen.sdm import (
+    SparseDeltaMemory,
+    SparseDeltaMemoryConfig,
+    SparseDeltaMemoryState,
+)
 from lumen.undertow import UndertowAttention, UndertowConfig, UndertowState
 from lumen.stack import Stack, StackState
 
@@ -94,6 +99,10 @@ __all__ = [
     "GatedDeltaNetConfig",
     "GatedDeltaNetState",
     "HeadLayout",
+    # sdm
+    "SparseDeltaMemory",
+    "SparseDeltaMemoryConfig",
+    "SparseDeltaMemoryState",
     # nn
     "RMSNorm",
     "SwiGLU",

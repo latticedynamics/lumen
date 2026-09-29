@@ -3,14 +3,14 @@ Registering the state containers so ``torch`` transforms can walk them.
 
 The mixers' contract is ``forward`` / ``init_state`` / ``step``, and **the state
 object is half of it** — two of those three methods exist only to produce and
-consume one.  A caller can hold either mixer without knowing which, which is the
+consume one.  A caller can hold any mixer without knowing which, which is the
 property this library exists to protect, right up until it hands a state to
 :func:`torch.func.vmap`, :func:`~torch.func.functional_call` or anything that
 flattens across a :func:`torch.compile` boundary.  There the abstraction stops,
 because a pytree that has never been declared is a leaf, and a leaf that is not
 a tensor is rejected.
 
-Nothing about these four classes is hostile to registration.  They are frozen
+Nothing about these five classes is hostile to registration.  They are frozen
 dataclasses holding tensors, tuples of tensors, ``None``, and one ``int``.  The
 declaration is the whole fix.  See `latticedynamics/lumen#12`.
 
@@ -69,6 +69,7 @@ import torch
 
 from lumen.block import BlockState
 from lumen.gdn import GatedDeltaNetState
+from lumen.sdm import SparseDeltaMemoryState
 from lumen.stack import StackState
 from lumen.undertow import UndertowState
 
@@ -105,8 +106,8 @@ def _register_dataclass(cls: type) -> None:
 def _register_undertow(cls: type) -> None:
     """Register with paths if this ``torch`` has them, without if it does not.
 
-    The keyed flatten is what makes ``tree_map_with_path`` treat all four states
-    alike; omitting it leaves the path-carrying traversals working on the three
+    The keyed flatten is what makes ``tree_map_with_path`` treat every state
+    alike; omitting it leaves the path-carrying traversals working on the
     dataclass-registered states and failing on this one, which is the asymmetry
     between mixers this module exists to remove.
 
@@ -154,6 +155,7 @@ _STATES: tuple[tuple[type, Callable[[type], None]], ...] = (
     (BlockState, _register_dataclass),
     (StackState, _register_dataclass),
     (UndertowState, _register_undertow),
+    (SparseDeltaMemoryState, _register_dataclass),
 )
 
 
@@ -184,7 +186,7 @@ def register_state_pytrees() -> tuple[str, ...]:
 
 #: What registration achieved on this ``torch``, evaluated once at import.
 #:
-#: Four names is the whole set.  Anything shorter names the states a
+#: Five names is the whole set.  Anything shorter names the states a
 #: ``torch.func`` transform will still refuse, which is the only question a
 #: consumer needs answered and is cheaper to read than to rediscover from a
 #: ``vmap`` error.

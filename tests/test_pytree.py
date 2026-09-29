@@ -24,6 +24,7 @@ from torch.func import functional_call, stack_module_state, vmap
 from lumen.block import Block
 from lumen.gdn import GatedDeltaNet, GatedDeltaNetConfig, HeadLayout
 from lumen.pytree import REGISTERED, register_state_pytrees
+from lumen.sdm import SparseDeltaMemory, SparseDeltaMemoryConfig
 from lumen.stack import Stack
 from lumen.undertow import UndertowAttention, UndertowConfig, UndertowState
 
@@ -34,7 +35,7 @@ SEQ = 8
 SETS = 4
 
 needs_registration = pytest.mark.skipif(
-    len(REGISTERED) < 4,
+    len(REGISTERED) < 5,
     reason=f"torch {torch.__version__} registered only {REGISTERED}",
 )
 
@@ -56,12 +57,32 @@ def a_local() -> UndertowAttention:
     return UndertowAttention(UndertowConfig(d_model=D_MODEL, n_heads=2, window=4))
 
 
+def a_memory() -> SparseDeltaMemory:
+    # Learned, so the initial table is a parameter and is stacked per set like
+    # every other weight -- the arrangement a population-based consumer runs.
+    return SparseDeltaMemory(
+        SparseDeltaMemoryConfig(
+            d_model=D_MODEL,
+            n_heads=2,
+            n_slots=16,
+            initial_memory="learned",
+            n_writes=3,
+            n_reads=3,
+            chunk_size=4,
+        )
+    )
+
+
 def gdn_only(index: int) -> Block:
     return Block(D_MODEL, a_mixer(), norm_eps=1e-5, d_mlp=0)
 
 
 def undertow_only(index: int) -> Block:
     return Block(D_MODEL, a_local(), norm_eps=1e-5, d_mlp=0)
+
+
+def sdm_only(index: int) -> Block:
+    return Block(D_MODEL, a_memory(), norm_eps=1e-5, d_mlp=0)
 
 
 def both(index: int) -> Block:
@@ -71,6 +92,7 @@ def both(index: int) -> Block:
 FACTORIES = [
     pytest.param(gdn_only, id="gdn"),
     pytest.param(undertow_only, id="undertow"),
+    pytest.param(sdm_only, id="sdm"),
     pytest.param(both, id="undertow-local-plus-gdn"),
 ]
 
@@ -85,6 +107,7 @@ def test_import_registers_every_state() -> None:
         "BlockState",
         "StackState",
         "UndertowState",
+        "SparseDeltaMemoryState",
     )
 
 
@@ -162,10 +185,10 @@ def test_a_state_survives_flattening_unchanged(factory) -> None:
 @needs_registration
 @pytest.mark.parametrize("factory", FACTORIES)
 def test_paths_are_available_on_every_state(factory) -> None:
-    """``tree_map_with_path`` works, or the four states are not alike after all.
+    """``tree_map_with_path`` works, or the states are not alike after all.
 
     The keyed flatten is optional to ``torch`` and not optional here: without it
-    the path-carrying traversals work on three states and fail on the fourth,
+    the path-carrying traversals work on the dataclass states and fail on one,
     which is the asymmetry between mixers this module exists to remove.
     """
     trunk = Stack(D_MODEL, N_LAYERS, factory, norm_eps=1e-5)
@@ -210,15 +233,18 @@ def test_vmap_over_stacked_parameter_sets(factory) -> None:
 
 
 @needs_registration
-def test_vmapped_sets_agree_with_the_models_run_one_at_a_time() -> None:
+@pytest.mark.parametrize(
+    "factory", [pytest.param(gdn_only, id="gdn"), pytest.param(sdm_only, id="sdm")]
+)
+def test_vmapped_sets_agree_with_the_models_run_one_at_a_time(factory) -> None:
     """The batched call is the same arithmetic, not merely the same shapes.
 
     Without this the test above passes on a transform that quietly broadcast one
     parameter set across all of them.
     """
-    models = [Stack(D_MODEL, N_LAYERS, gdn_only, norm_eps=1e-5) for _ in range(SETS)]
+    models = [Stack(D_MODEL, N_LAYERS, factory, norm_eps=1e-5) for _ in range(SETS)]
     params, buffers = stack_module_state(models)
-    base = Stack(D_MODEL, N_LAYERS, gdn_only, norm_eps=1e-5).to("meta")
+    base = Stack(D_MODEL, N_LAYERS, factory, norm_eps=1e-5).to("meta")
 
     x = torch.randn(SETS, BATCH, SEQ, D_MODEL)
 
@@ -261,3 +287,35 @@ def test_a_vmapped_state_still_streams() -> None:
     assert y.shape == (SETS, BATCH, SEQ, D_MODEL)
     # Both chunks were consumed, so the window state counted both.
     assert state.blocks[0].local.seen == 2 * SEQ
+
+
+@needs_registration
+def test_a_vmapped_sparse_delta_memory_streams_like_one_pass() -> None:
+    """Two vmapped chunks with the table carried equal one vmapped pass.
+
+    The sparse delta memory's kernel keeps every shape a function of the
+    configuration alone -- no boolean selection, no host sync -- precisely so
+    this works.  A kernel that picked its writers with ``w_idx[first]`` would be
+    refused by ``vmap`` outright; this holds that the carried table is also the
+    right one.
+    """
+    models = [Stack(D_MODEL, N_LAYERS, sdm_only, norm_eps=1e-5) for _ in range(SETS)]
+    params, buffers = stack_module_state(models)
+    base = Stack(D_MODEL, N_LAYERS, sdm_only, norm_eps=1e-5).to("meta")
+
+    def one_set(parameters, buffered, x, state):
+        return functional_call(
+            base, (parameters, buffered), (x,), {"state": state, "return_state": True}
+        )
+
+    state = pytree.tree_map(
+        lambda leaf: leaf.unsqueeze(0).expand(SETS, *leaf.shape).contiguous(),
+        models[0].init_state(BATCH),
+    )
+    x = torch.randn(SETS, BATCH, 2 * SEQ, D_MODEL)
+
+    whole, _ = vmap(one_set)(params, buffers, x, state)
+    head, carried = vmap(one_set)(params, buffers, x[:, :, :SEQ], state)
+    tail, _ = vmap(one_set)(params, buffers, x[:, :, SEQ:], carried)
+
+    torch.testing.assert_close(torch.cat([head, tail], dim=2), whole)
