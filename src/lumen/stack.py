@@ -142,8 +142,9 @@ class Stack(nn.Module):
         — it zeroed a bias only if the bias was already zero, which is a
         value-dependent branch that happens to preserve deliberate settings.
         Not touching them at all is equivalent for every layer in this package
-        (the only biases are a gated delta net's ``a_proj``, deliberately −3.0,
-        and ``b_proj``, deliberately zero) and it removes a branch whose
+        (the only biases are the ``a_proj`` of a gated delta net or a sparse
+        delta memory, deliberately −3.0, and their ``b_proj``, deliberately
+        zero) and it removes a branch whose
         correctness depended on "deliberate biases are nonzero" staying true.
 
         **The base pass would otherwise erase structure a sub-layer's

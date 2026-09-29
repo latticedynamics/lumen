@@ -3,8 +3,8 @@
 Every streaming state in this package is a registered pytree node, so the
 `torch` transforms that have to flatten a structure can walk one.
 
-`GatedDeltaNetState`, `UndertowState`, `BlockState` and `StackState` are frozen
-dataclasses of tensors. Until they are declared, `torch` sees each of them as a
+`GatedDeltaNetState`, `UndertowState`, `SparseDeltaMemoryState`, `BlockState`
+and `StackState` are frozen dataclasses of tensors. Until they are declared, `torch` sees each of them as a
 single opaque leaf, and a leaf that is not a tensor is refused:
 
 ```
@@ -16,8 +16,8 @@ Registration happens when you `import lumen`. There is nothing to call and no
 opt-in — but the call is exported for anyone who wants to be explicit, and it is
 idempotent.
 
-For *why* it is shaped this way — why import time, why one of the four cannot use
-the public entry point, and what `UndertowState.seen` has to do with any of it —
+For *why* it is shaped this way — why import time, why one of them cannot use the
+public entry point, and what `UndertowState.seen` has to do with any of it —
 see the module docstring in `lumen/pytree.py` and
 [`latticedynamics/lumen#12`](https://github.com/latticedynamics/lumen/issues/12).
 
@@ -93,16 +93,23 @@ per stream independently.
 **The base module holds no storage.** `.to("meta")` is what makes it a
 definition rather than a seventeenth model — all the weights come from `params`.
 
+**Every mixer runs under it**, and for the sparse delta memory that was a design
+constraint rather than a given: its chunkwise kernel keeps every shape a
+function of the configuration, never of the data, because a boolean selection
+or a value read back to the host is something `vmap` refuses. A learned initial
+table is a parameter like any other, so it is stacked per set with the rest.
+
 ## Checking what registered
 
 ```python
 import lumen
 
 lumen.REGISTERED
-# ('GatedDeltaNetState', 'BlockState', 'StackState', 'UndertowState')
+# ('GatedDeltaNetState', 'BlockState', 'StackState', 'UndertowState',
+#  'SparseDeltaMemoryState')
 ```
 
-Four names is the whole set. A shorter tuple means `torch` on this machine did
+Five names is the whole set. A shorter tuple means `torch` on this machine did
 not expose an entry point one of the states needs — the library is unaffected
 and every path documented elsewhere behaves identically, but a `torch.func`
 transform will still refuse the states that are missing. Reading it is cheaper
