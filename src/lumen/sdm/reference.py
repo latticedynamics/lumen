@@ -35,6 +35,15 @@ is carried by hand so that no chunk's backward costs anything in `N`, and a
 ``torch.func`` transform accepts and which is differentiable twice.  The arena
 is the default wherever it can run.  See :class:`_Arena`.
 
+Only the table is sequential.  Most of what a chunk computes -- its partners,
+cumulative decays, pairwise matrices, the solve, the weights its new rows are
+built from -- depends on its own inputs and on nothing an earlier chunk wrote.
+So it is computed for a group of chunks at once (:func:`_chunk_terms`), and the
+loop over chunks keeps only the operations that touch the table
+(:func:`_chunk_apply`), as Gated DeltaNet's reference keeps only its state.
+Those table-free terms are also most of what the backward keeps, and
+``recompute_pairwise`` rebuilds them per group instead.
+
 Why the decay stays inside the sum
 ----------------------------------
 Within a chunk, entering state `M₀`, write `G_{t,n} = Σ_{r≤t} log λ_{r,n}` for
@@ -78,7 +87,8 @@ Finding the partner is one sort of the chunk's write keys and a binary search
 per `(entry, position)` (:func:`_partners`), answerable exactly to a dense slot
 compare kept as its specification (:func:`_partners_dense`).  What autograd
 keeps is `O(C²·(W+R))` per chunk, which is linear in `C` over a sequence: the
-chunk size is a memory dial here as well as a speed one.
+chunk size is a memory dial here as well as a speed one, unless the pairwise
+terms are recomputed.
 
 Shape convention
 ----------------
@@ -103,6 +113,7 @@ import math
 
 import torch
 from torch.autograd.function import once_differentiable
+from torch.utils.checkpoint import checkpoint
 
 from lumen.gdn.reference import inv_unit
 
@@ -354,31 +365,34 @@ def _partners(
     return found[0], found[1], found[2], found[3]
 
 
-def _chunk(
-    rows_w: torch.Tensor,
-    rows_r: torch.Tensor,
-    scratch: torch.Tensor,
+def _chunk_terms(
     w_idx: torch.Tensor,
     w_val: torch.Tensor,
     w_logd: torch.Tensor,
-    v: torch.Tensor,
     beta: torch.Tensor,
     r_idx: torch.Tensor,
     r_val: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """One chunk: gathered rows and `(P, C, …)` inputs → output and the write.
+) -> tuple[torch.Tensor, ...]:
+    """Everything a chunk computes without the table, for any number of chunks.
 
-    ``rows_w`` / ``rows_r`` are the table's rows at ``w_idx`` / ``r_idx`` as
-    the chunk enters, `(P, C, W|R, d_v)`.  Returns the output `(P, C, d_v)` and
-    the write the chunk makes: every entry's ``destination`` and the
-    ``new_rows`` to place there.  The table itself is the caller's -- see
-    :class:`_FunctionalTable` and :class:`_Arena` -- so this function is the
-    same arithmetic whichever way it is held.
+    `(rows, C, …)` inputs, one chunk of one sequence per row: a caller batches
+    a group of chunks by folding them into ``rows``, which is the point -- none
+    of this depends on what an earlier chunk wrote, so none of it has to wait
+    in the sequential loop.  Returns, per row:
 
-    Indices are into the FLAT table, each row's slots offset by `p·N`, so two
-    entries of different rows can never compare equal.  ``scratch`` is
-    `(P, C, W)` indices of rows past the real table, one per write entry, where
-    the entries that do not place a slot's new row send theirs.
+    * ``w_weight`` / ``r_weight`` `(rows, C, W|R)` -- `k ⊙ e^G` and `q ⊙ e^G`,
+      the weights the chunk's entering rows are retrieved and read with;
+    * ``transform`` `(rows, C, C)` -- `(I + diag(β) A)⁻¹`, the solve;
+    * ``qk`` `(rows, C, C)`;
+    * ``decay_end`` `(rows, C, W)` -- how far each written slot decays by the
+      chunk's end;
+    * ``carry`` `(rows, C, W, C)` -- what each position's `δ` adds to each
+      written slot by the chunk's end;
+    * ``first`` `(rows, C, W)` -- which write entry places its slot's new row.
+
+    Indices are into the FLAT table, each sequence's slots offset by `p·N`, so
+    entries of different sequences never compare equal.  :func:`_chunk_apply`
+    is the rest of the chunk.
     """
     rows, chunk, n_writes = w_idx.shape
 
@@ -431,31 +445,107 @@ def _chunk(
     # `inv_unit` expects: `(I + diag(β) A)⁻¹` by one batched triangular solve.
     transform = inv_unit(beta.unsqueeze(-1) * a)
 
-    # ── the state-dependent part: solve, read ─────────────────────────────
-    retrieved = torch.einsum("pcw,pcwd->pcd", w_val * g_w.exp(), rows_w)
-    read_back = torch.einsum("pcr,pcrd->pcd", r_val * g_r.exp(), rows_r)
-    delta = transform @ (beta.unsqueeze(-1) * (v - retrieved))
-    out = read_back + qk @ delta
-
-    # ── the state update: one writer per slot ─────────────────────────────
+    # ── the state update's table-free half: one writer per slot ───────────
     # Every write entry of a slot would compute the same new row; the first
-    # one places it.  A replacing scatter with duplicate destinations would
-    # hand the full gradient to EVERY duplicate source -- wrong, and the kind
-    # of wrong that trains -- so the others are sent to scratch rows instead:
-    # one per entry, past the real table, never gathered from, sliced off at
-    # the end.  Their rows get no gradient because nothing reads them.
-    #
-    # Scratch rather than a boolean selection `w_idx[first]`, because every
-    # shape here then depends on the configuration and never on the data: no
-    # host sync, and nothing for `torch.func.vmap` to refuse.  And every
-    # destination is distinct, so the write is deterministic without asking.
+    # one places it (see `_group_terms` for where the others go).
     first = ~(w_has & before).any(-1)
     carry = w_partner_val * _ratio(w_has, g_end.unsqueeze(-1) - w_partner_g)
-    new_rows = g_end.exp().unsqueeze(-1) * rows_w + torch.einsum(
+    w_weight, r_weight, decay_end = w_val * g_w.exp(), r_val * g_r.exp(), g_end.exp()
+    return w_weight, r_weight, transform, qk, decay_end, carry, first
+
+
+def _chunk_apply(
+    rows_w: torch.Tensor,
+    rows_r: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    w_weight: torch.Tensor,
+    r_weight: torch.Tensor,
+    transform: torch.Tensor,
+    qk: torch.Tensor,
+    decay_end: torch.Tensor,
+    carry: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The part of a chunk that needs the table: its rows in, output and new rows out.
+
+    ``rows_w`` / ``rows_r`` are the table's rows at the chunk's write / read
+    indices as the chunk enters, `(P, C, W|R, d_v)`; ``v`` `(P, C, d_v)` and
+    ``beta`` `(P, C)` are its own; the rest is its share of
+    :func:`_chunk_terms`.  Returns the output `(P, C, d_v)` and the rows its
+    write entries carry, `(P, C, W, d_v)`.  This is everything the sequential
+    loop has to do per chunk, and the table itself is the caller's -- see
+    :class:`_FunctionalTable` and :class:`_Arena` -- so it is the same
+    arithmetic whichever way the table is held.
+    """
+    retrieved = torch.einsum("pcw,pcwd->pcd", w_weight, rows_w)
+    read_back = torch.einsum("pcr,pcrd->pcd", r_weight, rows_r)
+    delta = transform @ (beta.unsqueeze(-1) * (v - retrieved))
+    out = read_back + qk @ delta
+    new_rows = decay_end.unsqueeze(-1) * rows_w + torch.einsum(
         "pcws,psd->pcwd", carry, delta
     )
-    destination = torch.where(first, w_idx, scratch)
-    return out, destination, new_rows
+    return out, new_rows
+
+
+# ── a group of chunks ─────────────────────────────────────────────────────
+#
+# The table-free terms of consecutive chunks are computed together, and the
+# sequential loop runs over them one chunk at a time.  How many go together is
+# bounded by the size of the pairwise arrays, `(chunks·P, C, max(W, R), C)`:
+# without a bound a forward-only pass over a long sequence would hold every
+# chunk's at once, where the loop it replaces held one.  2²³ cells is 32 MiB
+# per array in fp32, a few arrays live at a time.  How many chunks that is
+# depends on the configuration alone, never on the data.
+
+_GROUP_CELLS = 2**23
+
+
+def _group_size(rows: int, chunk_size: int, n_entries: int) -> int:
+    """Chunks per group: as many as keep one pairwise array within the budget."""
+    return max(1, _GROUP_CELLS // (rows * chunk_size * n_entries * chunk_size))
+
+
+def _group_terms(
+    w_idx: torch.Tensor,
+    w_val: torch.Tensor,
+    w_logd: torch.Tensor,
+    beta: torch.Tensor,
+    r_idx: torch.Tensor,
+    r_val: torch.Tensor,
+    scratch: torch.Tensor,
+) -> tuple[torch.Tensor, ...]:
+    """:func:`_chunk_terms` for consecutive chunks at once.
+
+    `(P, n·C, …)` inputs → the terms as `(P, n, C, …)`, and each write entry's
+    ``destination`` in the table.  ``scratch`` is `(P, C, W)` indices of rows
+    past the real table, one per write entry of a chunk.
+
+    Only the first write entry of a slot places its new row.  A replacing
+    scatter with duplicate destinations would hand the full gradient to EVERY
+    duplicate source -- wrong, and the kind of wrong that trains -- so the
+    others are sent to the scratch rows instead: past the real table, never
+    gathered from, sliced off at the end.  Their rows get no gradient because
+    nothing reads them.  Scratch rather than a boolean selection
+    `w_idx[first]`, because every shape here then depends on the configuration
+    and never on the data: no host sync, and nothing for ``torch.func.vmap`` to
+    refuse.  And every destination is distinct, so the write is deterministic
+    without asking.
+    """
+    rows, chunk, _ = scratch.shape
+    n_chunks = w_idx.shape[1] // chunk
+
+    def fold(x: torch.Tensor) -> torch.Tensor:
+        return x.reshape(rows * n_chunks, chunk, *x.shape[2:])
+
+    def unfold(x: torch.Tensor) -> torch.Tensor:
+        return x.view(rows, n_chunks, *x.shape[1:])
+
+    inputs = (w_idx, w_val, w_logd, beta, r_idx, r_val)
+    *terms, first = _chunk_terms(*(fold(x) for x in inputs))
+    destination = torch.where(
+        unfold(first), w_idx.unflatten(1, (n_chunks, chunk)), scratch.unsqueeze(1)
+    )
+    return (*(unfold(term) for term in terms), destination)
 
 
 # ── the table across chunks: two ways to hold it ──────────────────────────
@@ -682,13 +772,16 @@ def chunk_sparse_delta(
     chunk_size: int,
     check_writes: bool = True,
     in_place: bool | None = None,
+    group: int | None = None,
+    recompute_pairwise: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Chunkwise-parallel sparse delta rule.  Shapes: the module docstring.
 
     Args:
         chunk_size: `C`, any positive integer.  Numerically inert — nothing
             here bounds accumulated decay, so nothing depends on it — and a
-            memory dial: autograd keeps `O(T·C·(W+R))` per sequence.
+            memory dial: autograd keeps `O(T·C·(W+R))` per sequence unless
+            ``recompute_pairwise`` is on.
         check_writes: verify the distinct-writes precondition.  On by default,
             because a violation returns a plausible wrong answer.  A caller
             whose indices are distinct **by construction** may turn it off:
@@ -706,6 +799,22 @@ def chunk_sparse_delta(
             transform is running.  The two agree bit for bit in the forward;
             their gradients differ only in the order a row's contributions are
             summed.
+        group: how many consecutive chunks have their table-free terms
+            computed together (:func:`_chunk_terms`) before the sequential loop
+            walks them.  ``None``, the default, takes as many as keep one
+            pairwise array within a fixed budget of cells (``_GROUP_CELLS``),
+            so the number depends on the configuration and never on the data.
+            Numerically inert, as ``chunk_size`` is: it changes how the work is
+            batched, not what is computed.
+        recompute_pairwise: keep only what the table-touching steps need for
+            the backward, and rebuild each group's table-free terms -- the
+            pairwise arrays, `O(T·C·(W+R))` per sequence -- when the backward
+            reaches them.  One more batched forward of those terms per group,
+            for memory that no longer grows with `C` beyond one array, the
+            carry.  The gradients are the same bit for bit: the rebuild is the
+            same arithmetic on the same inputs.  Not available under a
+            ``torch.func`` transform, which refuses the saved-tensor hooks it
+            is built on.
 
     Returns:
         `(…, T, d_v)` outputs and the `(…, N, d_v)` final table.  Rows no
@@ -713,11 +822,14 @@ def chunk_sparse_delta(
 
     Raises:
         ValueError: on inconsistent shapes, a position that writes one slot
-            twice (see :func:`_check_distinct_writes`), or ``in_place=True``
-            under a ``torch.func`` transform.
+            twice (see :func:`_check_distinct_writes`), a ``group`` below one,
+            or ``in_place=True`` or ``recompute_pairwise=True`` under a
+            ``torch.func`` transform.
     """
     if chunk_size < 1:
         raise ValueError(f"chunk_size must be >= 1, got {chunk_size}")
+    if group is not None and group < 1:
+        raise ValueError(f"group must be >= 1, got {group}")
     transformed = _transforms_active()
     if in_place is None:
         in_place = not transformed
@@ -726,6 +838,11 @@ def chunk_sparse_delta(
             "in_place=True cannot run under a torch.func transform: the table's "
             "gradient travels outside what the transform can see. Use "
             "in_place=False, or None to choose automatically."
+        )
+    if recompute_pairwise and transformed:
+        raise ValueError(
+            "recompute_pairwise=True cannot run under a torch.func transform: "
+            "recomputation is built on saved-tensor hooks, which transforms refuse."
         )
     _check_shapes(memory, write_idx, write_val, log_decay, v, beta, read_idx, read_val)
     if check_writes:
@@ -738,9 +855,9 @@ def chunk_sparse_delta(
     device = write_idx.device
 
     # One flat table for the whole batch, plus one scratch row per write entry
-    # of a chunk (see `_chunk`).  Broadcasting a shared initial table to the
-    # batch materialises one copy per stream here -- the moment each is about
-    # to be written anyway.
+    # of a chunk (see `_group_terms`).  Broadcasting a shared initial table to
+    # the batch materialises one copy per stream here -- the moment each is
+    # about to be written anyway.
     n_real = rows * n_slots
     n_scratch = rows * chunk_size * n_writes
     entering = memory.expand(*lead, n_slots, d_v)
@@ -781,25 +898,45 @@ def chunk_sparse_delta(
         )
         beta = torch.cat([beta, beta.new_zeros(rows, pad)], dim=1)
     padded_len = write_idx.shape[1]
-    n_chunks = padded_len // chunk_size
+    if group is None:
+        group = _group_size(rows, chunk_size, max(n_writes, n_reads))
+    recompute_pairwise = recompute_pairwise and torch.is_grad_enabled()
 
-    # unbind, NOT x[:, n] inside the loop: indexing a tensor in the loop makes
-    # autograd accumulate into a full-size zero buffer once per iteration.
-    def chunks(x: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        return x.reshape(rows, n_chunks, chunk_size, *x.shape[2:]).unbind(1)
+    # split and unbind, NOT x[:, lo:hi] inside the loop: slicing a tensor in a
+    # loop makes autograd accumulate into a full-size zero buffer once per
+    # iteration, where a split's backward is one concatenation.
+    def groups(x: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        return torch.split(x, group * chunk_size, dim=1)
+
+    def chunks(x: torch.Tensor, n: int) -> tuple[torch.Tensor, ...]:
+        return x.unflatten(1, (n, chunk_size)).unbind(1)
 
     outputs = []
-    for chunk in zip(
+    for w_idx, w_val, w_logd, v_group, beta_group, r_idx, r_val in zip(
         *(
-            chunks(x)
+            groups(x)
             for x in (write_idx, write_val, log_decay, v, beta, read_idx, read_val)
         )
     ):
-        w_idx, *_, r_idx, _ = chunk
-        rows_w, rows_r = table.gather(w_idx, r_idx)
-        out, destination, new_rows = _chunk(rows_w, rows_r, scratch, *chunk)
-        table.write(destination, new_rows)
-        outputs.append(out)
+        n = w_idx.shape[1] // chunk_size  # the last group may be short
+        inputs = (w_idx, w_val, w_logd, beta_group, r_idx, r_val, scratch)
+        if recompute_pairwise:
+            terms = checkpoint(
+                _group_terms, *inputs, use_reentrant=False, preserve_rng_state=False
+            )
+        else:
+            terms = _group_terms(*inputs)
+
+        # Only the table is sequential: per chunk, gather its rows, finish the
+        # chunk against them, write.
+        for w_idx_c, r_idx_c, v_c, beta_c, *terms_c, destination in zip(
+            *(chunks(x, n) for x in (w_idx, r_idx, v_group, beta_group)),
+            *(term.unbind(1) for term in terms),
+        ):
+            rows_w, rows_r = table.gather(w_idx_c, r_idx_c)
+            out, new_rows = _chunk_apply(rows_w, rows_r, v_c, beta_c, *terms_c)
+            table.write(destination, new_rows)
+            outputs.append(out)
 
     out = torch.stack(outputs, dim=1).reshape(rows, padded_len, d_v)[:, :seq_len]
     final = table.result(n_real)

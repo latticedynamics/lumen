@@ -252,6 +252,19 @@ def test_chunk_size_is_inert(chunk, holder):
 
 
 @pytest.mark.parametrize("holder", HOLDERS)
+@pytest.mark.parametrize("group", [1, 2, 4, 5])
+def test_grouping_is_inert(group, holder):
+    """How many chunks have their table-free terms computed together changes
+    nothing: one at a time, groups with a short last one, or -- the default at
+    this size -- all six at once."""
+    inputs = make_inputs()
+    y_all, m_all = chunked(*args(inputs), chunk_size=8, holder=holder)
+    y, m = chunked(*args(inputs), chunk_size=8, group=group, holder=holder)
+    assert max_diff(y, y_all) < EXACT
+    assert max_diff(m, m_all) < EXACT
+
+
+@pytest.mark.parametrize("holder", HOLDERS)
 @pytest.mark.parametrize("seq_len", [1, 2, 7, 8, 9, 23])
 def test_any_sequence_length_works_and_is_exact(seq_len, holder):
     inputs = make_inputs(seq_len=seq_len)
@@ -623,6 +636,20 @@ def test_under_a_transform_the_functional_holder_is_chosen():
         )(tables)
 
 
+def test_recompute_is_refused_under_a_transform():
+    """Recomputation rides on saved-tensor hooks, which ``torch.func`` refuses;
+    the kernel says so itself rather than surfacing the transform's error."""
+    inputs = make_inputs()
+    tables = torch.stack([inputs["memory"], inputs["memory"].flip(-2)])
+    rest = args(inputs)[1:]
+    with pytest.raises(ValueError, match="recompute_pairwise"):
+        torch.func.vmap(
+            lambda memory: chunk_sparse_delta(
+                memory, *rest, chunk_size=8, recompute_pairwise=True
+            )
+        )(tables)
+
+
 @pytest.mark.parametrize("holder", HOLDERS)
 def test_nothing_table_sized_is_kept_for_backward(holder):
     """Autograd keeps gathered rows and pairwise terms -- never a table.
@@ -662,9 +689,55 @@ def test_each_chunk_keeps_its_gathered_write_rows_once(holder):
     assert len(kept) == seq_len // chunk
 
 
+@pytest.mark.parametrize("holder", HOLDERS)
+def test_recomputing_the_pairwise_terms_changes_what_is_kept_and_nothing_else(holder):
+    """Rebuilt in the backward, the table-free terms are the same arithmetic on
+    the same inputs: outputs and gradients agree bit for bit.  What changes is
+    what autograd keeps: of everything pairwise-sized, only the carry -- one
+    array per group, needed by the table-touching step -- stays.
+
+    `W != R`, so a group's write-side pairwise arrays and read-side ones have
+    different sizes and each can be counted.
+    """
+    batch, heads, seq_len, chunk, group, n_writes, n_reads = 2, 2, 48, 8, 3, 4, 3
+    inputs = make_inputs(
+        batch=batch, heads=heads, seq_len=seq_len, n_writes=n_writes, n_reads=n_reads
+    )
+    probe = torch.randn(batch, heads, seq_len, 5, generator=torch.Generator().manual_seed(12),
+                        dtype=torch.float64)
+    cells = {k: batch * heads * group * chunk * k * chunk for k in (n_writes, n_reads)}
+    n_groups = seq_len // (chunk * group)
+
+    results = {}
+    for recompute in (False, True):
+        leaves = _leaves(inputs)
+        out: dict[str, torch.Tensor] = {}
+
+        def run() -> None:
+            out["y"], out["m"] = chunked(
+                *(leaves[name] for name in KERNEL_ARGS), chunk_size=chunk, group=group,
+                holder=holder, recompute_pairwise=recompute,
+            )
+
+        kept = [numel for numel, _ in _saved_storages(run)]
+        ((out["y"] * probe).sum() + out["m"].square().sum()).backward()
+        grads = [leaves[name].grad for name in DIFFERENTIABLE]
+        results[recompute] = (out["y"], out["m"], grads, kept)
+
+    (y, m, grads, kept), (y_rc, m_rc, grads_rc, kept_rc) = results[False], results[True]
+    assert torch.equal(y, y_rc) and torch.equal(m, m_rc)
+    for name, a, b in zip(DIFFERENTIABLE, grads, grads_rc):
+        assert torch.equal(a, b), name
+    assert kept.count(cells[n_writes]) > n_groups and kept.count(cells[n_reads]) > 0
+    assert kept_rc.count(cells[n_writes]) == n_groups  # the carry
+    assert kept_rc.count(cells[n_reads]) == 0
+
+
 def test_a_stack_recomputes_through_the_arena():
     """Non-reentrant checkpointing replays the forward and must land on the same
-    gradients -- the arena's indices are saved where checkpointing can see them."""
+    gradients -- the arena's indices are saved where checkpointing can see them.
+    With each layer rebuilding its pairwise terms as well, the two recomputes
+    nest, and still land on the same gradients."""
 
     def block(index: int) -> Block:
         config = SparseDeltaMemoryConfig(
@@ -682,12 +755,18 @@ def test_a_stack_recomputes_through_the_arena():
 
     grads = {}
     for recompute in (False, True):
-        trunk.recompute = recompute
-        trunk.zero_grad(set_to_none=True)
-        trunk(x).square().sum().backward()
-        grads[recompute] = {name: p.grad.clone() for name, p in trunk.named_parameters()}
-    for name in grads[False]:
-        assert torch.equal(grads[True][name], grads[False][name]), name
+        for pairwise in (False, True):
+            trunk.recompute = recompute
+            for b in trunk.blocks:
+                b.mixer.recompute_pairwise = pairwise
+            trunk.zero_grad(set_to_none=True)
+            trunk(x).square().sum().backward()
+            grads[recompute, pairwise] = {
+                name: p.grad.clone() for name, p in trunk.named_parameters()
+            }
+    for case in grads:
+        for name in grads[False, False]:
+            assert torch.equal(grads[case][name], grads[False, False][name]), (case, name)
 
 
 # ── preconditions ─────────────────────────────────────────────────────────
@@ -716,6 +795,11 @@ def test_inconsistent_shapes_are_refused():
 def test_chunk_size_must_be_positive():
     with pytest.raises(ValueError, match="chunk_size"):
         chunk_sparse_delta(*args(make_inputs()), chunk_size=0)
+
+
+def test_group_must_be_positive():
+    with pytest.raises(ValueError, match="group"):
+        chunk_sparse_delta(*args(make_inputs()), chunk_size=8, group=0)
 
 
 # ══ the layer ══════════════════════════════════════════════════════════════
@@ -999,6 +1083,25 @@ def test_backward_reaches_every_parameter_including_an_empty_table():
         assert bool(parameter.grad.abs().sum() > 0), name
 
 
+def test_the_layer_rebuilds_its_pairwise_terms_only_when_asked():
+    """A memory dial: off by default, not in the ``state_dict``, and invisible
+    in what the layer computes.  (Several groups at once are the kernel's
+    gates; this is the layer passing the dial down.)"""
+    layer = make_layer("learned").train()
+    assert layer.recompute_pairwise is False
+    keys = set(layer.state_dict())
+    x = sequence(seq_len=45)
+    grads = {}
+    for on in (False, True):
+        layer.recompute_pairwise = on
+        layer.zero_grad(set_to_none=True)
+        layer(x).square().sum().backward()
+        grads[on] = {name: p.grad.clone() for name, p in layer.named_parameters()}
+    assert set(layer.state_dict()) == keys
+    for name in grads[False]:
+        assert torch.equal(grads[True][name], grads[False][name]), name
+
+
 def test_zero_and_learned_checkpoints_do_not_silently_mix():
     zero, learned = make_layer("zero"), make_layer("learned")
     with pytest.raises(RuntimeError, match="initial_memory"):
@@ -1168,6 +1271,38 @@ def test_the_backward_is_reproducible_on_cuda_when_asked(holder):
     for run in runs[1:]:
         for name, a, b in zip(DIFFERENTIABLE, runs[0], run):
             assert torch.equal(a, b), name
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("holder", HOLDERS)
+def test_recomputing_the_pairwise_terms_changes_nothing_on_cuda(holder):
+    """On the device as on the host: with the backward made reproducible, the
+    rebuilt terms give the same gradients bit for bit, over several groups."""
+    inputs = {
+        name: tensor.cuda()
+        for name, tensor in make_inputs(dtype=torch.float32, seq_len=61).items()
+    }
+
+    def run(recompute: bool) -> list[torch.Tensor]:
+        leaves = _leaves(inputs)
+        y, m = chunked(
+            *(leaves[name] for name in KERNEL_ARGS), chunk_size=8, group=2,
+            holder=holder, recompute_pairwise=recompute,
+        )
+        (y.square().sum() + m.square().sum()).backward()
+        return [y.detach(), m.detach()] + [leaves[name].grad for name in DIFFERENTIABLE]
+
+    was = torch.are_deterministic_algorithms_enabled()
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            plain, rebuilt = run(False), run(True)
+    finally:
+        torch.use_deterministic_algorithms(was)
+    for name, a, b in zip(("y", "m", *DIFFERENTIABLE), plain, rebuilt):
+        assert torch.equal(a, b), name
 
 
 @pytest.mark.gpu
