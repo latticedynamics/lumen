@@ -43,13 +43,14 @@ lumen-probe --json          # same, machine-readable
 ## Quick start
 
 Every mixer in Lumen exposes the same three methods — `forward`, `init_state`,
-`step` — with the same shapes, so a transformer block can hold either one
+`step` — with the same shapes, so a transformer block can hold any of them
 without knowing which it has.
 
 ```python
 import torch
 from lumen import (
     GatedDeltaNet, GatedDeltaNetConfig, HeadLayout,
+    SparseDeltaMemory, SparseDeltaMemoryConfig,
     UndertowAttention, UndertowConfig,
 )
 
@@ -62,6 +63,9 @@ mixers = {
     "undertow": UndertowAttention(UndertowConfig(
         d_model=d_model, n_heads=4, window=32, plateau=24,
     )),
+    "sdm": SparseDeltaMemory(SparseDeltaMemoryConfig(
+        d_model=d_model, n_heads=2, n_slots=64**2, initial_memory="zero",
+    )),
 }
 
 x = torch.randn(batch, seq, d_model)
@@ -69,10 +73,11 @@ for name, mixer in mixers.items():
     print(name, tuple(mixer(x).shape))
 # gdn (2, 128, 256)
 # undertow (2, 128, 256)
+# sdm (2, 128, 256)
 ```
 
-Both stream in constant memory, and the recurrence agrees with the parallel
-path — so the check is written once and run against either:
+All three stream in constant memory, and the recurrence agrees with the parallel
+path — so the check is written once and run against any of them:
 
 ```python
 for name, mixer in mixers.items():
@@ -89,6 +94,7 @@ for name, mixer in mixers.items():
     print(name, (full - streamed).abs().max().item())
 # gdn       ~8e-07   <- fp32 round-off, not a modelling difference
 # undertow  ~8e-07
+# sdm       ~4e-07
 ```
 
 ## What's in it
@@ -108,6 +114,7 @@ it was written on.
 |---|---|
 | [`lumen.undertow`](./docs/UNDERTOW.md) | Fixed-window causal attention, no positional encoding, optional graded boundary. Streaming with constant memory, opt-in Triton path. [Design record](./docs/design/UNDERTOW.md) |
 | [`lumen.gdn`](./docs/GDN.md) | Gated DeltaNet — a fixed-size associative memory with a delta-rule write. Linear in sequence length, constant-memory generation, configurable head layout, reads that do not write, opt-in `fla` kernel path verified against the fp64 oracle. [Design record](./docs/design/GATED_DELTANET.md) |
+| [`lumen.sdm`](./docs/SDM.md) | Sparse Delta Memory — a gated delta rule over a large, sparsely addressed table. State size decoupled from parameter count and per-token compute; a slot nobody writes to is frozen, decay included; an empty or a learned initial table; runs under `vmap`. [Design record](./docs/design/SPARSE_DELTA_MEMORY.md) |
 | [`lumen.block`](./docs/BLOCK.md) | A residual `Block` and a `Stack` of them — the level a result is actually read off. Modality-free, sub-layer instances rather than a config, and the depth-scaled init that cannot live any lower. [Design record](./docs/design/BLOCK.md) |
 | [`lumen.pytree`](./docs/PYTREE.md) | Every streaming state is a pytree node, so `vmap`, `functional_call` and `torch.compile` can traverse one. The state is half the mixer contract; this is what keeps it from being where the abstraction stops |
 
@@ -190,9 +197,11 @@ instead of asserting version floors that are wrong.
 | [`docs/UNDERTOW.md`](./docs/UNDERTOW.md) | Using Undertow — configuration, streaming, splicing into a trained stack |
 | [`docs/BLOCK.md`](./docs/BLOCK.md) | Using Block and Stack — composition, streaming, initialisation, checkpoint keys |
 | [`docs/GDN.md`](./docs/GDN.md) | Using Gated DeltaNet — head layout, widths, generation, subclassing |
+| [`docs/SDM.md`](./docs/SDM.md) | Using Sparse Delta Memory — choosing the initial memory, sizing the state, generation, subclassing |
 | [`docs/PYTREE.md`](./docs/PYTREE.md) | States as pytrees — `tree_map` over a stream, and many parameter sets in one batched call |
 | [`docs/design/UNDERTOW.md`](./docs/design/UNDERTOW.md) | Undertow design record — lineages, decisions, evidence, open questions |
 | [`docs/design/GATED_DELTANET.md`](./docs/design/GATED_DELTANET.md) | Gated DeltaNet design record — same |
+| [`docs/design/SPARSE_DELTA_MEMORY.md`](./docs/design/SPARSE_DELTA_MEMORY.md) | Sparse Delta Memory design record — the diagonal-decay derivation, decisions, evidence, what is still open |
 
 ## Development
 

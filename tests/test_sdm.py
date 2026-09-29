@@ -754,3 +754,58 @@ def test_step_refuses_more_than_one_position():
 def test_residual_out_projections_is_the_output():
     layer = make_layer()
     assert layer.residual_out_projections() == (layer.o_proj,)
+
+
+# ── on a device ───────────────────────────────────────────────────────────
+# CI is CPU-only; these run locally with `pytest -m gpu`.  The kernels have no
+# compute-capability floor to test -- they are torch ops -- so what is checked
+# is that the arithmetic and the determinism claim survive the move.
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_chunkwise_matches_sequential_on_cuda(dtype):
+    inputs = {
+        name: tensor.cuda()
+        for name, tensor in make_inputs(dtype=dtype, seq_len=61).items()
+    }
+    y_ref, m_ref = sequential_sparse_delta(*args(inputs))
+    y, m = chunk_sparse_delta(*args(inputs), chunk_size=8)
+    bound = EXACT if dtype == torch.float64 else FP32
+    assert max_diff(y, y_ref) < bound
+    assert max_diff(m, m_ref) < bound
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_the_chunkwise_forward_is_deterministic_on_cuda():
+    """No scatter-add into a repeated destination, so no atomics to reorder.
+
+    The claim the partner layout and the scratch rows exist to make true, held
+    where it could fail: on a CPU every reduction order is already fixed.
+    """
+    inputs = {
+        name: tensor.cuda()
+        for name, tensor in make_inputs(dtype=torch.float32, seq_len=61).items()
+    }
+    first = chunk_sparse_delta(*args(inputs), chunk_size=8)
+    second = chunk_sparse_delta(*args(inputs), chunk_size=8)
+    assert torch.equal(first[0], second[0])
+    assert torch.equal(first[1], second[1])
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_the_layer_streams_on_cuda_without_a_device_argument():
+    """Build, move, init, step -- with no caller ever naming a device."""
+    layer = make_layer(dtype=torch.float32).cuda()
+    x = sequence().float().cuda()
+    state = layer.init_state(2)
+    assert state.memory.device == x.device
+
+    steps = []
+    for t in range(x.shape[1]):
+        y_t, state = layer.step(x[:, t : t + 1], state)
+        steps.append(y_t)
+    assert max_diff(torch.cat(steps, dim=1), layer(x)) < FP32
