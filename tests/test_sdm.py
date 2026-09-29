@@ -20,6 +20,8 @@ import torch.nn.functional as F
 
 from lumen.gdn.reference import chunk_gated_delta, sequential_gated_delta
 from lumen.sdm.reference import (
+    _partners,
+    _partners_dense,
     chunk_sparse_delta,
     read_sparse_delta,
     recurrent_sparse_delta,
@@ -142,6 +144,78 @@ def test_the_fixture_exercises_shared_slots():
     # Every chunk writes fewer distinct slots than it has write entries: some
     # slot is written by several positions in the same chunk, everywhere.
     assert bool((distinct < blocks.shape[-1]).all())
+
+
+# ── partners ──────────────────────────────────────────────────────────────
+
+
+def chunk_indices(
+    layout: str, *, rows: int = 3, chunk: int = 8, n_writes: int = 4, n_reads: int = 3,
+    seed: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """One chunk's `(P, C, W)` write and `(P, C, R)` read indices, flat as the
+    kernel sees them -- each row's slots offset by `p·N`.
+
+    ``collide``   a table one slot wider than a write set: nearly every slot is
+                  written at nearly every position.
+    ``same``      every position writes the same `W` slots, in its own order --
+                  every entry has a partner at every position.
+    ``disjoint``  no slot is written twice in the chunk.
+    ``miss``      reads confined to slots no position writes.
+    ``fixture``   the kernel fixture's proportions.
+    """
+    generator = torch.Generator().manual_seed(seed)
+
+    def distinct(n_slots: int, k: int, lo: int = 0) -> torch.Tensor:
+        return lo + torch.rand(rows, chunk, n_slots, generator=generator).argsort(-1)[..., :k]
+
+    if layout == "collide":
+        n_slots = n_writes + 1
+        w_idx, r_idx = distinct(n_slots, n_writes), distinct(n_slots, n_reads)
+    elif layout == "same":
+        n_slots = n_writes + n_reads
+        w_idx, r_idx = distinct(n_writes, n_writes), distinct(n_slots, n_reads)
+    elif layout == "disjoint":
+        n_slots = chunk * n_writes
+        w_idx = (torch.arange(chunk).view(1, chunk, 1) * n_writes
+                 + torch.arange(n_writes)).expand(rows, chunk, n_writes)
+        r_idx = distinct(n_slots, n_reads)
+    elif layout == "miss":
+        n_slots = 2 * n_writes + n_reads
+        w_idx, r_idx = distinct(n_writes + 1, n_writes), distinct(n_reads, n_reads, lo=n_slots - n_reads)
+    elif layout == "fixture":
+        n_slots = 24
+        w_idx, r_idx = distinct(n_slots, n_writes), distinct(n_slots, n_reads)
+    else:
+        raise ValueError(layout)
+    offset = (torch.arange(rows) * n_slots).view(rows, 1, 1)
+    return w_idx + offset, r_idx + offset
+
+
+@pytest.mark.parametrize("chunk", [1, 2, 5, 8, 64])
+@pytest.mark.parametrize("layout", ["collide", "same", "disjoint", "miss", "fixture"])
+def test_sorted_partners_are_the_dense_compare_exactly(layout, chunk):
+    """One sort and a binary search per cell, against the compare it replaced.
+
+    Exactly -- ``has`` and ``partner`` alike, including the value left where
+    there is no partner -- so everything downstream is the same arithmetic on
+    the same numbers, not merely close.
+    """
+    w_idx, r_idx = chunk_indices(layout, chunk=chunk)
+    for got, spec in zip(_partners(w_idx, r_idx), _partners_dense(w_idx, r_idx)):
+        assert got.dtype == spec.dtype
+        assert torch.equal(got, spec)
+
+
+def test_the_partner_layouts_mean_what_they_say():
+    """The adversarial layouts reach the extremes they are named for."""
+    w_has, _, r_has, _ = _partners(*chunk_indices("same"))
+    assert bool(w_has.all())
+    w_has, _, _, _ = _partners(*chunk_indices("disjoint"))
+    eye = torch.eye(8, dtype=torch.bool).view(1, 8, 1, 8)
+    assert torch.equal(w_has, eye.expand_as(w_has))  # only itself
+    _, _, r_has, _ = _partners(*chunk_indices("miss"))
+    assert not bool(r_has.any())
 
 
 # ── chunkwise against the oracle ──────────────────────────────────────────
@@ -1024,6 +1098,16 @@ def test_the_chunkwise_forward_is_deterministic_on_cuda():
     second = chunk_sparse_delta(*args(inputs), chunk_size=8)
     assert torch.equal(first[0], second[0])
     assert torch.equal(first[1], second[1])
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("layout", ["collide", "same", "disjoint", "miss", "fixture"])
+def test_sorted_partners_are_the_dense_compare_on_cuda(layout):
+    """The device's sort and search, against the device's compare."""
+    w_idx, r_idx = (t.cuda() for t in chunk_indices(layout, chunk=16))
+    for got, spec in zip(_partners(w_idx, r_idx), _partners_dense(w_idx, r_idx)):
+        assert torch.equal(got, spec)
 
 
 @pytest.mark.gpu

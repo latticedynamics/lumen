@@ -1,8 +1,8 @@
 # Sparse Delta Memory — design record
 
-**Status:** landed in 0.6.0, as `lumen.sdm`; the table written in place in
-0.6.1 (§3.11). The implementation is expected to match this record; where the
-two disagree, one of them is a bug.
+**Status:** landed in 0.6.0, as `lumen.sdm`; in 0.6.1 the table is written in
+place (§3.11) and partners are found by search (§3.1). The implementation is
+expected to match this record; where the two disagree, one of them is a bug.
 
 Unlike Gated DeltaNet and Undertow, this is **not a consolidation.** No
 existing implementation was merged, so there is no port to verify and no
@@ -161,14 +161,32 @@ scatter-add; that is inherent to sparse addressing, and it is deterministic
 under `torch.use_deterministic_algorithms`.) Equivalently: within a chunk, SDM
 is a diagonal-decay delta rule on the slots that chunk touches.
 
-**Cost of the reference layout, and the faster one it defers.** Finding the
-partner is a dense slot compare, `O(C²·W·(W+R))` booleans per chunk, transient.
+**Finding partners: a sort, not a compare.** The obvious way to find an
+entry's partner at each position is to compare its slot against every write in
+the chunk — a dense compare, `O(C²·W·(W+R))` booleans per chunk, reduced over
+`W`. The first kernel did that, and it is kept as the specification
+(`_partners_dense`). The kernel sorts the chunk's write keys `slot·C + t`
+instead — unique, because a position writes a slot at most once, so the sort
+needs no tie-break and orders them the same on every device — and answers each
+`(entry, s)` with a binary search for `slot·C + s`: `O(C·(W+R)·C·log(C·W))`,
+landing directly in the dense layout, with no scatter and no shape the data
+chooses. It reproduces the compare **exactly**, down to the index it leaves
+where there is no partner, so everything downstream is the same arithmetic on
+the same numbers; that is a test, on layouts built to reach the extremes —
+every position writing the same slots, no slot written twice, reads that never
+meet a write — and on a device.
+
+Measured on one machine (a Pascal card, `B = 4`, 2 heads, `W = R = 64`,
+`N = 128²`): 6.9 ms per chunk for the compare against 1.0 ms for the search at
+`C = 32`, 2.0 against 0.4 at `C = 16`, 25.6 against 2.5 at `C = 64`. A whole
+training step at the defaults went from 398 ms to 221; the forward alone from
+287 to 109. By the per-chunk timings, the search is about 15% of a step where
+the compare was over half.
+
 What autograd keeps is `O(C²·(W+R))` per chunk, so `O(T·C·(W+R))` per sequence
 — linear in `C`, which makes the chunk size a memory dial as well as a speed
-one. Most cells are empty; a two-pointer merge over sorted slot indices
-enumerates only real pairs, `O(C²·W)` work and `O(pairs)` memory. That is a
-faster path behind the same interface, and it earns its place by measurement
-(§3.6 of the GDN record), not by being obviously better.
+one. Most of those cells are empty. A layout holding only real pairs would
+shrink them, at the price of a shape the data chooses (§3.10).
 
 **The state update keeps one writer per slot.** A slot written by several
 positions in a chunk gets its new row computed once, at its first write entry,
@@ -343,11 +361,13 @@ a layer needs one, and none has been compared by anyone:
 - `M₀` initialisation — zero (here) vs truncated normal (paper); `M₀` optimiser
   treatment (§3.5).
 - `chunk_size` — inert numerically; a speed-and-memory dial. Measured on one
-  machine (§3.11), 16 was fastest at every table size from 32² to 256² and
-  smallest in memory; the default is 32. The optimum sits where a chunk's fixed
-  cost — launches, the Python loop — meets the compare's growth in `C`, and a
-  faster device shrinks the second without the first, so one card's answer is
-  not every card's.
+  machine, with the table in place (§3.11) and partners found by search
+  (§3.1), the default of 32 was fastest at every table size from 32² to 256²
+  (203–230 ms a step, against 242–270 at 64 and 289–339 at 16); memory grows
+  with it. Before the search it was 16. The optimum sits where a chunk's fixed
+  cost — launches, the Python loop — meets the pairwise terms' growth in `C`;
+  it has already moved once on one card, and a faster device shrinks the second
+  without the first, so it is not settled for others.
 
 ### 3.10 Every shape depends on the configuration, never on the data
 
@@ -422,8 +442,9 @@ Measured on the same machine, table-sized work fell to **0.7%** of a step at
 | `N = 128²` | 519 *(1126)* | **303** *(720)* | 398 *(622)* | 632 *(752)* |
 | `N = 256²` | 616 *(3604)* | **311** *(1952)* | 407 *(1233)* | 642 *(1053)* |
 
-*(in italics: the functional holder, before)*. At `C = 16` a 64× larger table costs 5% more
-time. One cell moved the wrong way, by 6%: the smallest chunk at the smallest
+*(in italics: the functional holder, before)*. At `C = 16` a 64× larger table
+costs 5% more time. (These precede §3.1's partner search, which moved the
+fastest chunk size to 32; there, the same 64× costs 13%.) One cell moved the wrong way, by 6%: the smallest chunk at the smallest
 table, where there is no table cost to remove and 128 chunks each make four
 more calls.
 
@@ -599,7 +620,10 @@ Each of these is a standing test in `tests/test_sdm.py`.
     forward is bit-identical across runs; the two holders agree; and the
     backward is bit-identical across runs under
     `torch.use_deterministic_algorithms`.
-13. **The two holders** (§3.11) each pass 1–7 and 9 (8 is checked before a
+13. **Partners by search equal partners by compare**, exactly, at chunk sizes 1
+    through 64, on layouts built to reach every extreme, and on a device
+    (§3.1).
+14. **The two holders** (§3.11) each pass 1–7 and 9 (8 is checked before a
     holder is chosen); agree bit for bit in the
     forward and to `1e-12` in their gradients; the arena backpropagates twice
     and refuses a second derivative, which the functional holder supports; neither
@@ -618,10 +642,14 @@ Each of these is a standing test in `tests/test_sdm.py`.
 - **How `M₀` should be optimised** (§3.5): ordinary weight decay shrinks what
   the context has frozen.
 - **The untested defaults** of §3.9.
-- **The dense slot compare** (§3.1) is now the largest single cost: measured
-  on one machine, 54% of a training step at the defaults and 68% at
-  `N = 32², C = 64`, and it grows with `C·W·(W+R)` and with heads at a fixed
-  state. The pair enumeration is the next path to earn its place.
+- **Where the time goes now.** Measured on one machine at the defaults, a
+  training step is 221 ms against Gated DeltaNet's 42 at the same width.
+  Finding partners is about 15% of it and table-sized work 1%; the rest is
+  elementwise work on the pairwise terms, gathers and their backward, and
+  batched matmuls, in roughly that order. At small chunks the device waits on
+  the host — 57% busy at `C = 16`, `N = 256²` — so the next lever is fusing a
+  chunk's elementwise work, a compiled or custom kernel measured against this
+  one, not a new algorithm.
 - **An in-place decode** (§3.6). Measured on one machine, the successor copy is
   most of a step once the table is large: at `B = 8`, 36 ms per step at
   `N = 512²` against 0.2 ms for the same arithmetic in place, which also costs

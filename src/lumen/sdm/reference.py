@@ -74,11 +74,11 @@ into a repeated destination, so the forward is deterministic on every device.
 (A gather's backward is a scatter-add; that is inherent to sparse addressing,
 and deterministic under ``torch.use_deterministic_algorithms``.)
 
-Finding the partner is a dense slot compare — `O(C²·W·(W+R))` booleans per
-chunk, transient.  What autograd keeps is `O(C²·(W+R))` per chunk, which is
-linear in `C` over a sequence: the chunk size is a memory dial here as well as
-a speed one.  Most cells are empty.  A merge that enumerates only real pairs is
-a faster path, and it earns its place by measurement.
+Finding the partner is one sort of the chunk's write keys and a binary search
+per `(entry, position)` (:func:`_partners`), answerable exactly to a dense slot
+compare kept as its specification (:func:`_partners_dense`).  What autograd
+keeps is `O(C²·(W+R))` per chunk, which is linear in `C` over a sequence: the
+chunk size is a memory dial here as well as a speed one.
 
 Shape convention
 ----------------
@@ -294,6 +294,66 @@ def _ratio(pair: torch.Tensor, exponent: torch.Tensor) -> torch.Tensor:
     return torch.where(pair, exponent, exponent.new_zeros(())).exp() * pair
 
 
+# ── partners ──────────────────────────────────────────────────────────────
+#
+# For every entry `(t, k)` -- a write or a read -- and every position `s` of
+# its chunk: does `s` write this entry's slot, and if so, which of its write
+# entries does?  At most one does, by the distinct-writes precondition.  The
+# answer is two `(P, C, K, C)` arrays: `has`, and `partner`, the flat index
+# `s·W + k'` of that write into the chunk's `(P, C·W)` write entries.  Where
+# there is no partner, `partner` is `s·W` -- any valid index would do, since
+# every use is masked by `has`, and this one is what the specification leaves.
+
+
+def _partners_dense(
+    w_idx: torch.Tensor, r_idx: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The specification: every entry against every write in the chunk.
+
+    `O(C²·W·(W+R))` booleans per chunk, then a reduction over `W` -- written to
+    be read.  :func:`_partners` is answerable to it, exactly.
+    """
+    rows, chunk, n_writes = w_idx.shape
+    column = torch.arange(chunk, device=w_idx.device).view(1, 1, 1, chunk) * n_writes
+    found: list[torch.Tensor] = []
+    for index in (w_idx, r_idx):
+        match = index[:, :, :, None, None] == w_idx[:, None, None, :, :]
+        found += [match.any(-1), column + match.to(torch.uint8).argmax(-1)]
+    return found[0], found[1], found[2], found[3]
+
+
+def _partners(
+    w_idx: torch.Tensor, r_idx: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """What the kernel runs: one sort, then one lookup per `(entry, s)`.
+
+    A write's key is its slot and then its position, `slot·C + t` -- unique,
+    because a position writes a slot at most once, so sorting the chunk's keys
+    needs no tie-break and is the same on every device.  Whether position `s`
+    writes the slot of an entry is then whether the key `slot·C + s` is among
+    them: a binary search, `O(C·(W+R)·C·log(C·W))` per chunk against the
+    specification's `O(C²·W·(W+R))`, landing directly in the layout the
+    kernel uses.  No scatter, and every shape is the configuration's.
+    """
+    rows, chunk, n_writes = w_idx.shape
+    position = torch.arange(chunk, device=w_idx.device)
+    keys = (w_idx * chunk + position.view(1, chunk, 1)).reshape(rows, chunk * n_writes)
+    keys, order = torch.sort(keys, dim=-1)
+    last = chunk * n_writes - 1
+    column = (position * n_writes).view(1, 1, 1, chunk)
+    found: list[torch.Tensor] = []
+    for index in (w_idx, r_idx):
+        shape = (*index.shape, chunk)
+        query = (index.unsqueeze(-1) * chunk + position).reshape(rows, -1)
+        # `searchsorted` returns where the query would go, which is past the
+        # end when it exceeds every key; clamped, the equality below says no.
+        at = torch.searchsorted(keys, query).clamp(max=last)
+        has = (keys.gather(1, at) == query).view(shape)
+        partner = torch.where(has, order.gather(1, at).view(shape), column)
+        found += [has, partner]
+    return found[0], found[1], found[2], found[3]
+
+
 def _chunk(
     rows_w: torch.Tensor,
     rows_r: torch.Tensor,
@@ -328,17 +388,7 @@ def _chunk(
     before = (position[None, :] < position[:, None]).view(1, chunk, 1, chunk)
 
     # ── partners: which write at position s names this entry's slot ───────
-    # The compare is C²·W·(W+R) and transient; only the (P, C, K, C) results
-    # below survive it.  At most one match per (entry, s), by the distinct-
-    # writes precondition, so `argmax` over the last axis finds it.
-    w_match = w_idx[:, :, :, None, None] == w_idx[:, None, None, :, :]
-    r_match = r_idx[:, :, :, None, None] == w_idx[:, None, None, :, :]
-    w_has = w_match.any(-1)
-    r_has = r_match.any(-1)
-    column = position.view(1, 1, 1, chunk) * n_writes
-    w_partner = column + w_match.to(torch.uint8).argmax(-1)
-    r_partner = column + r_match.to(torch.uint8).argmax(-1)
-    del w_match, r_match
+    w_has, w_partner, r_has, r_partner = _partners(w_idx, r_idx)
 
     w_val_flat = w_val.reshape(rows, chunk * n_writes)
     w_logd_flat = w_logd.reshape(rows, chunk * n_writes)
