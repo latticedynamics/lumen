@@ -28,6 +28,13 @@ Two paths live here and they compute the same recurrence, as in
 * the **chunkwise** path, which is what a layer runs, and which is required to
   reproduce the oracle to round-off in fp64.
 
+The chunkwise path holds its table between chunks in one of two ways, and they
+agree bit for bit in the forward: an **arena** written in place, whose gradient
+is carried by hand so that no chunk's backward costs anything in `N`, and a
+**functional** table, a new one per chunk under plain autograd, which every
+``torch.func`` transform accepts and which is differentiable twice.  The arena
+is the default wherever it can run.  See :class:`_Arena`.
+
 Why the decay stays inside the sum
 ----------------------------------
 Within a chunk, entering state `M₀`, write `G_{t,n} = Σ_{r≤t} log λ_{r,n}` for
@@ -95,6 +102,7 @@ from __future__ import annotations
 import math
 
 import torch
+from torch.autograd.function import once_differentiable
 
 from lumen.gdn.reference import inv_unit
 
@@ -287,7 +295,8 @@ def _ratio(pair: torch.Tensor, exponent: torch.Tensor) -> torch.Tensor:
 
 
 def _chunk(
-    table: torch.Tensor,
+    rows_w: torch.Tensor,
+    rows_r: torch.Tensor,
     scratch: torch.Tensor,
     w_idx: torch.Tensor,
     w_val: torch.Tensor,
@@ -296,8 +305,15 @@ def _chunk(
     beta: torch.Tensor,
     r_idx: torch.Tensor,
     r_val: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """One chunk: flat table and `(P, C, …)` inputs → output, successor table.
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """One chunk: gathered rows and `(P, C, …)` inputs → output and the write.
+
+    ``rows_w`` / ``rows_r`` are the table's rows at ``w_idx`` / ``r_idx`` as
+    the chunk enters, `(P, C, W|R, d_v)`.  Returns the output `(P, C, d_v)` and
+    the write the chunk makes: every entry's ``destination`` and the
+    ``new_rows`` to place there.  The table itself is the caller's -- see
+    :class:`_FunctionalTable` and :class:`_Arena` -- so this function is the
+    same arithmetic whichever way it is held.
 
     Indices are into the FLAT table, each row's slots offset by `p·N`, so two
     entries of different rows can never compare equal.  ``scratch`` is
@@ -305,8 +321,6 @@ def _chunk(
     the entries that do not place a slot's new row send theirs.
     """
     rows, chunk, n_writes = w_idx.shape
-    n_reads = r_idx.shape[-1]
-    d_v = table.shape[-1]
 
     position = torch.arange(chunk, device=w_idx.device)
     # (t, s) masks, laid out to broadcast against (P, C_t, K, C_s).
@@ -367,9 +381,7 @@ def _chunk(
     # `inv_unit` expects: `(I + diag(β) A)⁻¹` by one batched triangular solve.
     transform = inv_unit(beta.unsqueeze(-1) * a)
 
-    # ── the state-dependent part: gather, solve, read ─────────────────────
-    rows_w = table.index_select(0, w_idx.reshape(-1)).view(rows, chunk, n_writes, d_v)
-    rows_r = table.index_select(0, r_idx.reshape(-1)).view(rows, chunk, n_reads, d_v)
+    # ── the state-dependent part: solve, read ─────────────────────────────
     retrieved = torch.einsum("pcw,pcwd->pcd", w_val * g_w.exp(), rows_w)
     read_back = torch.einsum("pcr,pcrd->pcd", r_val * g_r.exp(), rows_r)
     delta = transform @ (beta.unsqueeze(-1) * (v - retrieved))
@@ -393,8 +405,219 @@ def _chunk(
         "pcws,psd->pcwd", carry, delta
     )
     destination = torch.where(first, w_idx, scratch)
-    table = table.index_copy(0, destination.reshape(-1), new_rows.reshape(-1, d_v))
-    return out, table
+    return out, destination, new_rows
+
+
+# ── the table across chunks: two ways to hold it ──────────────────────────
+#
+# `_chunk` reads rows and names a write; it never touches the table.  What
+# holds the table between chunks decides what the table costs, and the two
+# holders below compute the same values -- bit for bit in the forward.
+#
+# Measured on one machine (a Pascal card, fp32; the design record has the
+# table), the functional holder spends 36% of a training step on table-sized
+# work at `N = 128²` and 85% at `N = 256²` -- almost all of it autograd's
+# bookkeeping in the backward, about five full-table passes per chunk.  That
+# is a cost in `N` the recurrence does not have.  The arena removes it.
+
+
+def _gather_rows(table: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+    """`table (rows, d_v)`, `index (…)` → `(…, d_v)`."""
+    return table.index_select(0, index.reshape(-1)).view(*index.shape, table.shape[-1])
+
+
+class _FunctionalTable:
+    """The table as a value: each write returns a new table.  Plain autograd.
+
+    Runs under every ``torch.func`` transform and is differentiable to any
+    order, which is why it stays.  It pays for that in the table: each chunk's
+    write copies it, and the backward of a gather and of a replacing write each
+    allocate table-sized gradients, which then have to be summed.
+    """
+
+    def __init__(self, table: torch.Tensor) -> None:
+        self.table = table
+
+    def gather(
+        self, w_idx: torch.Tensor, r_idx: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return _gather_rows(self.table, w_idx), _gather_rows(self.table, r_idx)
+
+    def write(self, destination: torch.Tensor, rows: torch.Tensor) -> None:
+        d_v = self.table.shape[-1]
+        # `scatter` rather than `index_copy`: the same replacing write, but the
+        # backward of `index_copy` retains its whole source -- to read its
+        # shape -- where `scatter`'s retains only this index, a broadcast view.
+        # Measured, that source was a fifth of everything a training step kept.
+        index = destination.reshape(-1, 1).expand(-1, d_v)
+        self.table = self.table.scatter(0, index, rows.reshape(-1, d_v))
+
+    def result(self, n_real: int) -> torch.Tensor:
+        return self.table[:n_real]
+
+
+class _Arena:
+    """The table as one buffer, written in place; its gradient carried sparsely.
+
+    Four autograd Functions are the only things that touch the buffer: start,
+    gather, write, finish.  Everything between them -- the pairwise terms, the
+    solve, the new rows -- is ordinary autograd.  Nothing about the table is
+    differentiated by hand except the two facts that define it: a gather reads
+    rows, and a write replaces them.
+
+    The table's gradient never exists per chunk.  It is ONE buffer, allocated
+    once per backward, handed down a chain of zero-storage *token* tensors as
+    their gradient: each Function takes the previous token and returns the
+    next, so autograd's own dependency order runs their backwards in exactly
+    the reverse of the forward.  Per chunk, the backward then touches only the
+    rows the chunk touched:
+
+    * the write's backward reads the gradient at its destinations -- that is
+      the gradient of the new rows -- and zeroes those rows, because a replaced
+      row's old value reached nothing past the write;
+    * the gather's backward adds the gathered rows' gradients back in.
+
+    Every token is consumed exactly once, so autograd never sums two of them;
+    the buffer passes through by reference and is the Functions' own to
+    mutate.  A fresh backward -- ``retain_graph``, or gradcheck's repeated
+    passes -- starts a fresh buffer.  Double backward is refused rather than
+    wrong (``once_differentiable``); the functional holder offers it.
+    """
+
+    def __init__(self, memory: torch.Tensor, n_scratch: int) -> None:
+        self.table: torch.Tensor | None = None  # filled by `_Start`
+        self.token: torch.Tensor | None = _Start.apply(memory, self, n_scratch)
+
+    def gather(
+        self, w_idx: torch.Tensor, r_idx: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        rows_w, rows_r, self.token = _Gather.apply(self.token, self, w_idx, r_idx)
+        return rows_w, rows_r
+
+    def write(self, destination: torch.Tensor, rows: torch.Tensor) -> None:
+        self.token = _Write.apply(self.token, rows, self, destination)
+
+    def result(self, n_real: int) -> torch.Tensor:
+        final = _Finish.apply(self.token, self, n_real)
+        # Drop the last token, so no graph node is reachable from the arena and
+        # nothing here outlives the forward that built it.  The Functions keep
+        # only indices and shapes -- never the arena, never the table.
+        self.token = None
+        return final
+
+
+def _token(table: torch.Tensor) -> torch.Tensor:
+    """A table-shaped tensor with no storage: it exists to carry a gradient."""
+    return table.new_zeros(()).expand_as(table)
+
+
+class _Start(torch.autograd.Function):
+    """`memory (…, N, d_v)` → the arena's buffer, real rows then scratch rows."""
+
+    @staticmethod
+    def forward(ctx, memory, arena, n_scratch):  # type: ignore[override]
+        d_v = memory.shape[-1]
+        n_real = memory.numel() // d_v
+        table = memory.new_empty(n_real + n_scratch, d_v)
+        # A copy, so the caller's table -- a state, perhaps a broadcast view of
+        # a learned one -- is never written.  One per forward, not per chunk.
+        table[:n_real].view(memory.shape).copy_(memory)
+        table[n_real:].zero_()
+        arena.table = table
+        ctx.shape = memory.shape
+        ctx.set_materialize_grads(False)
+        return _token(table)
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad):  # type: ignore[override]
+        if grad is None:
+            return None, None, None
+        n_real = math.prod(ctx.shape[:-1])
+        return grad[:n_real].view(ctx.shape), None, None
+
+
+class _Gather(torch.autograd.Function):
+    """Rows at ``w_idx`` and ``r_idx``; backward adds their gradients in."""
+
+    @staticmethod
+    def forward(ctx, token, arena, w_idx, r_idx):  # type: ignore[override]
+        table = arena.table
+        ctx.save_for_backward(w_idx, r_idx)
+        ctx.table_shape = table.shape
+        ctx.set_materialize_grads(False)
+        return _gather_rows(table, w_idx), _gather_rows(table, r_idx), _token(table)
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad_w, grad_r, grad):  # type: ignore[override]
+        w_idx, r_idx = ctx.saved_tensors
+        for index, rows in ((w_idx, grad_w), (r_idx, grad_r)):
+            if rows is None:
+                continue
+            if grad is None:
+                grad = rows.new_zeros(ctx.table_shape)
+            grad.index_add_(0, index.reshape(-1), rows.reshape(-1, rows.shape[-1]))
+        return grad, None, None, None
+
+
+class _Write(torch.autograd.Function):
+    """Replace the rows at ``destination`` -- distinct by construction -- in place."""
+
+    @staticmethod
+    def forward(ctx, token, rows, arena, destination):  # type: ignore[override]
+        table = arena.table
+        table.index_copy_(0, destination.reshape(-1), rows.reshape(-1, table.shape[-1]))
+        ctx.save_for_backward(destination)
+        ctx.rows_shape = rows.shape
+        ctx.set_materialize_grads(False)
+        return _token(table)
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad):  # type: ignore[override]
+        if grad is None:
+            return None, None, None, None
+        (destination,) = ctx.saved_tensors
+        index = destination.reshape(-1)
+        grad_rows = grad.index_select(0, index).view(ctx.rows_shape)
+        grad.index_fill_(0, index, 0.0)
+        return grad, grad_rows, None, None
+
+
+class _Finish(torch.autograd.Function):
+    """The real rows of the final buffer; backward seeds the table gradient."""
+
+    @staticmethod
+    def forward(ctx, token, arena, n_real):  # type: ignore[override]
+        table = arena.table
+        ctx.table_shape = table.shape
+        ctx.n_real = n_real
+        ctx.set_materialize_grads(False)
+        return table[:n_real]
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad_final):  # type: ignore[override]
+        if grad_final is None:
+            return None, None, None
+        # A buffer of our own: the incoming gradient belongs to whoever
+        # produced it, and everything downstream of here mutates this one.
+        grad = grad_final.new_zeros(ctx.table_shape)
+        grad[: ctx.n_real] = grad_final
+        return grad, None, None
+
+
+def _transforms_active() -> bool:
+    """Is a ``torch.func`` transform -- vmap, grad, jvp, … -- running?
+
+    The arena's Functions carry the table through a side channel that no
+    transform can batch or trace, so under one the functional holder is the
+    only holder.  This is the check ``torch.autograd.Function.apply`` itself
+    makes to decide how to dispatch.  It is private API; the vmap tests in
+    ``tests/test_pytree.py`` are what would notice it moving.
+    """
+    return torch._C._are_functorch_transforms_active()
 
 
 def chunk_sparse_delta(
@@ -408,6 +631,7 @@ def chunk_sparse_delta(
     read_val: torch.Tensor,
     chunk_size: int,
     check_writes: bool = True,
+    in_place: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Chunkwise-parallel sparse delta rule.  Shapes: the module docstring.
 
@@ -422,17 +646,37 @@ def chunk_sparse_delta(
             is a data-dependent branch that ``torch.func.vmap`` refuses.  With
             it off, every shape in this function depends on the configuration
             alone.
+        in_place: how the table is held between chunks.  ``True`` writes one
+            buffer in place and carries its gradient sparsely (:class:`_Arena`),
+            so no step costs anything in `N` beyond one copy in and one
+            gradient buffer out.  ``False`` is the functional holder
+            (:class:`_FunctionalTable`): a new table per chunk under plain
+            autograd, which every ``torch.func`` transform accepts and which is
+            differentiable twice.  ``None``, the default, is ``True`` unless a
+            transform is running.  The two agree bit for bit in the forward;
+            their gradients differ only in the order a row's contributions are
+            summed.
 
     Returns:
         `(…, T, d_v)` outputs and the `(…, N, d_v)` final table.  Rows no
         position writes are the incoming rows, bit for bit.
 
     Raises:
-        ValueError: on inconsistent shapes, or a position that writes one slot
-            twice (see :func:`_check_distinct_writes`).
+        ValueError: on inconsistent shapes, a position that writes one slot
+            twice (see :func:`_check_distinct_writes`), or ``in_place=True``
+            under a ``torch.func`` transform.
     """
     if chunk_size < 1:
         raise ValueError(f"chunk_size must be >= 1, got {chunk_size}")
+    transformed = _transforms_active()
+    if in_place is None:
+        in_place = not transformed
+    elif in_place and transformed:
+        raise ValueError(
+            "in_place=True cannot run under a torch.func transform: the table's "
+            "gradient travels outside what the transform can see. Use "
+            "in_place=False, or None to choose automatically."
+        )
     _check_shapes(memory, write_idx, write_val, log_decay, v, beta, read_idx, read_val)
     if check_writes:
         _check_distinct_writes(write_idx)
@@ -449,12 +693,14 @@ def chunk_sparse_delta(
     # to be written anyway.
     n_real = rows * n_slots
     n_scratch = rows * chunk_size * n_writes
-    table = torch.cat(
-        [
-            memory.expand(*lead, n_slots, d_v).reshape(n_real, d_v),
-            memory.new_zeros(n_scratch, d_v),
-        ]
-    )
+    entering = memory.expand(*lead, n_slots, d_v)
+    table: _Arena | _FunctionalTable
+    if in_place:
+        table = _Arena(entering, n_scratch)
+    else:
+        table = _FunctionalTable(
+            torch.cat([entering.reshape(n_real, d_v), memory.new_zeros(n_scratch, d_v)])
+        )
     scratch = (n_real + torch.arange(n_scratch, device=device)).view(
         rows, chunk_size, n_writes
     )
@@ -499,8 +745,12 @@ def chunk_sparse_delta(
             for x in (write_idx, write_val, log_decay, v, beta, read_idx, read_val)
         )
     ):
-        out, table = _chunk(table, scratch, *chunk)
+        w_idx, *_, r_idx, _ = chunk
+        rows_w, rows_r = table.gather(w_idx, r_idx)
+        out, destination, new_rows = _chunk(rows_w, rows_r, scratch, *chunk)
+        table.write(destination, new_rows)
         outputs.append(out)
 
     out = torch.stack(outputs, dim=1).reshape(rows, padded_len, d_v)[:, :seq_len]
-    return out.reshape(*lead, seq_len, d_v), table[:n_real].reshape(*lead, n_slots, d_v)
+    final = table.result(n_real)
+    return out.reshape(*lead, seq_len, d_v), final.reshape(*lead, n_slots, d_v)

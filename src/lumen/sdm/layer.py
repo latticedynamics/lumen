@@ -351,7 +351,9 @@ class SparseDeltaMemory(nn.Module):
 
         The distinct-writes check is off: :meth:`_address` guarantees it by
         construction, and the check would cost a sync per call and break
-        ``torch.func``.
+        ``torch.func``.  How the table is held is the kernel's default: in
+        place, or functionally under a ``torch.func`` transform.  Pass
+        ``in_place=False`` from an override to differentiate twice.
         """
         return chunk_sparse_delta(
             memory, *features, chunk_size=self.config.chunk_size, check_writes=False

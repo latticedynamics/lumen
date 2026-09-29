@@ -55,8 +55,10 @@ the slots it lands on.
 | address parameters | `2 · d_model · n_heads · 2√n_slots` — grows as `√n_slots` |
 | learned table | `n_slots · d_model` parameters, under `"learned"` only |
 
-`n_slots` is the knob that grows the state without growing compute. It is per
-head and must be a perfect square, because product keys address it as
+`n_slots` is the knob that grows the state without growing compute — in
+training as well as in the recurrence, because the kernel writes the table in
+place and carries its gradient sparsely (design record §3.11). It is per head
+and must be a perfect square, because product keys address it as
 `√N × √N`. There is deliberately no `expand_v`: value width multiplies state
 *and* compute, and `n_slots` already buys the first without the second.
 
@@ -121,7 +123,7 @@ output, and every slot of the final table, is what it would have been.
 | `key_norm` | `"softmax"` | how the selected scores become weights. `"l2"` normalises them to a unit vector instead — the delta rule at full strength, and the experiment for whether this layer is a delta rule at all (design record §4.2) |
 | `decay_weighting` | `"write_set"` | every written slot decays by the full `α`. `"key"` scales each slot's decay by its write weight, removing the jump at the top-`W` boundary; untested, and refused with `key_norm="l2"` |
 | `beta_max` | 2.0 | write-strength ceiling. The paper's is 1; past 2 is refused, because the chunkwise solve stops being stable there |
-| `chunk_size` | 32 | numerically inert, and a memory dial: training keeps `O(T · chunk_size · (W+R))` per sequence. The default is a guess awaiting measurement |
+| `chunk_size` | 32 | numerically inert, and a speed and memory dial: training keeps `O(T · chunk_size · (W+R))` per sequence. Measured on one machine, 16 was fastest at every table size and smaller in memory; where the optimum sits depends on the device (design record §3.9) |
 | `norm_eps`, `dropout` | 1e-5, 0.0 | as in Gated DeltaNet |
 
 ## Optimising a learned table
@@ -157,6 +159,12 @@ design constraint on the kernel, not a given: every shape in it depends on the
 configuration, never on the data. A learned table is a parameter like any
 other, so it is stacked per set with the rest.
 
+Under a transform the kernel holds its table functionally — each chunk writes
+a new one — because the in-place path's gradient bookkeeping is invisible to
+`torch.func`. It is chosen automatically and gives the same outputs; the cost
+is a table copy per chunk, which grows with `n_slots` as nothing else here
+does.
+
 ## Subclassing
 
 Reuse is by subclassing. Four methods are the seams:
@@ -165,7 +173,7 @@ Reuse is by subclassing. Four methods are the seams:
 |---|---|
 | `_address` | change how slots are selected and weighted |
 | `_features` | change anything else the kernel takes: values, write strength, decay |
-| `_scan` | swap in a different kernel |
+| `_scan` | swap in a different kernel — or call this one with `in_place=False` to differentiate twice |
 | `_out` | change the output path |
 
 **An override of `_address` must keep write indices distinct within each
@@ -183,8 +191,17 @@ has no atomics, so it is deterministic on a GPU without asking.
 
 Training memory has two terms beyond the table itself: the rows each chunk
 gathers, `O(T · (W+R) · d_v)` per head, and the pairwise terms,
-`O(T · chunk_size · (W+R))`. For long sequences, `Stack.recompute = True` trades
+`O(T · chunk_size · (W+R))`. The table is not among them: training writes it in
+place and never retains it. For long sequences, `Stack.recompute = True` trades
 a second forward for the first.
+
+The backward adds each gathered row's gradient back into the table's with a
+scatter-add, so on a GPU its sums can reorder from run to run. Under
+`torch.use_deterministic_algorithms(True)` they do not.
+
+The in-place path cannot be differentiated twice; a second derivative through
+it is refused. The kernel's `in_place=False` can be, at the cost of a table
+copy per chunk.
 
 Run the GPU-marked tests locally; CI is CPU-only:
 
