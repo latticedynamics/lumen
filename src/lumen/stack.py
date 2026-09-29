@@ -30,6 +30,7 @@ from typing import Callable, Iterable
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from lumen.block import Block, BlockState
 from lumen.nn import RMSNorm
@@ -111,6 +112,13 @@ class Stack(nn.Module):
 
         self.blocks = nn.ModuleList(block(index) for index in range(n_layers))
         self.norm_f = RMSNorm(d_model, norm_eps)
+
+        #: Activation recompute per block, while training: a memory dial, not
+        #: part of the function. An attribute rather than a constructor argument
+        #: because it is not part of the model either — it is not in the
+        #: ``state_dict``, draws nothing, and the same weights may be trained
+        #: with it on and served with it off. See :meth:`forward`.
+        self.recompute = False
 
         self.reset_parameters()
 
@@ -224,7 +232,23 @@ class Stack(nn.Module):
         state: StackState | None = None,
         return_state: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, StackState]:
-        """``(B, T, d_model)`` → ``(B, T, d_model)``, optionally continuing a stream."""
+        """``(B, T, d_model)`` → ``(B, T, d_model)``, optionally continuing a stream.
+
+        **With** :attr:`recompute` **on**, each block runs under non-reentrant
+        ``torch.utils.checkpoint`` while training with gradients enabled: its
+        intermediates are dropped after its forward and rebuilt in its
+        backward, so peak memory holds one block's intermediates rather than
+        every block's. That trades a second forward per block for memory that
+        scales with depth. It exists for long sequences, where a recurrent
+        mixer's saved intermediates grow as ``T · d`` per block and a single
+        sequence can exceed a card in the forward pass alone.
+
+        The function is unchanged: the recomputed forward is the same
+        arithmetic on the same inputs, and ``checkpoint`` restores the RNG
+        state so a dropout mask is redrawn identically. Outside training, or
+        under ``torch.no_grad()``, it is a no-op, because there is no backward
+        to save memory for.
+        """
         prior = state.blocks if state is not None else (None,) * self.n_layers
         if len(prior) != self.n_layers:
             raise ValueError(
@@ -232,11 +256,23 @@ class Stack(nn.Module):
                 f"{self.n_layers} blocks"
             )
 
+        recompute = self.recompute and self.training and torch.is_grad_enabled()
         successors: list[BlockState] = []
         for block, block_state in zip(self.blocks, prior):
             if return_state:
-                x, successor = block(x, state=block_state, return_state=True)
+                if recompute:
+                    x, successor = checkpoint(
+                        lambda h, b=block, s=block_state: b(h, state=s, return_state=True),
+                        x,
+                        use_reentrant=False,
+                    )
+                else:
+                    x, successor = block(x, state=block_state, return_state=True)
                 successors.append(successor)
+            elif recompute:
+                x = checkpoint(
+                    lambda h, b=block, s=block_state: b(h, state=s), x, use_reentrant=False
+                )
             else:
                 x = block(x, state=block_state)
 
