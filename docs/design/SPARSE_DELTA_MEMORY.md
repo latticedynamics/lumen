@@ -1,7 +1,8 @@
 # Sparse Delta Memory — design record
 
-**Status:** landed in 0.6.0, as `lumen.sdm`. The implementation is expected to
-match this record; where the two disagree, one of them is a bug.
+**Status:** landed in 0.6.0, as `lumen.sdm`; in 0.6.1 the table is written in
+place (§3.11) and partners are found by search (§3.1). The implementation is
+expected to match this record; where the two disagree, one of them is a bug.
 
 Unlike Gated DeltaNet and Undertow, this is **not a consolidation.** No
 existing implementation was merged, so there is no port to verify and no
@@ -160,14 +161,32 @@ scatter-add; that is inherent to sparse addressing, and it is deterministic
 under `torch.use_deterministic_algorithms`.) Equivalently: within a chunk, SDM
 is a diagonal-decay delta rule on the slots that chunk touches.
 
-**Cost of the reference layout, and the faster one it defers.** Finding the
-partner is a dense slot compare, `O(C²·W·(W+R))` booleans per chunk, transient.
+**Finding partners: a sort, not a compare.** The obvious way to find an
+entry's partner at each position is to compare its slot against every write in
+the chunk — a dense compare, `O(C²·W·(W+R))` booleans per chunk, reduced over
+`W`. The first kernel did that, and it is kept as the specification
+(`_partners_dense`). The kernel sorts the chunk's write keys `slot·C + t`
+instead — unique, because a position writes a slot at most once, so the sort
+needs no tie-break and orders them the same on every device — and answers each
+`(entry, s)` with a binary search for `slot·C + s`: `O(C·(W+R)·C·log(C·W))`,
+landing directly in the dense layout, with no scatter and no shape the data
+chooses. It reproduces the compare **exactly**, down to the index it leaves
+where there is no partner, so everything downstream is the same arithmetic on
+the same numbers; that is a test, on layouts built to reach the extremes —
+every position writing the same slots, no slot written twice, reads that never
+meet a write — and on a device.
+
+Measured on one machine (a Pascal card, `B = 4`, 2 heads, `W = R = 64`,
+`N = 128²`): 6.9 ms per chunk for the compare against 1.0 ms for the search at
+`C = 32`, 2.0 against 0.4 at `C = 16`, 25.6 against 2.5 at `C = 64`. A whole
+training step at the defaults went from 398 ms to 221; the forward alone from
+287 to 109. By the per-chunk timings, the search is about 15% of a step where
+the compare was over half.
+
 What autograd keeps is `O(C²·(W+R))` per chunk, so `O(T·C·(W+R))` per sequence
 — linear in `C`, which makes the chunk size a memory dial as well as a speed
-one. Most cells are empty; a two-pointer merge over sorted slot indices
-enumerates only real pairs, `O(C²·W)` work and `O(pairs)` memory. That is a
-faster path behind the same interface, and it earns its place by measurement
-(§3.6 of the GDN record), not by being obviously better.
+one. Most of those cells are empty. A layout holding only real pairs would
+shrink them, at the price of a shape the data chooses (§3.10).
 
 **The state update keeps one writer per slot.** A slot written by several
 positions in a chunk gets its new row computed once, at its first write entry,
@@ -291,11 +310,9 @@ later decision with its own measurement, not a refactor of this one.
 
 `init_state` hands out the initial table as a **broadcast view**, `(B, H, N,
 d_v)` over `(H, N, d_v)`: no stream costs a copy until its first write, which is
-the copy the successor rule makes anyway. The same copy happens once per
-*chunk* in training, as an out-of-place index write. That is bandwidth, not
-memory: the backward of an index read or an index write needs only the
-indices, so autograd retains the gathered rows and never a table per chunk —
-checked by measurement on the bare pattern, not just argued.
+the copy the successor rule makes anyway. A training pass makes it once, into
+a buffer it then writes in place (§3.11): nothing is copied per chunk, and
+autograd retains the gathered rows and never a table — held by a test.
 
 **Re-reads are out.** GDN's `reread(q', cache)` is cheap because the entering
 state per chunk is `d_k × d_v`. Here it is the table — `O((T/C)·N·d_v)` to
@@ -343,7 +360,14 @@ a layer needs one, and none has been compared by anyone:
   asked for yet.
 - `M₀` initialisation — zero (here) vs truncated normal (paper); `M₀` optimiser
   treatment (§3.5).
-- `chunk_size` — inert numerically; a speed-and-memory dial to be measured.
+- `chunk_size` — inert numerically; a speed-and-memory dial. Measured on one
+  machine, with the table in place (§3.11) and partners found by search
+  (§3.1), the default of 32 was fastest at every table size from 32² to 256²
+  (203–230 ms a step, against 242–270 at 64 and 289–339 at 16); memory grows
+  with it. Before the search it was 16. The optimum sits where a chunk's fixed
+  cost — launches, the Python loop — meets the pairwise terms' growth in `C`;
+  it has already moved once on one card, and a faster device shrinks the second
+  without the first, so it is not settled for others.
 
 ### 3.10 Every shape depends on the configuration, never on the data
 
@@ -367,9 +391,87 @@ and both refusals came from choices, not necessities:
   `(row, column)` pairs from two `topk`s). An override of `_address` inherits
   that obligation, and its docstring says so.
 
+Under a transform the kernel holds its table functionally — a new table per
+chunk — because the in-place arena's gradient travels by a side channel no
+transform can see (§3.11). The transformed forward pays the table copy per
+chunk that an untransformed one no longer does.
+
 Held by tests: a vmapped stack of SDM blocks equals the models run one at a
 time **exactly**, and two vmapped chunks with the table carried equal one
 vmapped pass.
+
+### 3.11 The table is written in place, and its gradient is carried by hand
+
+The recurrence costs `O((W+R)·d_v)` per position whatever `N` is. The first
+chunkwise path did not. It held the table as a value — each chunk's write
+returned a new one under plain autograd — and while the forward's copy per
+chunk was expected, the backward's cost was not: autograd's gradient for a
+gather is a table-sized buffer of zeros with rows added in, and for a replacing
+write a table-sized copy with rows zeroed, so every chunk's backward allocated
+three table-sized buffers and summed them. Measured on one machine (a Pascal
+card, fp32, `d_model = 512`, `B = 4`, `T = 1024`, 2 heads, `W = R = 64`),
+table-sized work was **36%** of a training step at `N = 128²` and **85%** at
+`N = 256²`. Training cost grew with `N`, which is the one thing this layer
+exists not to do.
+
+The chunkwise kernel now holds the table in an **arena**: one buffer, copied
+in once and written in place. Four `autograd.Function`s — start, gather,
+write, finish — are the only code that touches it. Everything between them —
+the pairwise terms, the solve, the new rows — is ordinary autograd, so no
+derivative of the recurrence is written by hand. What is written by hand are
+the two facts that define the table: a gather reads rows, and a write replaces
+them.
+
+The table's gradient is one buffer per backward, and it travels as the gradient
+of a chain of zero-storage *token* tensors: each Function takes the previous
+token and returns the next, so autograd's own dependency order runs their
+backwards in exactly the reverse of the forward. A chunk's backward touches
+only the rows the chunk touched. The write reads the gradient at its
+destinations — that is its new rows' gradient — and zeroes those rows, since a
+replaced row's old value reached nothing past the write. The gather adds the
+gathered rows' gradients back in. Each token is consumed exactly once, so the
+buffer passes by reference and is never summed, and a fresh backward starts a
+fresh buffer.
+
+Measured on the same machine, table-sized work fell to **0.7%** of a step at
+`N = 128²` and **1.6%** at `N = 256²`. Forward and backward, ms:
+
+| | `C = 8` | `C = 16` | `C = 32` | `C = 64` |
+|---|---|---|---|---|
+| `N = 32²` | 549 *(519)* | **296** *(321)* | 379 *(416)* | 612 *(644)* |
+| `N = 128²` | 519 *(1126)* | **303** *(720)* | 398 *(622)* | 632 *(752)* |
+| `N = 256²` | 616 *(3604)* | **311** *(1952)* | 407 *(1233)* | 642 *(1053)* |
+
+*(in italics: the functional holder, before)*. At `C = 16` a 64× larger table
+costs 5% more time. (These precede §3.1's partner search, which moved the
+fastest chunk size to 32; there, the same 64× costs 13%.) One cell moved the wrong way, by 6%: the smallest chunk at the smallest
+table, where there is no table cost to remove and 128 chunks each make four
+more calls.
+
+**The functional holder stays**, as `in_place=False`, for the two things an arena
+cannot do. It runs under a `torch.func` transform, where the arena's side
+channel is invisible, so under a transform it is chosen automatically (§3.10);
+the check is the one `torch.autograd.Function.apply` itself makes, which is
+private API, and the vmap tests are what would notice it moving. And it is
+differentiable twice: the arena's Functions are `once_differentiable`, so a
+second derivative through them is refused rather than wrong. The two holders
+agree bit for bit in the forward; their gradients differ only in the order a
+row's contributions are summed.
+
+**The functional holder lost one avoidable cost on the way.** Its write was
+`index_copy`, whose backward retains the whole source — every chunk's new rows
+— to read its shape; `scatter` is the same replacing write and retains only its
+index. At the defaults that source was a fifth of everything a training step
+kept, 512 of 2727 MiB. The arena never kept it.
+
+Held by tests: both holders pass every chunkwise value and gradient gate of §7
+on their own; the forward agrees bit for bit, recording or not; gradients agree
+to `1e-12` in fp64; the arena backpropagates twice (`retain_graph`) to
+identical gradients; the functional holder passes `gradgradcheck`, and the
+arena refuses a double backward; the caller's table is never written; neither
+holder retains anything table-sized; each chunk retains its gathered write rows
+exactly once — the gate that fails if `index_copy` returns; and a `Stack` with
+`recompute` reaches the same gradients through the arena.
 
 ---
 
@@ -470,7 +572,9 @@ Kernels in `lumen.sdm.reference`, not exported:
 - `sequential_sparse_delta` — the whole sequence one position at a time; **the
   oracle.** Written to be read.
 - `chunk_sparse_delta` — §3.1; what the layer runs. `check_writes=False` for
-  callers whose indices are distinct by construction (§3.10).
+  callers whose indices are distinct by construction (§3.10). `in_place`
+  chooses how the table is held (§3.11): in place by default, functionally under
+  a `torch.func` transform or when asked.
 - `read_sparse_delta` — one position, read-only; the decode step's readout.
 
 Kernel shapes: `memory (…, N, d_v)`, `write_idx / write_val / log_decay
@@ -512,8 +616,20 @@ Each of these is a standing test in `tests/test_sdm.py`.
     silently load into each other; state size is flat in generated length.
 11. **`vmap`** over stacked parameter sets equals the models run one at a time,
     exactly, and streams (§3.10).
-12. **On a device** (GPU-marked, run locally): chunkwise equals sequential, and
-    the forward is bit-identical across runs.
+12. **On a device** (GPU-marked, run locally): chunkwise equals sequential; the
+    forward is bit-identical across runs; the two holders agree; and the
+    backward is bit-identical across runs under
+    `torch.use_deterministic_algorithms`.
+13. **Partners by search equal partners by compare**, exactly, at chunk sizes 1
+    through 64, on layouts built to reach every extreme, and on a device
+    (§3.1).
+14. **The two holders** (§3.11) each pass 1–7 and 9 (8 is checked before a
+    holder is chosen); agree bit for bit in the
+    forward and to `1e-12` in their gradients; the arena backpropagates twice
+    and refuses a second derivative, which the functional holder supports; neither
+    writes the caller's table or retains anything table-sized; each chunk
+    retains its gathered write rows once; recompute through the arena is
+    exact.
 
 ---
 
@@ -526,6 +642,16 @@ Each of these is a standing test in `tests/test_sdm.py`.
 - **How `M₀` should be optimised** (§3.5): ordinary weight decay shrinks what
   the context has frozen.
 - **The untested defaults** of §3.9.
-- **Where the time goes** in the reference path, which decides whether the
-  two-pointer pair enumeration (§3.1) or an in-place decode (§3.6) earns its
-  place.
+- **Where the time goes now.** Measured on one machine at the defaults, a
+  training step is 221 ms against Gated DeltaNet's 42 at the same width.
+  Finding partners is about 15% of it and table-sized work 1%; the rest is
+  elementwise work on the pairwise terms, gathers and their backward, and
+  batched matmuls, in roughly that order. At small chunks the device waits on
+  the host — 57% busy at `C = 16`, `N = 256²` — so the next lever is fusing a
+  chunk's elementwise work, a compiled or custom kernel measured against this
+  one, not a new algorithm.
+- **An in-place decode** (§3.6). Measured on one machine, the successor copy is
+  most of a step once the table is large: at `B = 8`, 36 ms per step at
+  `N = 512²` against 0.2 ms for the same arithmetic in place, which also costs
+  0.2 ms at every smaller table. Whether that buys an opt-in `step_` against the
+  house's successor guarantee is an API decision, not an optimisation.

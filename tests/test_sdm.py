@@ -12,12 +12,16 @@ consistent with fp32 round-off, never the fp64 one.
 
 from __future__ import annotations
 
+import warnings
+
 import pytest
 import torch
 import torch.nn.functional as F
 
 from lumen.gdn.reference import chunk_gated_delta, sequential_gated_delta
 from lumen.sdm.reference import (
+    _partners,
+    _partners_dense,
     chunk_sparse_delta,
     read_sparse_delta,
     recurrent_sparse_delta,
@@ -38,6 +42,15 @@ KERNEL_ARGS = (
     "read_val",
 )
 DIFFERENTIABLE = ("memory", "write_val", "log_decay", "v", "beta", "read_val")
+
+# The two ways the chunkwise kernel can hold its table between chunks.  Every
+# gate the chunkwise path answers to, it answers to under both: the holders are
+# separate code, and "the other one passes" is not evidence for either.
+HOLDERS = ("in_place", "functional")
+
+
+def chunked(*kernel_args, holder: str, **kwargs):
+    return chunk_sparse_delta(*kernel_args, in_place=holder == "in_place", **kwargs)
 
 
 def make_inputs(
@@ -133,50 +146,127 @@ def test_the_fixture_exercises_shared_slots():
     assert bool((distinct < blocks.shape[-1]).all())
 
 
+# ── partners ──────────────────────────────────────────────────────────────
+
+
+def chunk_indices(
+    layout: str, *, rows: int = 3, chunk: int = 8, n_writes: int = 4, n_reads: int = 3,
+    seed: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """One chunk's `(P, C, W)` write and `(P, C, R)` read indices, flat as the
+    kernel sees them -- each row's slots offset by `p·N`.
+
+    ``collide``   a table one slot wider than a write set: nearly every slot is
+                  written at nearly every position.
+    ``same``      every position writes the same `W` slots, in its own order --
+                  every entry has a partner at every position.
+    ``disjoint``  no slot is written twice in the chunk.
+    ``miss``      reads confined to slots no position writes.
+    ``fixture``   the kernel fixture's proportions.
+    """
+    generator = torch.Generator().manual_seed(seed)
+
+    def distinct(n_slots: int, k: int, lo: int = 0) -> torch.Tensor:
+        return lo + torch.rand(rows, chunk, n_slots, generator=generator).argsort(-1)[..., :k]
+
+    if layout == "collide":
+        n_slots = n_writes + 1
+        w_idx, r_idx = distinct(n_slots, n_writes), distinct(n_slots, n_reads)
+    elif layout == "same":
+        n_slots = n_writes + n_reads
+        w_idx, r_idx = distinct(n_writes, n_writes), distinct(n_slots, n_reads)
+    elif layout == "disjoint":
+        n_slots = chunk * n_writes
+        w_idx = (torch.arange(chunk).view(1, chunk, 1) * n_writes
+                 + torch.arange(n_writes)).expand(rows, chunk, n_writes)
+        r_idx = distinct(n_slots, n_reads)
+    elif layout == "miss":
+        n_slots = 2 * n_writes + n_reads
+        w_idx, r_idx = distinct(n_writes + 1, n_writes), distinct(n_reads, n_reads, lo=n_slots - n_reads)
+    elif layout == "fixture":
+        n_slots = 24
+        w_idx, r_idx = distinct(n_slots, n_writes), distinct(n_slots, n_reads)
+    else:
+        raise ValueError(layout)
+    offset = (torch.arange(rows) * n_slots).view(rows, 1, 1)
+    return w_idx + offset, r_idx + offset
+
+
+@pytest.mark.parametrize("chunk", [1, 2, 5, 8, 64])
+@pytest.mark.parametrize("layout", ["collide", "same", "disjoint", "miss", "fixture"])
+def test_sorted_partners_are_the_dense_compare_exactly(layout, chunk):
+    """One sort and a binary search per cell, against the compare it replaced.
+
+    Exactly -- ``has`` and ``partner`` alike, including the value left where
+    there is no partner -- so everything downstream is the same arithmetic on
+    the same numbers, not merely close.
+    """
+    w_idx, r_idx = chunk_indices(layout, chunk=chunk)
+    for got, spec in zip(_partners(w_idx, r_idx), _partners_dense(w_idx, r_idx)):
+        assert got.dtype == spec.dtype
+        assert torch.equal(got, spec)
+
+
+def test_the_partner_layouts_mean_what_they_say():
+    """The adversarial layouts reach the extremes they are named for."""
+    w_has, _, r_has, _ = _partners(*chunk_indices("same"))
+    assert bool(w_has.all())
+    w_has, _, _, _ = _partners(*chunk_indices("disjoint"))
+    eye = torch.eye(8, dtype=torch.bool).view(1, 8, 1, 8)
+    assert torch.equal(w_has, eye.expand_as(w_has))  # only itself
+    _, _, r_has, _ = _partners(*chunk_indices("miss"))
+    assert not bool(r_has.any())
+
+
 # ── chunkwise against the oracle ──────────────────────────────────────────
 
 
+@pytest.mark.parametrize("holder", HOLDERS)
 @pytest.mark.parametrize("decay", ["write_set", "key"])
 @pytest.mark.parametrize("chunk", [1, 2, 5, 8, 16, 64])
-def test_chunkwise_matches_sequential_fp64(decay, chunk):
+def test_chunkwise_matches_sequential_fp64(decay, chunk, holder):
     inputs = make_inputs(decay=decay)
     y_ref, m_ref = sequential_sparse_delta(*args(inputs))
-    y, m = chunk_sparse_delta(*args(inputs), chunk_size=chunk)
+    y, m = chunked(*args(inputs), chunk_size=chunk, holder=holder)
     assert max_diff(y, y_ref) < EXACT
     assert max_diff(m, m_ref) < EXACT
 
 
-def test_chunkwise_matches_sequential_fp32():
+@pytest.mark.parametrize("holder", HOLDERS)
+def test_chunkwise_matches_sequential_fp32(holder):
     inputs = make_inputs(dtype=torch.float32)
     y_ref, m_ref = sequential_sparse_delta(*args(inputs))
-    y, m = chunk_sparse_delta(*args(inputs), chunk_size=8)
+    y, m = chunked(*args(inputs), chunk_size=8, holder=holder)
     assert max_diff(y, y_ref) < FP32
     assert max_diff(m, m_ref) < FP32
 
 
+@pytest.mark.parametrize("holder", HOLDERS)
 @pytest.mark.parametrize("chunk", [2, 3, 8, 16, 64])
-def test_chunk_size_is_inert(chunk):
+def test_chunk_size_is_inert(chunk, holder):
     inputs = make_inputs()
-    y_one, m_one = chunk_sparse_delta(*args(inputs), chunk_size=1)
-    y, m = chunk_sparse_delta(*args(inputs), chunk_size=chunk)
+    y_one, m_one = chunked(*args(inputs), chunk_size=1, holder=holder)
+    y, m = chunked(*args(inputs), chunk_size=chunk, holder=holder)
     assert max_diff(y, y_one) < EXACT
     assert max_diff(m, m_one) < EXACT
 
 
+@pytest.mark.parametrize("holder", HOLDERS)
 @pytest.mark.parametrize("seq_len", [1, 2, 7, 8, 9, 23])
-def test_any_sequence_length_works_and_is_exact(seq_len):
+def test_any_sequence_length_works_and_is_exact(seq_len, holder):
     inputs = make_inputs(seq_len=seq_len)
     y_ref, m_ref = sequential_sparse_delta(*args(inputs))
-    y, m = chunk_sparse_delta(*args(inputs), chunk_size=8)
+    y, m = chunked(*args(inputs), chunk_size=8, holder=holder)
     assert y.shape == y_ref.shape
     assert max_diff(y, y_ref) < EXACT
     assert max_diff(m, m_ref) < EXACT
 
 
+@pytest.mark.parametrize("holder", HOLDERS)
 @pytest.mark.parametrize("split", [5, 16, 29])
-def test_split_and_resume_equals_one_pass(split):
+def test_split_and_resume_equals_one_pass(split, holder):
     inputs = make_inputs()
-    y_one, m_one = chunk_sparse_delta(*args(inputs), chunk_size=8)
+    y_one, m_one = chunked(*args(inputs), chunk_size=8, holder=holder)
 
     def part(lo: int, hi: int | None) -> list[torch.Tensor]:
         return [
@@ -185,10 +275,10 @@ def test_split_and_resume_equals_one_pass(split):
         ]
 
     first = part(0, split)
-    y_a, carried = chunk_sparse_delta(*first, chunk_size=8)
+    y_a, carried = chunked(*first, chunk_size=8, holder=holder)
     second = part(split, None)
     second[0] = carried
-    y_b, m = chunk_sparse_delta(*second, chunk_size=8)
+    y_b, m = chunked(*second, chunk_size=8, holder=holder)
 
     assert max_diff(torch.cat([y_a, y_b], dim=2), y_one) < EXACT
     assert max_diff(m, m_one) < EXACT
@@ -216,7 +306,7 @@ def test_read_does_not_write():
 # ── the reduction to Gated DeltaNet ───────────────────────────────────────
 
 
-@pytest.mark.parametrize("path", ["sequential", "chunk"])
+@pytest.mark.parametrize("path", ["sequential", *HOLDERS])
 def test_every_slot_selected_is_gated_deltanet(path):
     """`N = d_k`, `W = R = N`, dense unit keys: Lumen's own GDN oracle.
 
@@ -252,7 +342,7 @@ def test_every_slot_selected_is_gated_deltanet(path):
     if path == "sequential":
         y, m = sequential_sparse_delta(*sdm)
     else:
-        y, m = chunk_sparse_delta(*sdm, chunk_size=8)
+        y, m = chunked(*sdm, chunk_size=8, holder=path)
 
     assert max_diff(y, y_gdn[:, 0, 0]) < EXACT
     assert max_diff(m, m_gdn[:, 0, 0]) < EXACT
@@ -264,7 +354,7 @@ def test_every_slot_selected_is_gated_deltanet(path):
 # ── properties claimed by construction ────────────────────────────────────
 
 
-@pytest.mark.parametrize("path", ["sequential", "chunk"])
+@pytest.mark.parametrize("path", ["sequential", *HOLDERS])
 def test_unwritten_slots_are_frozen_bit_for_bit(path):
     """A slot no position writes is the incoming slot, exactly — decay included.
 
@@ -279,15 +369,16 @@ def test_unwritten_slots_are_frozen_bit_for_bit(path):
     if path == "sequential":
         _, m = sequential_sparse_delta(*args(inputs))
     else:
-        _, m = chunk_sparse_delta(*args(inputs), chunk_size=8)
+        _, m = chunked(*args(inputs), chunk_size=8, holder=path)
     untouched = slice(0, n_slots // 2)
     assert torch.equal(m[..., untouched, :], inputs["memory"][..., untouched, :])
     # ...and the written half really was written, so the check means something.
     assert not torch.equal(m[..., n_slots // 2 :, :], inputs["memory"][..., n_slots // 2 :, :])
 
 
+@pytest.mark.parametrize("holder", HOLDERS)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
-def test_no_overflow_at_extreme_decay(dtype):
+def test_no_overflow_at_extreme_decay(dtype, holder):
     """Every write a full wipe: finite, and each slot holds exactly its last write.
 
     `log α = −1e4` underflows `α` to exactly 0 in both formats.  A factored
@@ -302,7 +393,7 @@ def test_no_overflow_at_extreme_decay(dtype):
     log_alpha = torch.full((batch, heads, seq_len), -1e4, dtype=dtype)
     inputs = make_inputs(dtype=dtype, log_alpha=log_alpha, seq_len=seq_len)
     y_ref, m_ref = sequential_sparse_delta(*args(inputs))
-    y, m = chunk_sparse_delta(*args(inputs), chunk_size=16)
+    y, m = chunked(*args(inputs), chunk_size=16, holder=holder)
     assert torch.isfinite(y).all() and torch.isfinite(m).all()
 
     bound = EXACT if dtype == torch.float64 else FP32
@@ -321,7 +412,8 @@ def test_no_overflow_at_extreme_decay(dtype):
     assert max_diff(m, expected) < bound
 
 
-def test_a_shared_initial_table_serves_the_batch():
+@pytest.mark.parametrize("holder", HOLDERS)
+def test_a_shared_initial_table_serves_the_batch(holder):
     """`memory` with fewer leading axes broadcasts, and its gradient is the sum.
 
     A learned initial table is `(H, N, d_v)` and serves every stream in the
@@ -334,8 +426,8 @@ def test_a_shared_initial_table_serves_the_batch():
     copied = shared.detach().expand_as(inputs["memory"]).clone().requires_grad_(True)
 
     rest = args(inputs)[1:]
-    y_shared, m_shared = chunk_sparse_delta(shared, *rest, chunk_size=8)
-    y_copied, m_copied = chunk_sparse_delta(copied, *rest, chunk_size=8)
+    y_shared, m_shared = chunked(shared, *rest, chunk_size=8, holder=holder)
+    y_copied, m_copied = chunked(copied, *rest, chunk_size=8, holder=holder)
     assert torch.equal(y_shared, y_copied)
     assert torch.equal(m_shared, m_copied)
 
@@ -347,8 +439,9 @@ def test_a_shared_initial_table_serves_the_batch():
 # ── gradients ─────────────────────────────────────────────────────────────
 
 
+@pytest.mark.parametrize("holder", HOLDERS)
 @pytest.mark.parametrize("decay", ["write_set", "key"])
-def test_gradients_match_the_oracle(decay):
+def test_gradients_match_the_oracle(decay, holder):
     """Every differentiable input, through outputs AND the final table."""
     inputs = make_inputs(decay=decay, seq_len=29)
     generator = torch.Generator().manual_seed(11)
@@ -365,12 +458,13 @@ def test_gradients_match_the_oracle(decay):
         return {name: leaves[name].grad for name in DIFFERENTIABLE}
 
     reference = grads(sequential_sparse_delta)
-    chunked = grads(lambda *a: chunk_sparse_delta(*a, chunk_size=8))
+    chunkwise = grads(lambda *a: chunked(*a, chunk_size=8, holder=holder))
     for name in DIFFERENTIABLE:
-        assert max_diff(chunked[name], reference[name]) < EXACT, name
+        assert max_diff(chunkwise[name], reference[name]) < EXACT, name
 
 
-def test_gradcheck_chunkwise():
+@pytest.mark.parametrize("holder", HOLDERS)
+def test_gradcheck_chunkwise(holder):
     inputs = make_inputs(
         batch=1, heads=2, seq_len=7, n_slots=9, n_writes=2, n_reads=2, d_v=3
     )
@@ -379,10 +473,221 @@ def test_gradcheck_chunkwise():
     def fn(*leaves: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         full = dict(inputs)
         full.update(zip(names, leaves))
-        return chunk_sparse_delta(*args(full), chunk_size=4)
+        return chunked(*args(full), chunk_size=4, holder=holder)
 
     leaves = tuple(inputs[name].detach().clone().requires_grad_(True) for name in names)
     assert torch.autograd.gradcheck(fn, leaves)
+
+
+# ── the two holders ───────────────────────────────────────────────────────
+#
+# The arena writes the table in place and carries its gradient by hand; the
+# functional holder is plain autograd.  What the arena claims, held here: the
+# same forward bit for bit, the same gradient up to summation order, a backward
+# that can be run again, and nothing retained that the functional one drops.
+
+
+def _saved_storages(fn) -> list[tuple[int, int]]:
+    """`(numel, nbytes)` of every storage autograd saves while ``fn`` runs, once each."""
+    seen: dict[int, tuple[int, int]] = {}
+
+    def pack(tensor: torch.Tensor) -> torch.Tensor:
+        storage = tensor.untyped_storage()
+        seen.setdefault(
+            storage.data_ptr(), (storage.nbytes() // tensor.element_size(), storage.nbytes())
+        )
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+        fn()
+    return list(seen.values())
+
+
+def _leaves(inputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    return {
+        name: inputs[name].detach().clone().requires_grad_(name in DIFFERENTIABLE)
+        for name in KERNEL_ARGS
+    }
+
+
+@pytest.mark.parametrize("recording", [True, False])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_the_holders_agree_bit_for_bit_in_the_forward(dtype, recording):
+    """Same arithmetic, different bookkeeping: the forward cannot tell them apart.
+
+    With autograd recording and without, from a shared initial table that the
+    arena copies in and the functional holder concatenates.
+    """
+    inputs = make_inputs(dtype=dtype, seq_len=45)
+    inputs["memory"] = inputs["memory"][0]  # (H, N, d_v), broadcast over the batch
+    results = {}
+    for holder in HOLDERS:
+        leaves = _leaves(inputs)
+        with torch.set_grad_enabled(recording):
+            results[holder] = chunked(
+                *(leaves[name] for name in KERNEL_ARGS), chunk_size=8, holder=holder
+            )
+    for a, b in zip(results["in_place"], results["functional"]):
+        assert torch.equal(a, b)
+
+
+def test_the_holders_gradients_differ_only_in_summation_order():
+    """A row's gradient is summed from the same terms by both; only the order moves."""
+    inputs = make_inputs(seq_len=45)
+    generator = torch.Generator().manual_seed(12)
+    probe_y = torch.randn(2, 2, 45, 5, generator=generator, dtype=torch.float64)
+    probe_m = torch.randn(2, 2, 24, 5, generator=generator, dtype=torch.float64)
+    grads = {}
+    for holder in HOLDERS:
+        leaves = _leaves(inputs)
+        y, m = chunked(*(leaves[name] for name in KERNEL_ARGS), chunk_size=8, holder=holder)
+        ((y * probe_y).sum() + (m * probe_m).sum()).backward()
+        grads[holder] = {name: leaves[name].grad for name in DIFFERENTIABLE}
+    for name in DIFFERENTIABLE:
+        assert max_diff(grads["in_place"][name], grads["functional"][name]) < 1e-12, name
+
+
+def test_the_arena_can_be_backpropagated_twice():
+    """``retain_graph``: each backward starts its own table gradient.
+
+    The gradient buffer is handed down the token chain and mutated as it goes,
+    so a second pass that inherited the first one's buffer would be silently
+    wrong rather than refused.
+    """
+    leaves = _leaves(make_inputs(seq_len=29))
+    y, m = chunked(*(leaves[name] for name in KERNEL_ARGS), chunk_size=8, holder="in_place")
+    loss = y.square().sum() + m.square().sum()
+    wrt = [leaves[name] for name in DIFFERENTIABLE]
+    first = torch.autograd.grad(loss, wrt, retain_graph=True)
+    second = torch.autograd.grad(loss, wrt)
+    for name, a, b in zip(DIFFERENTIABLE, first, second):
+        assert torch.equal(a, b), name
+
+
+def test_double_backward_is_the_functional_holders_and_refused_by_the_arena():
+    """Second order through the table: offered by one holder, refused -- not
+    wrong -- by the other."""
+    inputs = make_inputs(
+        batch=1, heads=1, seq_len=6, n_slots=6, n_writes=2, n_reads=2, d_v=2
+    )
+    names = ("memory", "v")
+
+    def fn(holder: str):
+        def run(*leaves: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            full = dict(inputs)
+            full.update(zip(names, leaves))
+            return chunked(*args(full), chunk_size=4, holder=holder)
+
+        return run
+
+    leaves = tuple(inputs[name].detach().clone().requires_grad_(True) for name in names)
+    assert torch.autograd.gradgradcheck(fn("functional"), leaves)
+
+    y, m = fn("in_place")(*leaves)
+    (grad,) = torch.autograd.grad(y.square().sum() + m.square().sum(), leaves[0], create_graph=True)
+    with pytest.raises(RuntimeError, match="differentiate twice"):
+        grad.sum().backward()
+
+
+@pytest.mark.parametrize("holder", HOLDERS)
+def test_the_callers_table_is_never_written(holder):
+    """The entering table is a caller's state -- forward and backward leave it be."""
+    inputs = make_inputs()
+    before = inputs["memory"].clone()
+    leaves = _leaves(inputs)
+    y, m = chunked(*(leaves[name] for name in KERNEL_ARGS), chunk_size=8, holder=holder)
+    (y.sum() + m.square().sum()).backward()
+    assert torch.equal(leaves["memory"], before)
+    assert m.untyped_storage().data_ptr() != leaves["memory"].untyped_storage().data_ptr()
+
+
+def test_under_a_transform_the_functional_holder_is_chosen():
+    """The default picks the holder ``torch.func`` can batch; forcing the arena
+    under one is refused with the reason, not with a transform's own error."""
+    inputs = make_inputs()
+    tables = torch.stack([inputs["memory"], inputs["memory"].flip(-2)])
+    rest = args(inputs)[1:]
+
+    def run(memory: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return chunk_sparse_delta(memory, *rest, chunk_size=8)
+
+    y, m = torch.func.vmap(run)(tables)
+    for index in range(2):
+        y_one, m_one = run(tables[index])
+        assert max_diff(y[index], y_one) < EXACT
+        assert max_diff(m[index], m_one) < EXACT
+
+    with pytest.raises(ValueError, match="torch.func transform"):
+        torch.func.vmap(
+            lambda memory: chunk_sparse_delta(memory, *rest, chunk_size=8, in_place=True)
+        )(tables)
+
+
+@pytest.mark.parametrize("holder", HOLDERS)
+def test_nothing_table_sized_is_kept_for_backward(holder):
+    """Autograd keeps gathered rows and pairwise terms -- never a table.
+
+    A table far larger than anything per-chunk, so a retained copy of it could
+    not hide among the rest.
+    """
+    inputs = make_inputs(n_slots=400)
+    leaves = _leaves(inputs)
+    table_bytes = leaves["memory"].nbytes
+
+    def run() -> None:
+        chunked(*(leaves[name] for name in KERNEL_ARGS), chunk_size=8, holder=holder)
+
+    largest = max(nbytes for _, nbytes in _saved_storages(run))
+    assert largest < table_bytes
+
+
+@pytest.mark.parametrize("holder", HOLDERS)
+def test_each_chunk_keeps_its_gathered_write_rows_once(holder):
+    """At the size of a chunk's write set, autograd keeps the gathered rows -- once.
+
+    `W != R`, so a storage of exactly the write set's size is either the rows
+    gathered at the write indices or the rows written back, which no backward
+    needs.  ``index_copy`` kept the latter -- a fifth of everything a training
+    step retained, measured at the defaults -- and this is what keeps it gone.
+    """
+    batch, heads, seq_len, chunk, n_writes, d_v = 2, 2, 48, 8, 4, 5
+    inputs = make_inputs(n_writes=n_writes, n_reads=3, seq_len=seq_len)
+    leaves = _leaves(inputs)
+    write_set = batch * heads * chunk * n_writes * d_v
+
+    def run() -> None:
+        chunked(*(leaves[name] for name in KERNEL_ARGS), chunk_size=chunk, holder=holder)
+
+    kept = [numel for numel, _ in _saved_storages(run) if numel == write_set]
+    assert len(kept) == seq_len // chunk
+
+
+def test_a_stack_recomputes_through_the_arena():
+    """Non-reentrant checkpointing replays the forward and must land on the same
+    gradients -- the arena's indices are saved where checkpointing can see them."""
+
+    def block(index: int) -> Block:
+        config = SparseDeltaMemoryConfig(
+            d_model=D_MODEL, n_heads=2, n_slots=16, initial_memory="learned",
+            n_writes=3, n_reads=4, chunk_size=4,
+        )
+        return Block(D_MODEL, SparseDeltaMemory(config), norm_eps=1e-5, d_mlp=48)
+
+    torch.manual_seed(0)
+    trunk = Stack(D_MODEL, 2, block, norm_eps=1e-5).double().train()
+    with torch.no_grad():
+        for b in trunk.blocks:
+            b.mixer.initial_memory.normal_()
+    x = sequence()
+
+    grads = {}
+    for recompute in (False, True):
+        trunk.recompute = recompute
+        trunk.zero_grad(set_to_none=True)
+        trunk(x).square().sum().backward()
+        grads[recompute] = {name: p.grad.clone() for name, p in trunk.named_parameters()}
+    for name in grads[False]:
+        assert torch.equal(grads[True][name], grads[False][name]), name
 
 
 # ── preconditions ─────────────────────────────────────────────────────────
@@ -793,6 +1098,76 @@ def test_the_chunkwise_forward_is_deterministic_on_cuda():
     second = chunk_sparse_delta(*args(inputs), chunk_size=8)
     assert torch.equal(first[0], second[0])
     assert torch.equal(first[1], second[1])
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("layout", ["collide", "same", "disjoint", "miss", "fixture"])
+def test_sorted_partners_are_the_dense_compare_on_cuda(layout):
+    """The device's sort and search, against the device's compare."""
+    w_idx, r_idx = (t.cuda() for t in chunk_indices(layout, chunk=16))
+    for got, spec in zip(_partners(w_idx, r_idx), _partners_dense(w_idx, r_idx)):
+        assert torch.equal(got, spec)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_the_holders_agree_on_cuda(dtype):
+    """Forward bit for bit; gradients to round-off -- on the device whose
+    ``index_add_`` reorders its sums from run to run."""
+    inputs = {
+        name: tensor.cuda()
+        for name, tensor in make_inputs(dtype=dtype, seq_len=61).items()
+    }
+    results, grads = {}, {}
+    for holder in HOLDERS:
+        leaves = _leaves(inputs)
+        y, m = chunked(*(leaves[name] for name in KERNEL_ARGS), chunk_size=8, holder=holder)
+        (y.square().sum() + m.square().sum()).backward()
+        results[holder] = (y.detach(), m.detach())
+        grads[holder] = [leaves[name].grad for name in DIFFERENTIABLE]
+    for a, b in zip(results["in_place"], results["functional"]):
+        assert torch.equal(a, b)
+    bound = EXACT if dtype == torch.float64 else FP32
+    for name, a, b in zip(DIFFERENTIABLE, grads["in_place"], grads["functional"]):
+        assert max_diff(a, b) < bound, name
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("holder", HOLDERS)
+def test_the_backward_is_reproducible_on_cuda_when_asked(holder):
+    """A gather's backward is a scatter-add into repeated rows, so by default its
+    sums reorder run to run.  Under ``torch.use_deterministic_algorithms`` they
+    do not -- the claim the module docstring makes, held on the device.
+
+    ``warn_only``: cuBLAS asks for a workspace setting that must be in the
+    environment before it initialises, which a test cannot arrange; the
+    matmuls here reproduce without it, and the equality below is the check.
+    """
+    inputs = {
+        name: tensor.cuda()
+        for name, tensor in make_inputs(dtype=torch.float32, seq_len=61).items()
+    }
+
+    def grads() -> list[torch.Tensor]:
+        leaves = _leaves(inputs)
+        y, m = chunked(*(leaves[name] for name in KERNEL_ARGS), chunk_size=8, holder=holder)
+        (y.square().sum() + m.square().sum()).backward()
+        return [leaves[name].grad for name in DIFFERENTIABLE]
+
+    was = torch.are_deterministic_algorithms_enabled()
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            runs = [grads() for _ in range(3)]
+    finally:
+        torch.use_deterministic_algorithms(was)
+    for run in runs[1:]:
+        for name, a, b in zip(DIFFERENTIABLE, runs[0], run):
+            assert torch.equal(a, b), name
 
 
 @pytest.mark.gpu

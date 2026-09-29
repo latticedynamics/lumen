@@ -96,8 +96,12 @@ definition rather than a seventeenth model — all the weights come from `params
 **Every mixer runs under it**, and for the sparse delta memory that was a design
 constraint rather than a given: its chunkwise kernel keeps every shape a
 function of the configuration, never of the data, because a boolean selection
-or a value read back to the host is something `vmap` refuses. A learned initial
-table is a parameter like any other, so it is stacked per set with the rest.
+or a value read back to the host is something `vmap` refuses. Under a
+transform it also holds its table functionally, a new one per chunk, since the
+in-place path's gradient bookkeeping is invisible to `torch.func` — chosen
+automatically, same outputs, and a cost that grows with the table. A learned
+initial table is a parameter like any other, so it is stacked per set with the
+rest.
 
 ## Checking what registered
 
