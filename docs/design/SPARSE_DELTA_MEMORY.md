@@ -553,7 +553,8 @@ Held by tests: the grouping is inert (one chunk per group, uneven groups, all at
 once) under both holders; recomputing gives the same outputs and gradients bit
 for bit, on the host and on a device under deterministic algorithms, keeps one
 pairwise array per group where the plain path keeps many, and nests under
-`Stack.recompute`; under a `torch.func` transform it is refused.
+`Stack.recompute`; under a `torch.func` transform it is refused while gradients
+are enabled, and ignored without them, when there is nothing to rebuild.
 
 ---
 
@@ -728,11 +729,13 @@ Each of these is a standing test in `tests/test_sdm.py`.
     `torch.use_deterministic_algorithms`; of everything pairwise-sized, it
     keeps exactly one array per group — the carry — where the plain path keeps
     many; it nests under `Stack.recompute` to the same gradients; under a
-    `torch.func` transform it is refused. The layer's dial is off by default
-    and outside the `state_dict`, and reaches the kernel only while training:
-    on, a training layer keeps less; an evaluating one keeps exactly what it
-    would with the dial off, and still runs under `vmap` over stacked parameter
-    sets.
+    `torch.func` transform it is refused while gradients are enabled
+    (`torch.func.grad` included, whatever surrounds it) and without them is
+    the plain path. The layer's dial is off by default and outside the
+    `state_dict`, and reaches the kernel only while training: on, a training
+    layer keeps less; an evaluating one keeps exactly what it would with the
+    dial off, and still runs under `vmap` over stacked parameter sets, as a
+    training one does without gradients.
 
 ---
 

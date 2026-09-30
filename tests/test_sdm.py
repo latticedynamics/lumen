@@ -650,6 +650,28 @@ def test_recompute_is_refused_under_a_transform():
         )(tables)
 
 
+def test_without_gradients_recompute_is_no_reason_to_refuse():
+    """Without gradients the dial has nothing to rebuild, so a no-grad pass
+    under ``vmap`` -- parameter sets evaluated at once -- runs, and is the plain
+    path.  The boundary is grad mode *inside* the transform: ``torch.func.grad``
+    turns gradients on whatever surrounds it, so it is still refused."""
+    inputs = make_inputs()
+    tables = torch.stack([inputs["memory"], inputs["memory"].flip(-2)])
+    rest = args(inputs)[1:]
+
+    def run(recompute: bool):
+        return lambda memory: chunk_sparse_delta(
+            memory, *rest, chunk_size=8, recompute_pairwise=recompute
+        )
+
+    with torch.no_grad():
+        y, m = torch.func.vmap(run(True))(tables)
+        y_plain, m_plain = torch.func.vmap(run(False))(tables)
+        with pytest.raises(ValueError, match="recompute_pairwise"):
+            torch.func.grad(lambda memory: run(True)(memory)[0].sum())(inputs["memory"])
+    assert torch.equal(y, y_plain) and torch.equal(m, m_plain)
+
+
 @pytest.mark.parametrize("holder", HOLDERS)
 def test_nothing_table_sized_is_kept_for_backward(holder):
     """Autograd keeps gathered rows and pairwise terms -- never a table.
@@ -1126,10 +1148,12 @@ def test_the_layer_rebuilds_its_pairwise_terms_only_while_training():
 
 
 def test_a_layer_trained_with_the_dial_on_still_serves_under_a_transform():
-    """Recomputation is refused under ``torch.func`` (§3.12), so the dial must
-    not follow a layer out of training.  Switched to eval, a layer that trained
-    with it on runs under ``vmap`` over stacked parameter sets and agrees with
-    each set run alone; left in training, it is refused, by name.
+    """Recomputation is refused under ``torch.func`` with gradients on (§3.12),
+    so the dial must not follow a layer out of training.  Switched to eval, a
+    layer that trained with it on runs under ``vmap`` over stacked parameter
+    sets and agrees with each set run alone.  Left in training, it is refused,
+    by name -- unless gradients are off, where the dial has nothing to do and
+    the layer runs as well.
 
     Distinct parameter sets, so a transform that broadcast one set across the
     others could not pass.
@@ -1146,11 +1170,15 @@ def test_a_layer_trained_with_the_dial_on_still_serves_under_a_transform():
     base.train()
     with pytest.raises(ValueError, match="recompute_pairwise"):
         torch.func.vmap(run)(params, buffers)
+    with torch.no_grad():
+        in_training = torch.func.vmap(run)(params, buffers)
 
     base.eval()
     batched = torch.func.vmap(run)(params, buffers)
-    for model, y in zip(models, batched):
-        torch.testing.assert_close(y, model(x), rtol=0, atol=1e-12)
+    for model, y, y_training in zip(models, batched, in_training):
+        expected = model(x)
+        torch.testing.assert_close(y, expected, rtol=0, atol=1e-12)
+        torch.testing.assert_close(y_training, expected, rtol=0, atol=1e-12)
 
 
 def test_zero_and_learned_checkpoints_do_not_silently_mix():

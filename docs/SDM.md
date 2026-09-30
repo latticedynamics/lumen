@@ -206,7 +206,8 @@ pairwise array (the carry), and gives the same gradients bit for bit. Measured
 on one machine, a 32K-position row at `d_model = 128` kept 3.5 GiB instead of
 10.8 at `chunk_size = 32`, at 6% more time. At the `d_model = 512` defaults it
 made a step 23% slower and its peak memory 39% smaller (design record §3.12). It is off by
-default, and it is refused under a `torch.func` transform. For long sequences
+default. Under a `torch.func` transform it is refused while gradients are
+enabled, and ignored without them, when it has nothing to do. For long sequences
 in a deep model, `Stack.recompute = True` also keeps only one block's
 intermediates at a time; the two nest.
 

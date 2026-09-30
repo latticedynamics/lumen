@@ -812,9 +812,10 @@ def chunk_sparse_delta(
             reaches them.  One more batched forward of those terms per group,
             for memory that no longer grows with `C` beyond one array, the
             carry.  The gradients are the same bit for bit: the rebuild is the
-            same arithmetic on the same inputs.  Not available under a
-            ``torch.func`` transform, which refuses the saved-tensor hooks it
-            is built on.
+            same arithmetic on the same inputs.  Without gradients it has
+            nothing to do and is ignored.  With them, it is not available under
+            a ``torch.func`` transform, which refuses the saved-tensor hooks it
+            is built on; ``torch.func.grad`` always enables them.
 
     Returns:
         `(…, T, d_v)` outputs and the `(…, N, d_v)` final table.  Rows no
@@ -823,8 +824,8 @@ def chunk_sparse_delta(
     Raises:
         ValueError: on inconsistent shapes, a position that writes one slot
             twice (see :func:`_check_distinct_writes`), a ``group`` below one,
-            or ``in_place=True`` or ``recompute_pairwise=True`` under a
-            ``torch.func`` transform.
+            ``in_place=True`` under a ``torch.func`` transform, or
+            ``recompute_pairwise=True`` under one with gradients enabled.
     """
     if chunk_size < 1:
         raise ValueError(f"chunk_size must be >= 1, got {chunk_size}")
@@ -839,10 +840,16 @@ def chunk_sparse_delta(
             "gradient travels outside what the transform can see. Use "
             "in_place=False, or None to choose automatically."
         )
+    # Without gradients there is nothing to rebuild, so the dial is dropped
+    # BEFORE the transform check: a no-grad pass under vmap (parameter sets
+    # evaluated at once) has no reason to be refused.  torch.func.grad turns
+    # gradients on inside itself whatever surrounds it, so it is still refused.
+    recompute_pairwise = recompute_pairwise and torch.is_grad_enabled()
     if recompute_pairwise and transformed:
         raise ValueError(
-            "recompute_pairwise=True cannot run under a torch.func transform: "
-            "recomputation is built on saved-tensor hooks, which transforms refuse."
+            "recompute_pairwise=True cannot run under a torch.func transform with "
+            "gradients enabled: recomputation is built on saved-tensor hooks, which "
+            "transforms refuse."
         )
     _check_shapes(memory, write_idx, write_val, log_decay, v, beta, read_idx, read_val)
     if check_writes:
@@ -900,7 +907,6 @@ def chunk_sparse_delta(
     padded_len = write_idx.shape[1]
     if group is None:
         group = _group_size(rows, chunk_size, max(n_writes, n_reads))
-    recompute_pairwise = recompute_pairwise and torch.is_grad_enabled()
 
     # split and unbind, NOT x[:, lo:hi] inside the loop: slicing a tensor in a
     # loop makes autograd accumulate into a full-size zero buffer once per
