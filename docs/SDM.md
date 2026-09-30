@@ -123,7 +123,7 @@ output, and every slot of the final table, is what it would have been.
 | `key_norm` | `"softmax"` | how the selected scores become weights. `"l2"` normalises them to a unit vector instead — the delta rule at full strength, and the experiment for whether this layer is a delta rule at all (design record §4.2) |
 | `decay_weighting` | `"write_set"` | every written slot decays by the full `α`. `"key"` scales each slot's decay by its write weight, removing the jump at the top-`W` boundary; untested, and refused with `key_norm="l2"` |
 | `beta_max` | 2.0 | write-strength ceiling. The paper's is 1; past 2 is refused, because the chunkwise solve stops being stable there |
-| `chunk_size` | 32 | numerically inert, and a speed and memory dial: training keeps `O(T · chunk_size · (W+R))` per sequence. Measured on one machine, 32 was fastest at every table size; smaller chunks use less memory. Where the optimum sits depends on the device (design record §3.9) |
+| `chunk_size` | 32 | numerically inert, and a speed and memory dial: training keeps `O(T · chunk_size · (W+R))` per sequence unless the pairwise terms are recomputed (below). The default is not a measured optimum: on one machine, 16 was fastest at `d_model = 512`, and on a narrow layer the best value depended on how many sequences shared a batch. It depends on the device too (design record §3.9); worth measuring for yours |
 | `norm_eps`, `dropout` | 1e-5, 0.0 | as in Gated DeltaNet |
 
 ## Optimising a learned table
@@ -173,7 +173,7 @@ Reuse is by subclassing. Four methods are the seams:
 |---|---|
 | `_address` | change how slots are selected and weighted |
 | `_features` | change anything else the kernel takes: values, write strength, decay |
-| `_scan` | swap in a different kernel — or call this one with `in_place=False` to differentiate twice |
+| `_scan` | swap in a different kernel — or call this one with `in_place=False` to differentiate twice. It passes `recompute_pairwise` on while training; an override should too |
 | `_out` | change the output path |
 
 **An override of `_address` must keep write indices distinct within each
@@ -192,8 +192,24 @@ has no atomics, so it is deterministic on a GPU without asking.
 Training memory has two terms beyond the table itself: the rows each chunk
 gathers, `O(T · (W+R) · d_v)` per head, and the pairwise terms,
 `O(T · chunk_size · (W+R))`. The table is not among them: training writes it in
-place and never retains it. For long sequences, `Stack.recompute = True` trades
-a second forward for the first.
+place and never retains it.
+
+On a narrow layer the pairwise terms are most of it, and they can be rebuilt
+instead of kept:
+
+```python
+mixer.recompute_pairwise = True   # a memory dial: not in the state_dict
+```
+
+The backward then rebuilds them a group of chunks at a time, keeping one
+pairwise array (the carry), and gives the same gradients bit for bit. Measured
+on one machine, a 32K-position row at `d_model = 128` kept 3.5 GiB instead of
+10.8 at `chunk_size = 32`, at 6% more time. At the `d_model = 512` defaults it
+made a step 23% slower and its peak memory 39% smaller (design record §3.12). It is off by
+default. Under a `torch.func` transform it is refused while gradients are
+enabled, and ignored without them, when it has nothing to do. For long sequences
+in a deep model, `Stack.recompute = True` also keeps only one block's
+intermediates at a time; the two nest.
 
 The backward adds each gathered row's gradient back into the table's with a
 scatter-add, so on a GPU its sums can reorder from run to run. Under

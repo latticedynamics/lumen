@@ -1,8 +1,10 @@
 # Sparse Delta Memory — design record
 
 **Status:** landed in 0.6.0, as `lumen.sdm`; in 0.6.1 the table is written in
-place (§3.11) and partners are found by search (§3.1). The implementation is
-expected to match this record; where the two disagree, one of them is a bug.
+place (§3.11) and partners are found by search (§3.1); in 0.6.2 only the
+table-touching work stays in the chunk loop, and the pairwise terms can be
+recomputed (§3.12). The implementation is expected to match this record; where
+the two disagree, one of them is a bug.
 
 Unlike Gated DeltaNet and Undertow, this is **not a consolidation.** No
 existing implementation was merged, so there is no port to verify and no
@@ -360,14 +362,21 @@ a layer needs one, and none has been compared by anyone:
   asked for yet.
 - `M₀` initialisation — zero (here) vs truncated normal (paper); `M₀` optimiser
   treatment (§3.5).
-- `chunk_size` — inert numerically; a speed-and-memory dial. Measured on one
-  machine, with the table in place (§3.11) and partners found by search
-  (§3.1), the default of 32 was fastest at every table size from 32² to 256²
-  (203–230 ms a step, against 242–270 at 64 and 289–339 at 16); memory grows
-  with it. Before the search it was 16. The optimum sits where a chunk's fixed
-  cost — launches, the Python loop — meets the pairwise terms' growth in `C`;
-  it has already moved once on one card, and a faster device shrinks the second
-  without the first, so it is not settled for others.
+- `chunk_size` — inert numerically; a speed-and-memory dial, and the default of
+  32 is not a measured optimum. The optimum sits where a chunk's fixed cost —
+  launches, the Python loop — meets the pairwise terms' growth in `C`, and it
+  has moved with every change to the kernel. Measured on one machine:
+  - at `d_model = 512` (`B = 4`, `T = 1024`), 16 was fastest before the
+    partner search (§3.1), 32 after it (203–230 ms a step at every table size
+    from 32² to 256²), and 16 again once the table-free work left the loop
+    (§3.12): 172 ms, against 204 at 32 and 256 at 64;
+  - at `d_model = 128` on 32K rows (§3.12), it depends on how many rows share a
+    micro-batch: one row runs fastest at 32–64, four with the pairwise terms
+    recomputed at 16.
+
+  Memory grows with `C` unless the pairwise terms are recomputed. A faster
+  device shrinks the pairwise cost without the fixed one, so none of this is
+  settled for others.
 
 ### 3.10 Every shape depends on the configuration, never on the data
 
@@ -473,6 +482,80 @@ holder retains anything table-sized; each chunk retains its gathered write rows
 exactly once — the gate that fails if `index_copy` returns; and a `Stack` with
 `recompute` reaches the same gradients through the arena.
 
+### 3.12 Only the table is sequential
+
+Most of what a chunk computes depends on nothing another chunk wrote: its
+partners (§3.1), the cumulative decays, the pairwise matrices `A` and `QK`, the
+solve `(I + diag(β) A)⁻¹`, each write's decay to the chunk's end, and the carry
+of each position's `δ` into each written slot. Only the rows it gathers from the
+table do, and with them the retrieval, the read, `δ`, the output and the new
+rows. Gated DeltaNet's reference is built on that split already: everything
+state-free is computed for all chunks at once, and the loop over chunks is one
+matmul each.
+
+The first chunkwise path ran all of a chunk inside the loop. On a wide layer
+the device was busy regardless and it did not show; on a narrow one it was the
+whole cost. Measured on one machine (a Pascal card, fp32; `d_model = 128`,
+2 heads, `N = 128²`, `W = R = 64`, rows of 32,768 positions), a chunk's forward
+and backward cost 4.7–4.8 ms **whatever its size**: at every `C` from 8 to 64,
+for one row or two, and at `W = R` from 16 to 64. The step was the number of
+chunks times the fixed cost of issuing a chunk's operations from Python —
+hundreds of operator calls each. A Gated DeltaNet block of the same width
+takes 0.10 s for a whole row.
+
+The kernel now computes the table-free terms for a **group** of consecutive
+chunks at once, batched (`_chunk_terms`), then walks the group one chunk at a
+time doing only what needs the table (`_chunk_apply`), about a dozen
+operations. A group is as many chunks as keep one pairwise array,
+`(chunks·P, C, max(W, R), C)`, within 2²³ cells: unbounded, a forward-only pass
+over a long sequence would hold every chunk's pairwise terms at once, where the
+loop held one. The number depends on the configuration alone (§3.10), and the
+grouping is numerically inert. It is the same arithmetic, reorganised: measured
+against the kernel before it, outputs and gradients agree bit for bit on the
+host in fp32 and fp64, and on a device under deterministic algorithms (without
+them, by less than the old kernel's own run-to-run spread). The budget trades
+launches against a transient:
+a forward-only pass holds one group's pairwise terms at once. Measured, 2²⁰
+cells gives back the loop's forward-only peak at the configuration of §3.11
+(336 MiB, against 795 at 2²³) and costs 5% of that step and 20–35% of the
+narrow layer's below; each doubling to 2²³ narrows the gap. 2²³ is the default,
+and the transient it buys does not grow with `T`.
+
+**Recomputing the pairwise terms.** The table-free terms are also most of what
+the backward keeps, `O(T·C·(W+R))` per sequence against the gathered rows'
+`O(T·(W+R)·d_v)`; on the narrow layer above, about 8 of the 10.8 GiB one row
+keeps at `C = 32`. With `recompute_pairwise` on — a kernel argument, and a
+layer attribute off by default, like `Stack.recompute` — the backward keeps
+only what the table-touching steps need, and rebuilds a group's terms, batched,
+when it reaches them. Of the pairwise arrays one stays, the carry, which the
+new rows' step consumes. Because the rebuild is issued once per group, it costs
+little: a first prototype that checkpointed each chunk instead doubled the
+per-chunk cost.
+
+Same machine and configuration, forward and backward per micro-batch:
+
+| | one row, before | one row | one row, recomputed | four rows, recomputed |
+|---|---|---|---|---|
+| `C = 8` | 19.7 s · 4.7 GiB | 7.5 s · 4.7 GiB | — | — |
+| `C = 16` | 9.8 s · 6.7 GiB | 3.5 s · 6.8 GiB | 3.5 s · 3.1 GiB | **4.4 s** · 11.4 GiB |
+| `C = 32` | 4.9 s · 10.8 GiB | **1.8 s** · 10.8 GiB | 1.9 s · 3.5 GiB | 5.8 s · 12.6 GiB |
+| `C = 64` | 2.4 s · 18.9 GiB | 1.7 s · 19.0 GiB | 2.3 s · 4.1 GiB | 8.5 s · 14.7 GiB |
+| `C = 128` | out of memory | out of memory | 3.9 s · 5.1 GiB | 15.1 s · 18.9 GiB |
+
+(peak memory for the layer alone.) Without the pairwise terms to keep, four rows
+fit where at most two did, and the table's size still does not matter: from
+`N = 64²` to `512²`, four rows at `C = 64` take 8.5–8.6 s. After the change the
+device is busy about three quarters of the time at one row, `C = 32`; at four
+rows it is busy throughout, on elementwise work over the pairwise arrays — which
+is where §8's next lever is aimed.
+
+Held by tests: the grouping is inert (one chunk per group, uneven groups, all at
+once) under both holders; recomputing gives the same outputs and gradients bit
+for bit, on the host and on a device under deterministic algorithms, keeps one
+pairwise array per group where the plain path keeps many, and nests under
+`Stack.recompute`; under a `torch.func` transform it is refused while gradients
+are enabled, and ignored without them, when there is nothing to rebuild.
+
 ---
 
 ## 4. What the paper's evidence supports
@@ -566,6 +649,11 @@ for subclassing, named for their purpose as in GDN: `_address` (product keys),
 `_features` (everything the kernel takes), `_scan` (the kernel), `_out`.
 Exported from `lumen` and `lumen.sdm`; the state is a registered pytree.
 
+`recompute_pairwise`, an attribute defaulting to `False`, is a memory dial
+(§3.12) for the reason `Stack.recompute` is one: not part of the function, not
+in the `state_dict`, and the same weights may be trained with it on and served
+with it off. `_scan` passes it to the kernel while training.
+
 Kernels in `lumen.sdm.reference`, not exported:
 
 - `recurrent_sparse_delta` — one position; the decode step.
@@ -574,7 +662,10 @@ Kernels in `lumen.sdm.reference`, not exported:
 - `chunk_sparse_delta` — §3.1; what the layer runs. `check_writes=False` for
   callers whose indices are distinct by construction (§3.10). `in_place`
   chooses how the table is held (§3.11): in place by default, functionally under
-  a `torch.func` transform or when asked.
+  a `torch.func` transform or when asked. `group` sets how many chunks have
+  their table-free terms computed together, sized by a budget when left out;
+  `recompute_pairwise` rebuilds those terms in the backward instead of keeping
+  them (§3.12).
 - `read_sparse_delta` — one position, read-only; the decode step's readout.
 
 Kernel shapes: `memory (…, N, d_v)`, `write_idx / write_val / log_decay
@@ -630,6 +721,21 @@ Each of these is a standing test in `tests/test_sdm.py`.
     writes the caller's table or retains anything table-sized; each chunk
     retains its gathered write rows once; recompute through the arena is
     exact.
+15. **Grouping is inert** (§3.12): one chunk per group, uneven groups and all
+    chunks at once agree to `1e-9` in fp64, under both holders; a group below
+    one is refused.
+16. **Recomputing the pairwise terms** (§3.12) gives outputs and gradients
+    equal bit for bit, under both holders, on the host and on a device under
+    `torch.use_deterministic_algorithms`; of everything pairwise-sized, it
+    keeps exactly one array per group — the carry — where the plain path keeps
+    many; it nests under `Stack.recompute` to the same gradients; under a
+    `torch.func` transform it is refused while gradients are enabled
+    (`torch.func.grad` included, whatever surrounds it) and without them is
+    the plain path. The layer's dial is off by default and outside the
+    `state_dict`, and reaches the kernel only while training: on, a training
+    layer keeps less; an evaluating one keeps exactly what it would with the
+    dial off, and still runs under `vmap` over stacked parameter sets, as a
+    training one does without gradients.
 
 ---
 
@@ -642,14 +748,19 @@ Each of these is a standing test in `tests/test_sdm.py`.
 - **How `M₀` should be optimised** (§3.5): ordinary weight decay shrinks what
   the context has frozen.
 - **The untested defaults** of §3.9.
-- **Where the time goes now.** Measured on one machine at the defaults, a
-  training step is 221 ms against Gated DeltaNet's 42 at the same width.
-  Finding partners is about 15% of it and table-sized work 1%; the rest is
-  elementwise work on the pairwise terms, gathers and their backward, and
-  batched matmuls, in roughly that order. At small chunks the device waits on
-  the host — 57% busy at `C = 16`, `N = 256²` — so the next lever is fusing a
-  chunk's elementwise work, a compiled or custom kernel measured against this
-  one, not a new algorithm.
+- **Where the time goes now.** Measured on one machine at the defaults
+  (`d_model = 512`), a training step is 204 ms against Gated DeltaNet's 42 at
+  the same width, and 172 ms at `C = 16`. The device is busy throughout, at
+  every chunk size profiled: a step takes the same time with a profiler
+  attached as without. About half of it is elementwise work over the pairwise
+  arrays; a fifth is gathers, index writes and their backward; a fifth is
+  batched matmuls; table-sized work is under 2%. So the next lever is fusing
+  the pairwise work — a compiled or custom kernel, measured against this one,
+  that keeps those arrays in registers instead of passing each through memory
+  — not a new algorithm. On a narrow layer with few slots per position the
+  host still sets the pace: at `d_model = 128` and `W = R = 16`, a micro-batch
+  of 32K rows costs about 1.8 ms a chunk whether it holds one row or four,
+  which is the cost of issuing the loop's table-touching operations.
 - **An in-place decode** (§3.6). Measured on one machine, the successor copy is
   most of a step once the table is large: at `B = 8`, 36 ms per step at
   `N = 512²` against 0.2 ms for the same arithmetic in place, which also costs

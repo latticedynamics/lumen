@@ -263,6 +263,14 @@ class SparseDeltaMemory(nn.Module):
         nn.init.constant_(self.a_proj.bias, -3.0)
         nn.init.zeros_(self.b_proj.bias)
 
+        #: Rebuild the kernel's pairwise terms in the backward rather than keep
+        #: them, while training: a memory dial, not part of the function, and
+        #: an attribute for the reason ``Stack.recompute`` is one -- it is not
+        #: in the ``state_dict`` and draws nothing.  Those terms are what grows
+        #: with ``chunk_size``; with this on, what a training step keeps is the
+        #: gathered rows and one pairwise array.  See ``chunk_sparse_delta``.
+        self.recompute_pairwise = False
+
     # ── seams ─────────────────────────────────────────────────────────────
 
     def _address(
@@ -354,9 +362,15 @@ class SparseDeltaMemory(nn.Module):
         ``torch.func``.  How the table is held is the kernel's default: in
         place, or functionally under a ``torch.func`` transform.  Pass
         ``in_place=False`` from an override to differentiate twice.
+        :attr:`recompute_pairwise` is honoured here, so an override should
+        pass it on.
         """
         return chunk_sparse_delta(
-            memory, *features, chunk_size=self.config.chunk_size, check_writes=False
+            memory,
+            *features,
+            chunk_size=self.config.chunk_size,
+            check_writes=False,
+            recompute_pairwise=self.recompute_pairwise and self.training,
         )
 
     def _out(self, o: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
