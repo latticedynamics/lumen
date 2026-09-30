@@ -1084,22 +1084,73 @@ def test_backward_reaches_every_parameter_including_an_empty_table():
 
 
 def test_the_layer_rebuilds_its_pairwise_terms_only_when_asked():
-    """A memory dial: off by default, not in the ``state_dict``, and invisible
-    in what the layer computes.  (Several groups at once are the kernel's
-    gates; this is the layer passing the dial down.)"""
+    """A memory dial: off by default, not in the ``state_dict``, invisible in
+    what the layer computes, and visible in what it keeps.  (Exactly what is
+    kept, and several groups at once, are the kernel's gates; this is the layer
+    passing the dial down.  Equal gradients alone would pass on a layer that
+    ignored it.)"""
     layer = make_layer("learned").train()
     assert layer.recompute_pairwise is False
     keys = set(layer.state_dict())
     x = sequence(seq_len=45)
-    grads = {}
+    grads, kept = {}, {}
     for on in (False, True):
         layer.recompute_pairwise = on
         layer.zero_grad(set_to_none=True)
-        layer(x).square().sum().backward()
+        out: dict[str, torch.Tensor] = {}
+        kept[on] = sum(
+            nbytes for _, nbytes in _saved_storages(lambda: out.update(y=layer(x)))
+        )
+        out["y"].square().sum().backward()
         grads[on] = {name: p.grad.clone() for name, p in layer.named_parameters()}
     assert set(layer.state_dict()) == keys
     for name in grads[False]:
         assert torch.equal(grads[True][name], grads[False][name]), name
+    assert kept[True] < kept[False]
+
+
+def test_the_layer_rebuilds_its_pairwise_terms_only_while_training():
+    """The dial is for training.  Outside it -- an evaluation that still wants
+    gradients, say -- the layer keeps exactly what it keeps with the dial off,
+    and computes the same thing."""
+    layer = make_layer("learned").eval()
+    x = sequence(seq_len=45)
+    ys, kept = {}, {}
+    for on in (False, True):
+        layer.recompute_pairwise = on
+        out: dict[str, torch.Tensor] = {}
+        kept[on] = sorted(_saved_storages(lambda: out.update(y=layer(x))))
+        ys[on] = out["y"]
+    assert kept[True] == kept[False]
+    assert torch.equal(ys[True], ys[False])
+
+
+def test_a_layer_trained_with_the_dial_on_still_serves_under_a_transform():
+    """Recomputation is refused under ``torch.func`` (§3.12), so the dial must
+    not follow a layer out of training.  Switched to eval, a layer that trained
+    with it on runs under ``vmap`` over stacked parameter sets and agrees with
+    each set run alone; left in training, it is refused, by name.
+
+    Distinct parameter sets, so a transform that broadcast one set across the
+    others could not pass.
+    """
+    models = [make_layer("learned", seed=seed).eval() for seed in (0, 1)]
+    params, buffers = torch.func.stack_module_state(models)
+    base = make_layer("learned", seed=2)
+    base.recompute_pairwise = True
+    x = sequence()
+
+    def run(p: dict[str, torch.Tensor], b: dict[str, torch.Tensor]) -> torch.Tensor:
+        return torch.func.functional_call(base, (p, b), (x,))
+
+    base.train()
+    with pytest.raises(ValueError, match="recompute_pairwise"):
+        torch.func.vmap(run)(params, buffers)
+
+    base.eval()
+    batched = torch.func.vmap(run)(params, buffers)
+    for model, y in zip(models, batched):
+        torch.testing.assert_close(y, model(x), rtol=0, atol=1e-12)
 
 
 def test_zero_and_learned_checkpoints_do_not_silently_mix():

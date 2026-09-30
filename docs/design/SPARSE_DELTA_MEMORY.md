@@ -727,9 +727,12 @@ Each of these is a standing test in `tests/test_sdm.py`.
     equal bit for bit, under both holders, on the host and on a device under
     `torch.use_deterministic_algorithms`; of everything pairwise-sized, it
     keeps exactly one array per group — the carry — where the plain path keeps
-    many; it nests under `Stack.recompute` to the same gradients; the layer's
-    dial is off by default and outside the `state_dict`; under a `torch.func`
-    transform it is refused.
+    many; it nests under `Stack.recompute` to the same gradients; under a
+    `torch.func` transform it is refused. The layer's dial is off by default
+    and outside the `state_dict`, and reaches the kernel only while training:
+    on, a training layer keeps less; an evaluating one keeps exactly what it
+    would with the dial off, and still runs under `vmap` over stacked parameter
+    sets.
 
 ---
 
