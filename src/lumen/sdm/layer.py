@@ -48,6 +48,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from lumen.nn import rms_norm
+from lumen.sdm import triton_kernels
 from lumen.sdm.reference import (
     chunk_sparse_delta,
     read_sparse_delta,
@@ -57,6 +58,7 @@ from lumen.sdm.reference import (
 INITIAL_MEMORY = ("zero", "learned")
 KEY_NORMS = ("softmax", "l2")
 DECAY_WEIGHTINGS = ("write_set", "key")
+BACKENDS = ("reference", "triton")
 
 
 @dataclass(frozen=True)
@@ -130,6 +132,16 @@ class SparseDeltaMemoryConfig:
                   sequence.  The default is a guess to be measured.
         norm_eps: Per-head output RMSNorm epsilon.
         dropout:  Applied to the layer output, after the output projection.
+        backend:  ``"reference"`` (default) or ``"triton"``.  **Opt-in, and
+                  not auto-detected**, for the reason Undertow's
+                  ``docs/design/UNDERTOW.md`` §3.4 gives: two projects sharing
+                  this layer must be running the same code.  ``"triton"`` is
+                  Lumen's own kernels (:mod:`lumen.sdm.triton_kernels`) for
+                  the table-free terms and the walk over the table: the same
+                  arithmetic to fp32 round-off, not bit-identical, and its
+                  backward is not bit-deterministic run to run.  Where they
+                  cannot run -- a CPU tensor, fp64, a ``torch.func``
+                  transform -- the reference runs instead.
     """
 
     d_model: int
@@ -144,6 +156,7 @@ class SparseDeltaMemoryConfig:
     chunk_size: int = 32
     norm_eps: float = 1e-5
     dropout: float = 0.0
+    backend: Literal["reference", "triton"] = "reference"
 
     def __post_init__(self) -> None:
         if self.d_model < 1:
@@ -194,6 +207,8 @@ class SparseDeltaMemoryConfig:
             raise ValueError(f"norm_eps must be > 0, got {self.norm_eps}")
         if not 0.0 <= self.dropout < 1.0:
             raise ValueError(f"dropout must be in [0, 1), got {self.dropout}")
+        if self.backend not in BACKENDS:
+            raise ValueError(f"backend must be one of {BACKENDS}, got {self.backend!r}")
 
     @property
     def d_v(self) -> int:
@@ -227,6 +242,11 @@ class SparseDeltaMemory(nn.Module):
 
     def __init__(self, config: SparseDeltaMemoryConfig) -> None:
         super().__init__()
+        if config.backend == "triton" and not triton_kernels.HAS_TRITON:
+            raise RuntimeError(
+                'backend="triton" was requested but triton did not import. '
+                "Install it, or use the reference backend."
+            )
         self.config = config
 
         d_model, n_heads, d_v = config.d_model, config.n_heads, config.d_v
@@ -365,7 +385,12 @@ class SparseDeltaMemory(nn.Module):
         :attr:`recompute_pairwise` is honoured here, so an override should
         pass it on.
         """
-        return chunk_sparse_delta(
+        kernel = (
+            triton_kernels.chunk_sparse_delta
+            if self.config.backend == "triton"
+            else chunk_sparse_delta
+        )
+        return kernel(
             memory,
             *features,
             chunk_size=self.config.chunk_size,
@@ -505,5 +530,5 @@ class SparseDeltaMemory(nn.Module):
             f"initial_memory={config.initial_memory}, "
             f"n_writes={config.n_writes}, n_reads={config.n_reads}, "
             f"key_norm={config.key_norm}, decay_weighting={config.decay_weighting}, "
-            f"beta_max={config.beta_max}"
+            f"beta_max={config.beta_max}, backend={config.backend}"
         )
