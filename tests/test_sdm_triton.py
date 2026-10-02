@@ -572,3 +572,28 @@ def test_vmap_with_gradients_runs_the_reference() -> None:
     got = torch.func.grad(loss)(*args)
     want = torch.func.grad(loss_ref)(*args)
     assert distance(got, want) < FP32_ROUNDOFF
+
+
+@requires_cuda
+@requires_triton
+@needs_cuda
+@needs_triton
+def test_a_table_that_wants_no_gradient() -> None:
+    """A zero initial table is a fresh tensor that wants no gradient while the
+    projections do: the token chain starts without one, and every other input
+    still gets its gradient, equal to the reference's."""
+    inputs = draw()
+    def leaves(device_inputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        device_inputs["memory"] = torch.zeros_like(device_inputs["memory"]).detach()
+        return device_inputs
+
+    got_inputs = leaves(place(inputs, "cuda", torch.float32))
+    want_inputs = leaves(place(inputs, "cuda", torch.float32))
+    differentiable = [name for name in DIFFERENTIABLE if name != "memory"]
+    results = []
+    for kernel, args in ((tk.chunk_sparse_delta, got_inputs), (ref.chunk_sparse_delta, want_inputs)):
+        out, final = kernel(*(args[a] for a in ARGS), chunk_size=8)
+        grads = torch.autograd.grad(out.square().sum() + final.square().sum(), [args[n] for n in differentiable])
+        results.append((out.detach(), final.detach(), *grads))
+    for name, a, b in zip(["out", "final", *differentiable], *results):
+        assert distance(a, b) < FP32_ROUNDOFF, name
