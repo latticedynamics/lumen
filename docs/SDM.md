@@ -125,6 +125,7 @@ output, and every slot of the final table, is what it would have been.
 | `beta_max` | 2.0 | write-strength ceiling. The paper's is 1; past 2 is refused, because the chunkwise solve stops being stable there |
 | `chunk_size` | 32 | numerically inert, and a speed and memory dial: training keeps `O(T · chunk_size · (W+R))` per sequence unless the pairwise terms are recomputed (below). The default is not a measured optimum: on one machine, 16 was fastest at `d_model = 512`, and on a narrow layer the best value depended on how many sequences shared a batch. It depends on the device too (design record §3.9); worth measuring for yours |
 | `norm_eps`, `dropout` | 1e-5, 0.0 | as in Gated DeltaNet |
+| `backend` | `"reference"` | `"triton"` runs Lumen's own kernels (below). Opt-in, never detected |
 
 ## Optimising a learned table
 
@@ -223,6 +224,59 @@ Run the GPU-marked tests locally; CI is CPU-only:
 
 ```bash
 pytest -m gpu tests/test_sdm.py
+```
+
+## The Triton backend
+
+```python
+config = SparseDeltaMemoryConfig(..., backend="triton")
+```
+
+The same function as the reference -- outputs and every gradient to fp32
+round-off, and as close to the sequential oracle as the reference is -- by a
+different route. Both halves of a chunk run as kernels:
+
+- **The terms that do not need the table** -- partners, cumulative decays, the
+  pairwise matrices -- one chunk per program. A chunk's writes are sorted by slot
+  once, and each entry visits only the writes that share its slot, so the dense
+  pairwise arrays the reference builds are never formed. `recompute_pairwise`
+  has nothing to recompute here and is accepted for compatibility.
+- **The walk over the table**, one launch per group of chunks: each program owns
+  one sequence's table and a block of its value columns and loops over the
+  chunks in order. The value columns never interact, so the programs never
+  communicate.
+
+The backward is **deterministic without asking**: every sum has one owner and a
+fixed order, and there are no atomics. (The reference's backward needs
+`torch.use_deterministic_algorithms` for that on a GPU.)
+
+It runs where Triton runs, on CUDA tensors in fp32, and under `vmap` without
+gradients -- many parameter sets in one call (above) run as one launch, the
+mapped axis becoming more sequences. Anywhere else -- a CPU tensor, fp64, a
+`torch.func` transform with gradients, or a `chunk_size` above 64 -- the layer
+runs the reference instead, exactly. It never switches itself on: a fast path
+that turns on wherever a package imports would mean two projects sharing this
+layer no longer run the same code.
+
+Measured on one machine (a Pascal card without tensor cores, fp32, `N = 128²`,
+`W = R = 64`, `chunk_size = 32`), the kernel's training step and peak memory
+against the reference's:
+
+| shape | reference | `"triton"` |
+|---|---|---|
+| `d_model = 512`, 4 × 1,024 positions | 184 ms · 2.4 GiB | 52 ms · 1.8 GiB |
+| `d_model = 256`, 2 × 8,192 | 596 ms · 6.3 GiB | 101 ms · 2.5 GiB |
+| `d_model = 128`, 1 × 32,768 | 1,708 ms · 10.4 GiB | 149 ms · 2.4 GiB |
+| `d_model = 128`, 4 × 32,768, `chunk_size = 16` | out of memory | 431 ms · 9.4 GiB |
+
+The longer and narrower the sequence, the larger the gain: the reference's cost
+there was launching small operations per chunk, which the walk does not do.
+Without gradients the forward is 5--23× faster on the same shapes. On this path
+`chunk_size` matters little -- 16 was 2--8% faster than 32, and 32 kept less
+memory. These are one machine's numbers; on yours, measure.
+
+```bash
+pytest -m "gpu and triton" tests/test_sdm_triton.py
 ```
 
 ## Verifying it yourself

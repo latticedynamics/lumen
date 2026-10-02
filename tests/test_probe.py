@@ -17,6 +17,7 @@ from lumen.probe import (
     DtypeReport,
     ProbeResult,
     TritonReport,
+    _build_notes,
     arch_facts,
     format_report,
     probe,
@@ -164,6 +165,41 @@ def test_to_dict_is_json_serialisable():
         notes=["a note"],
     )
     assert json.loads(json.dumps(result.to_dict()))["recommended_dtype"] == "float32"
+
+
+def test_failed_atomics_are_reported_as_a_note():
+    """The Pascal case: tl.dot works and tl.atomic_add does not assemble.
+
+    A kernel author reading the report must learn that from the probe rather
+    than from ptxas, three call levels into their own code.
+    """
+    result = ProbeResult(
+        device=DeviceInfo(0, "Tesla P40", "-", 22905, 48, 30, arch_facts((6, 1))),
+        dtypes=[DtypeReport("float32", True, tflops=7.70, relative_to_fp32=1.00)],
+        triton=TritonReport(
+            available=True, version="3.5.1", elementwise_ok=True, dot_ok=True,
+            max_dot_block=64, atomics_ok=False, atomics_error="PTXASError: '.relaxed' requires sm_70",
+        ),
+        torch_version="2.9.1",
+        python_version="3.13.1",
+    )
+    result.notes = _build_notes(result.device, result.dtypes, result.triton)
+    assert any("tl.atomic_add does NOT work" in note for note in result.notes)
+    assert "tl.atomic_add      FAILED" in format_report(result)
+
+
+def test_unmeasured_atomics_say_nothing():
+    """`None` is not measured, not failed: no note, no line."""
+    result = ProbeResult(
+        device=DeviceInfo(0, "test", "-", 1024, 48, 1, arch_facts((6, 1))),
+        dtypes=[DtypeReport("float32", True, tflops=7.70, relative_to_fp32=1.00)],
+        triton=TritonReport(available=True, version="3.5.1", elementwise_ok=True, dot_ok=True, max_dot_block=64),
+        torch_version="2.9.1",
+        python_version="3.13.1",
+    )
+    result.notes = _build_notes(result.device, result.dtypes, result.triton)
+    assert not any("atomic" in note for note in result.notes)
+    assert "atomic_add" not in format_report(result)
 
 
 @requires_cuda

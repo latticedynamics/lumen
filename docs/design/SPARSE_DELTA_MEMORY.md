@@ -3,8 +3,9 @@
 **Status:** landed in 0.6.0, as `lumen.sdm`; in 0.6.1 the table is written in
 place (§3.11) and partners are found by search (§3.1); in 0.6.2 only the
 table-touching work stays in the chunk loop, and the pairwise terms can be
-recomputed (§3.12). The implementation is expected to match this record; where
-the two disagree, one of them is a bug.
+recomputed (§3.12); in 0.7.0 an opt-in Triton backend computes the same
+function as kernels (§3.13). The implementation is expected to match this
+record; where the two disagree, one of them is a bug.
 
 Unlike Gated DeltaNet and Undertow, this is **not a consolidation.** No
 existing implementation was merged, so there is no port to verify and no
@@ -341,7 +342,7 @@ with no activation, address scores linear in `x`, no short convolution.
 |---|---|
 | BatchNorm on the address projections | in training its batch statistics include **future positions** — a small causality leak — and slot selection shifts between batch statistics (training) and running statistics (inference). Off in every released config of the reference code, absent from the paper. If slot collapse appears, it is a finding to record, and a load-balancing term or a causal normaliser are the candidates |
 | short causal convolution | the paper has none, and names it as the only difference from GDN. Reachable later as a layer detail; not an untested default to ship |
-| CUDA/Triton kernels, a bf16 table, fp8/int4 snapshots | a faster path, earned by measurement. The reference table is the model dtype, and the gradient into `M₀` is not accumulated through bf16 atomics |
+| a bf16 table, fp8/int4 snapshots | a faster path, earned by measurement. The reference table is the model dtype, and the gradient into `M₀` is not accumulated through bf16 atomics. (Triton kernels were in this row; §3.13 is what earned them out of it) |
 | context parallelism | not the layer's business |
 | `reread` | §3.6 |
 
@@ -556,6 +557,118 @@ pairwise array per group where the plain path keeps many, and nests under
 `Stack.recompute`; under a `torch.func` transform it is refused while gradients
 are enabled, and ignored without them, when there is nothing to rebuild.
 
+### 3.13 A second route: the Triton backend
+
+`backend="triton"` computes the same function as `chunk_sparse_delta` with
+Lumen's own kernels (`lumen.sdm.triton_kernels`). It is opt-in and never
+detected, for Undertow's reason (`docs/design/UNDERTOW.md` §3.4), and it answers
+to the same oracle as the reference: outputs and every gradient to fp32
+round-off. Where it cannot run -- a CPU tensor, fp64, a `torch.func`
+transform with gradients, a chunk longer than 64 -- the reference runs
+instead, exactly. Under `vmap` without gradients it does run: the forward is a
+custom operator whose batching rule moves the mapped axis in among the
+sequences, which the kernels take any number of (§3.10's consumer, many
+parameter sets in one call, gets the forward's gain).
+
+The reference's costs on a long sequence were not the recurrence's (§3.12,
+§8): the terms made a dozen passes over dense `(C, K, C)` arrays that are
+almost entirely zero, and the walk issued a dozen small operations per chunk.
+Both halves are kernels here, one group of chunks per autograd node. What was
+decided, and why:
+
+**Partners by segment.** The partner relation of §3.1 is a sort, read the
+other way. Sorting a chunk's writes by `slot·C + position` makes the writes
+that share a slot one contiguous segment in position order, and each entry
+walks its own segment -- the partners it actually has, one or two at the
+access statistics product keys produce and `C` at worst -- instead of `C`
+cells of which nearly all are empty. The cumulative decays are summed member by
+member in position order, so two entries with the same history add the same
+terms in the same order and an exponent that should be exactly zero is (§3.1).
+`A` and `QK` are built a row at a time. A first version searched by brute force
+in registers -- every entry against every write -- and was correct and slow:
+the search is `C·W` steps per chunk, and its registers allowed one program per
+multiprocessor. The segments were 30 times faster at the narrow layer of
+§3.12.
+
+**The carry is one number per write.** Every write entry of one slot carries
+the same row, nonzero only at that slot's own writes; so the `(C, W, C)` carry
+is a single coefficient per write, `c_m = k_m · exp(G_end − G_m)` (an exponent
+`≤ 0`), and the new row of a slot is
+
+    M_C[n] = exp(G_end,n) · M₀[n] + Σ_{m writes n} c_m · δ_{position(m)}
+
+summed along the slot's segment. Its transpose in the backward is a gather: the
+gradient reaching `δ_s` from the new rows is `Σ_w c[s,w] · g[slot(s,w)]`. The
+array the reference keeps for this, the largest a training step kept, is not
+formed, and neither is the matmul that applied it.
+
+**One owner per sum, no atomics.** A scatter-add -- the reference backward's
+`index_add` -- reorders its sums from run to run. Here every reduction has an
+owner: the terms sum each pair's two ends from the two entries' own segments
+(sharing a slot is symmetric), and the walk's backward hands each slot a chunk
+touched to its first writer, or for a slot only read to its first reader,
+which sums everything that reached the old row in segment order and writes
+once. So the backward is reproducible without asking. It is also portable: a
+design with atomics depends on how a compiler lowers them, and on one machine
+(Triton 3.5, a Pascal card) every form of `tl.atomic_add` failed to assemble --
+it carries a memory-order qualifier that architecture's assembler refuses. An
+inline-assembly reduction worked, and brought its own hazard: a tile smaller
+than the program is replicated across threads, Triton's own atomics mask the
+replicas, and an inline instruction cannot know it is one. Two replicas add
+twice. The tests caught it; the owners made it moot.
+
+**The walk is persistent, and its columns never mix.** A program owns one
+sequence's table and a block of its value columns and loops over a group's
+chunks in order, with a barrier between a chunk's reads of the table and its
+writes. Every operation in the recurrence is per value column, so programs that
+share a sequence never communicate. The backward walk carries only the table's
+gradient; what a chunk's reads hand back depends only on the output's
+gradient, so it is summed for every chunk at once before the walk begins, and
+the reductions over the value width run after it, in parallel.
+
+**Launch geometry: one wave.** The walk is a chain of dependent loads per
+program, so latency bounds it, and two things set the chain's length. A narrow
+column block gathers a whole chunk's rows in one round -- 8 columns is one
+32-byte sector, the unit the memory system moves anyway -- and shortens the
+chain. But each program holds a chunk's tiles and, on the machine measured,
+fills its multiprocessor's registers, so a grid larger than the card runs in
+waves, each paying the whole chain. The rule is the narrowest block whose grid
+fits one wave. It picked the fastest of the configurations tried at every shape
+measured. Products of a chunk's `C × C` matrices use `tl.dot` where every side
+is at least 16 and a broadcast below that; past `C = 64` the solve's tile no
+longer fits the shared memory `tl.dot` stages it in on that machine, and those
+chunks -- also the slowest measured -- run the reference.
+
+**What stays in torch.** The sort that builds the segments (integers only) and
+the solve `(I + diag(β) A)⁻¹`, one batched triangular solve whose backward is
+written out: `dB = −Xᵀ dX Xᵀ` on the strict lower triangle.
+
+Measured on one machine (a Pascal card, fp32, `N = 128²`, `W = R = 64`,
+`C = 32`; the kernel alone, forward and backward):
+
+| shape | reference | Triton |
+|---|---|---|
+| `d_model = 512`, 4 × 1,024 | 184 ms · 2.4 GiB | 52 ms · 1.8 GiB |
+| `d_model = 256`, 2 × 8,192 | 596 ms · 6.3 GiB | 101 ms · 2.5 GiB |
+| `d_model = 256`, 1 × 16,384 | 843 ms · 6.2 GiB | 112 ms · 2.4 GiB |
+| `d_model = 128`, 1 × 32,768 | 1,708 ms · 10.4 GiB | 149 ms · 2.4 GiB |
+
+The gain grows as rows narrow and sequences lengthen, where the reference was
+bound by launching operations. Memory falls because the pairwise arrays are not
+kept, or formed; four rows of 32,768 at `C = 16`, out of memory on the reference
+in 22 GiB, train in 9.4. On this path `C` matters little: 16 was 2--8% faster
+than 32, which kept less memory. The default is unchanged.
+
+Two further measured choices. The walks' loops over entry blocks are not
+unrolled: unrolling kept every block's tiles live, at the register limit and
+spilling, where the rolled loop ran 9--22% faster. And the work that does not
+wait on the walk -- the next group's table-free half in the forward, a group's
+reductions after its own walk in the backward -- runs on a second stream beside
+it, for 2--7%: concurrent kernels slow the latency-bound walk, which gives back
+much of the overlap.
+
+Held by tests (`tests/test_sdm_triton.py`): §7.17.
+
 ---
 
 ## 4. What the paper's evidence supports
@@ -633,6 +746,7 @@ class SparseDeltaMemoryConfig:
     chunk_size: int = 32                           # to be measured
     norm_eps: float = 1e-5
     dropout: float = 0.0
+    backend: Literal["reference", "triton"] = "reference"   # §3.13
 
 class SparseDeltaMemory(nn.Module):
     def init_state(self, batch, device=None, dtype=None) -> SparseDeltaMemoryState
@@ -667,6 +781,10 @@ Kernels in `lumen.sdm.reference`, not exported:
   `recompute_pairwise` rebuilds those terms in the backward instead of keeping
   them (§3.12).
 - `read_sparse_delta` — one position, read-only; the decode step's readout.
+
+`lumen.sdm.triton_kernels.chunk_sparse_delta` is the same signature less
+`in_place`, the route `backend="triton"` takes (§3.13); it falls back to the
+reference where its kernels cannot run.
 
 Kernel shapes: `memory (…, N, d_v)`, `write_idx / write_val / log_decay
 (…, T, W)`, `read_idx / read_val (…, T, R)`, `v (…, T, d_v)`, `beta (…, T)`,
@@ -736,6 +854,23 @@ Each of these is a standing test in `tests/test_sdm.py`.
     layer keeps less; an evaluating one keeps exactly what it would with the
     dial off, and still runs under `vmap` over stacked parameter sets, as a
     training one does without gradients.
+17. **The Triton backend** (§3.13, `tests/test_sdm_triton.py`): as close to the
+    fp64 oracle as the reference is -- outputs, final table and every
+    gradient -- with slots written several times in a chunk and read twice at
+    one position, a ragged last chunk, chunks of 1, 6 and 64, one write per
+    position, more entries than one tile, and value widths of 3 and 40; the
+    forward without gradients is the forward with them, bit for bit; a table
+    handed back and resumed matches one pass; the caller's table is never
+    written; the layer agrees across backends, gradients included; with every
+    slot selected it is Gated DeltaNet (every segment the whole chunk); an
+    unwritten slot is bit-identical after a pass; every write a full wipe stays
+    finite and leaves each slot its last write; the backward is bit-identical
+    across runs **with deterministic algorithms off**; under `vmap` without
+    gradients the kernels run and agree with each parameter set alone; and where
+    the kernels do not run -- a CPU tensor, fp64, gradients under a transform, a
+    chunk past 64 -- the reference runs, bit for bit. Reference is the default,
+    and an unknown backend, or Triton without triton, is refused at
+    construction.
 
 ---
 
@@ -748,19 +883,19 @@ Each of these is a standing test in `tests/test_sdm.py`.
 - **How `M₀` should be optimised** (§3.5): ordinary weight decay shrinks what
   the context has frozen.
 - **The untested defaults** of §3.9.
-- **Where the time goes now.** Measured on one machine at the defaults
-  (`d_model = 512`), a training step is 204 ms against Gated DeltaNet's 42 at
-  the same width, and 172 ms at `C = 16`. The device is busy throughout, at
-  every chunk size profiled: a step takes the same time with a profiler
-  attached as without. About half of it is elementwise work over the pairwise
-  arrays; a fifth is gathers, index writes and their backward; a fifth is
-  batched matmuls; table-sized work is under 2%. So the next lever is fusing
-  the pairwise work — a compiled or custom kernel, measured against this one,
-  that keeps those arrays in registers instead of passing each through memory
-  — not a new algorithm. On a narrow layer with few slots per position the
-  host still sets the pace: at `d_model = 128` and `W = R = 16`, a micro-batch
-  of 32K rows costs about 1.8 ms a chunk whether it holds one row or four,
-  which is the cost of issuing the loop's table-touching operations.
+- **Where the time goes now.** On the reference path, measured on one machine
+  at the defaults (`d_model = 512`), a training step was 204 ms against Gated
+  DeltaNet's 42, about half of it elementwise work over the pairwise arrays and,
+  on narrow layers, the host issuing the loop's operations. That lever was
+  pulled: §3.13 forms no pairwise array and issues one launch per group. What is
+  left is the Triton path's own cost, and it is a different kind. Its walks are
+  chains of dependent gathers -- latency, not bandwidth: at `d_model = 512` a
+  step moves perhaps a third of what the card's memory could in the time it
+  takes. The candidates are fewer rounds per chunk, keeping less (the read rows
+  could be rebuilt by undoing the writes in reverse, since the write rows are
+  kept), and, for one or two sequences, more parallelism than splitting value
+  columns gives. Unmeasured on any card with tensor cores, or with more shared
+  memory per block than 48 KB -- where the cap on chunk length may not bind.
 - **An in-place decode** (§3.6). Measured on one machine, the successor copy is
   most of a step once the table is large: at `B = 8`, 36 ms per step at
   `N = 512²` against 0.2 ms for the same arithmetic in place, which also costs
