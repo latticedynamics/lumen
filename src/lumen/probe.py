@@ -218,6 +218,12 @@ class TritonReport:
     max_dot_block: int | None = None
     cold_compile_s: float | None = None
     error: str | None = None
+    #: Does ``tl.atomic_add`` compile and add correctly here?  ``None``: not
+    #: measured.  Kept apart from ``dot_ok`` because the two fail separately --
+    #: on a Pascal card with Triton 3.5 every form of the atomic is refused by
+    #: the assembler while ``tl.dot`` works.
+    atomics_ok: bool | None = None
+    atomics_error: str | None = None
 
     @property
     def autotune_tax_s(self) -> float | None:
@@ -253,6 +259,11 @@ def probe_triton(index: int = 0, blocks: tuple[int, ...] = (16, 32, 64, 128)) ->
         idx = offs[:, None] * BLOCK + offs[None, :]
         tl.store(c_ptr + idx, tl.dot(tl.load(a_ptr + idx), tl.load(b_ptr + idx)))
 
+    @triton.jit
+    def _scatter_add(x_ptr, idx_ptr, v_ptr, BLOCK: tl.constexpr):
+        offs = tl.arange(0, BLOCK)
+        tl.atomic_add(x_ptr + tl.load(idx_ptr + offs), tl.load(v_ptr + offs))
+
     elementwise_ok = False
     cold_compile_s: float | None = None
     try:
@@ -285,6 +296,26 @@ def probe_triton(index: int = 0, blocks: tuple[int, ...] = (16, 32, 64, 128)) ->
         except Exception:  # noqa: BLE001 -- expected once shared memory runs out
             break
 
+    # Colliding destinations on purpose: an atomic that loses an add is as
+    # wrong as one that does not compile, and only a collision shows it.
+    atomics_ok: bool | None = None
+    atomics_error: str | None = None
+    try:
+        idx = torch.randint(0, 8, (64,), device=device)
+        values = torch.randn(64, device=device)
+        x = torch.zeros(8, device=device)
+        _scatter_add[(1,)](x, idx, values, BLOCK=64)
+        torch.cuda.synchronize(index)
+        expected = torch.zeros(8, device=device).index_add_(0, idx, values)
+        atomics_ok = bool(torch.allclose(x, expected, atol=1e-5))
+    except Exception as exc:  # noqa: BLE001 -- a refusal is the datum
+        atomics_ok = False
+        # ptxas leads with a generic line; the one naming the cause says
+        # what the target "requires".
+        lines = [line.strip() for line in str(exc).splitlines() if line.strip()]
+        cause = next((line for line in lines if "requires" in line), lines[0] if lines else "")
+        atomics_error = f"{type(exc).__name__}: {cause}"[:200]
+
     return TritonReport(
         available=True,
         version=getattr(triton, "__version__", None),
@@ -292,6 +323,8 @@ def probe_triton(index: int = 0, blocks: tuple[int, ...] = (16, 32, 64, 128)) ->
         dot_ok=max_dot_block is not None,
         max_dot_block=max_dot_block,
         cold_compile_s=cold_compile_s,
+        atomics_ok=atomics_ok,
+        atomics_error=atomics_error,
     )
 
 
@@ -388,6 +421,12 @@ def _build_notes(device: DeviceInfo, dtypes: list[DtypeReport], triton: TritonRe
             f"Triton {triton.version} WORKS here (tl.dot up to block {triton.max_dot_block}), "
             "despite the widely repeated SM 7.0 floor."
         )
+        if triton.atomics_ok is False:
+            notes.append(
+                f"tl.atomic_add does NOT work here ({triton.atomics_error or 'wrong result'}). "
+                "Kernels that scatter-add through Triton atomics will not run on this card; "
+                "an owner-per-sum design, or an inline-PTX reduction, does."
+            )
         tax = triton.autotune_tax_s
         if tax is not None and not arch.tensor_cores:
             notes.append(
@@ -479,6 +518,8 @@ def format_report(result: ProbeResult) -> str:
         add(f"    version            {triton.version}")
         add(f"    elementwise        {'ok' if triton.elementwise_ok else 'FAILED'}")
         add(f"    tl.dot             {'ok up to block ' + str(triton.max_dot_block) if triton.dot_ok else 'FAILED'}")
+        if triton.atomics_ok is not None:
+            add(f"    tl.atomic_add      {'ok' if triton.atomics_ok else 'FAILED'}")
         if triton.cold_compile_s is not None:
             add(f"    cold compile       {triton.cold_compile_s:.2f}s")
             add(f"    est. autotune tax  ~{triton.autotune_tax_s:.0f}s per kernel per (shape, dtype)")
