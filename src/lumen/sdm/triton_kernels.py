@@ -61,6 +61,8 @@ round-off apart, not bit-identical.  The fp64 oracle is what both answer to.
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
+from typing import Any
 
 import torch
 from torch.autograd.function import once_differentiable
@@ -855,32 +857,29 @@ def _segments(
 # ── one group of chunks: terms, solve, walk ───────────────────────────────
 
 
-def _forward_group(
-    table: torch.Tensor,
+def _prepare_group(
     w_idx: torch.Tensor,
     r_idx: torch.Tensor,
     w_val: torch.Tensor,
     w_logd: torch.Tensor,
     r_val: torch.Tensor,
-    v: torch.Tensor,
     beta: torch.Tensor,
     chunk: int,
-    save: bool,
+    n_slots: int,
 ) -> dict[str, torch.Tensor]:
-    """A group's terms, solve and walk; ``table`` `(P·N, D)` is written in place.
+    """A group's table-free half: the sort, the terms, the solve.
 
-    `(P, L, …)` contiguous inputs, `L = n·C`.  Returns ``out`` and -- with
-    ``save`` -- everything the backward needs.
+    `(P, L, …)` contiguous inputs, `L = n·C`.  Depends on nothing the walk
+    writes, so the driver runs it one group ahead, on a second stream, while
+    the walk of the group before holds the first.
     """
     rows, length, n_writes = w_idx.shape
     n_reads = r_idx.shape[-1]
-    d_v = table.shape[-1]
     n = length // chunk
     fold = (rows * n, chunk)
     w_order, w_lo, w_hi, r_lo, r_hi = _segments(
-        w_idx.view(*fold, n_writes), r_idx.view(*fold, n_reads), table.shape[0], reads_too=False
+        w_idx.view(*fold, n_writes), r_idx.view(*fold, n_reads), n_slots, reads_too=False
     )
-
     new = w_val.new_empty
     g_w, g_end, g_r = new(w_val.shape), new(w_val.shape), new(r_val.shape)
     a, qk = new(rows * n, chunk, chunk), new(rows * n, chunk, chunk)
@@ -898,7 +897,31 @@ def _forward_group(
     # contiguous: a batched triangular solve may hand back column-major
     # storage, and a kernel reads raw strides.
     transform = inv_unit(beta.view(*fold).unsqueeze(-1) * a).contiguous()
+    return dict(
+        a=a, transform=transform, qk=qk, dest=dest, coef=coef,
+        w_weight=w_weight, r_weight=r_weight, decay_end=decay_end,
+        g_w=g_w, g_r=g_r, g_end=g_end, w_order=w_order, w_lo=w_lo, w_hi=w_hi,
+    )
 
+
+def _walk_group(
+    table: torch.Tensor,
+    w_idx: torch.Tensor,
+    r_idx: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    prepared: dict[str, torch.Tensor],
+    chunk: int,
+    save: bool,
+) -> dict[str, torch.Tensor]:
+    """A group's walk; ``table`` `(P·N, D)` is written in place.
+
+    Returns ``out`` and -- with ``save`` -- the rows and vectors the backward
+    needs.
+    """
+    rows, length, n_writes = w_idx.shape
+    n_reads = r_idx.shape[-1]
+    d_v = table.shape[-1]
     out = v.new_empty(rows, length, d_v)
     delta = v.new_empty(rows, length, d_v)
     if save:
@@ -909,22 +932,57 @@ def _forward_group(
         save_w = save_r = err = out  # never touched: SAVE is a constexpr
     blocks, grid, warps = _walk_launch(rows, chunk, n_writes, n_reads, d_v, v.device)
     _walk_fwd_kernel[grid](
-        table, w_idx, r_idx, dest, w_order, w_lo, w_hi,
-        v, beta, w_weight, r_weight, transform, qk, decay_end, coef,
+        table, w_idx, r_idx, prepared["dest"],
+        prepared["w_order"], prepared["w_lo"], prepared["w_hi"],
+        v, beta, prepared["w_weight"], prepared["r_weight"], prepared["transform"],
+        prepared["qk"], prepared["decay_end"], prepared["coef"],
         out, save_w, save_r, delta, err,
-        n, length,
+        length // chunk, length,
         D=d_v, W=n_writes, R=n_reads, C=chunk, SAVE=save, num_warps=warps,
         **blocks,
     )
-    result = dict(out=out)
-    if save:
-        result.update(
-            a=a, transform=transform, qk=qk, dest=dest, coef=coef,
-            w_weight=w_weight, r_weight=r_weight, decay_end=decay_end,
-            g_w=g_w, g_r=g_r, g_end=g_end,
-            save_w=save_w, save_r=save_r, delta=delta, err=err,
-        )
-    return result
+    return dict(out=out, save_w=save_w, save_r=save_r, delta=delta, err=err)
+
+
+def _forward_group(
+    table: torch.Tensor,
+    w_idx: torch.Tensor,
+    r_idx: torch.Tensor,
+    w_val: torch.Tensor,
+    w_logd: torch.Tensor,
+    r_val: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    chunk: int,
+    save: bool,
+) -> dict[str, torch.Tensor]:
+    """Both halves of a group on the current stream -- for callers and tests
+    that want one group in isolation.  The driver pipelines them instead."""
+    prepared = _prepare_group(w_idx, r_idx, w_val, w_logd, r_val, beta, chunk, table.shape[0])
+    walked = _walk_group(table, w_idx, r_idx, v, beta, prepared, chunk, save)
+    return {**prepared, **walked} if save else {"out": walked["out"]}
+
+
+_SIDE_STREAMS: dict[int, torch.cuda.Stream] = {}
+
+
+def _side_stream(device: torch.device) -> torch.cuda.Stream:
+    """One second stream per device, for the work that does not wait on the walk."""
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    if index not in _SIDE_STREAMS:
+        _SIDE_STREAMS[index] = torch.cuda.Stream(device=index)
+    return _SIDE_STREAMS[index]
+
+
+def _cross(tensors: Iterable[object], stream: torch.cuda.Stream) -> None:
+    """Tell the allocator these tensors are also used on ``stream``.
+
+    Without it, a tensor freed on the stream that made it can be handed out
+    again while ``stream`` is still reading it.
+    """
+    for tensor in tensors:
+        if isinstance(tensor, torch.Tensor) and tensor.is_cuda:
+            tensor.record_stream(stream)
 
 
 _SAVED = (
@@ -956,14 +1014,21 @@ class _TritonGroup(torch.autograd.Function):
         v: torch.Tensor,
         beta: torch.Tensor,
         chunk: int,
+        prepared: dict[str, torch.Tensor],
+        last: bool,
     ):
-        inputs = tuple(x.contiguous() for x in (w_idx, r_idx, w_val, w_logd, r_val, v, beta))
-        found = _forward_group(arena.table, *inputs, chunk=chunk, save=True)
+        """``prepared`` is the group's table-free half, made ahead by the driver
+        (outside autograd, which never sees it); ``last`` marks the group whose
+        backward runs last, which waits for the second stream."""
+        inputs = (w_idx, r_idx, w_val, w_logd, r_val, v, beta)
+        walked = _walk_group(arena.table, w_idx, r_idx, v, beta, prepared, chunk, save=True)
+        found = {**prepared, **walked}
         ctx.save_for_backward(*inputs, *(found[name] for name in _SAVED))
         ctx.table_shape = arena.table.shape
         ctx.chunk = chunk
+        ctx.last = last
         ctx.set_materialize_grads(False)
-        return found["out"], ref._token(arena.table)
+        return walked["out"], ref._token(arena.table)
 
     @staticmethod
     @once_differentiable
@@ -1014,57 +1079,96 @@ class _TritonGroup(torch.autograd.Function):
             n, length,
             D=d_v_width, W=n_writes, R=n_reads, C=chunk, num_warps=warps, **blocks,
         )
+        del read_sums  # the backward's largest transient, used by the walk alone
 
-        # ── everything else reduces over the value width: in parallel ─────
-        new = v.new_empty
-        d_transform, d_qk = new(rows * n, chunk, chunk), new(rows * n, chunk, chunk)
-        d_beta, d_v = new(beta.shape), new(v.shape)
-        d_w_weight, d_decay, d_coef = new(w_val.shape), new(w_val.shape), new(w_val.shape)
-        d_r_weight = new(r_val.shape)
-        # One program per chunk, looping over the width: 32 columns and an
-        # 8192-float tile were the fastest of those tried at every shape.
-        block_c = _next_pow2(chunk)
-        block_d = 32
-        entries = max(1, 8192 // (block_c * block_d))
-        _walk_grads_kernel[(rows * n,)](
-            saved["save_w"], saved["save_r"], g_slot, saved["err"], saved["delta"],
-            g_out, g_delta, g_u, beta, saved["dest"],
-            d_transform, d_qk, d_beta, d_v, d_w_weight, d_r_weight, d_decay, d_coef,
-            D=d_v_width, W=n_writes, R=n_reads, C=chunk,
-            BC=block_c, BW=min(_next_pow2(n_writes), entries),
-            BR=min(_next_pow2(n_reads), entries), BD=block_d,
-            DOT=block_c >= 16, num_warps=4,
-        )
-        beta_c = beta.view(*fold)
-        transform, a = saved["transform"], saved["a"]
-
-        # The solve: X = (I + B)⁻¹ with B = diag(β) A strictly lower, so
-        # dB = −Xᵀ dX Xᵀ on the strict lower triangle -- what autograd through
-        # the unitriangular solve gives the reference.
-        transform_t = transform.transpose(-1, -2)
-        d_b = torch.tril(-(transform_t @ d_transform @ transform_t), diagonal=-1)
-        d_beta = d_beta.view(*fold) + (d_b * a).sum(-1)
-        d_a = beta_c.unsqueeze(-1) * d_b
-
-        # ── the terms ─────────────────────────────────────────────────────
-        del read_sums  # the largest transient of the backward; free before the terms
-        scratch_g, scratch_end = torch.empty_like(w_val), torch.empty_like(w_val)
-        scratch_gr = torch.empty_like(r_val)
-        d_k, d_l, d_q = torch.empty_like(w_val), torch.empty_like(w_val), torch.empty_like(r_val)
-        _terms_bwd_kernel[(rows * n,)](
-            w_val, r_val, w_order, w_lo, w_hi, r_lo, r_hi, r_order, wr_lo, wr_hi,
-            saved["g_w"], saved["g_r"], saved["g_end"],
-            *(x.contiguous() for x in (d_a, d_qk, d_w_weight, d_r_weight, d_decay, d_coef)),
-            scratch_g, scratch_end, scratch_gr,
-            d_k, d_l, d_q,
-            C=chunk, W=n_writes, R=n_reads,
-            **_terms_blocks(chunk, n_writes, n_reads),
-        )
+        # ── everything after the walk waits on this group's walk only ─────
+        # So it runs on the second stream, beside the next group's walk, and
+        # the stream the caller sees waits for it once, after the last group.
+        main = torch.cuda.current_stream()
+        side = _side_stream(v.device)
+        side.wait_stream(main)
+        _cross((*ctx.saved_tensors, g_out, g_slot, g_delta, g_u, *segments), side)
+        with torch.cuda.stream(side):
+            d_k, d_l, d_q, d_v, d_beta = _after_walk(
+                ctx, saved, w_val, r_val, v, beta, g_out, g_slot, g_delta, g_u, segments,
+            )
+        _cross((d_k, d_l, d_q, d_v, d_beta), main)
+        if ctx.last:
+            main.wait_stream(side)
         return (
             grad, None, None, None,
             d_k, d_l, d_q, d_v, d_beta.view(beta.shape),
-            None,
+            None, None, None,
         )
+
+
+def _after_walk(
+    ctx: Any,
+    saved: dict[str, torch.Tensor],
+    w_val: torch.Tensor,
+    r_val: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    g_out: torch.Tensor,
+    g_slot: torch.Tensor,
+    g_delta: torch.Tensor,
+    g_u: torch.Tensor,
+    segments: tuple[torch.Tensor, ...],
+) -> tuple[torch.Tensor, ...]:
+    """A group's backward once its walk has passed: the width reductions, the
+    solve's backward and the terms' backward.  Runs on whichever stream is
+    current; nothing in it depends on another group."""
+    chunk = ctx.chunk
+    rows, length, n_writes = g_slot.shape[:3]
+    n_reads = r_val.shape[-1]
+    d_v_width = v.shape[-1]
+    n = length // chunk
+    fold = (rows * n, chunk)
+    w_order, w_lo, w_hi, r_lo, r_hi, r_order, wr_lo, wr_hi, _, _ = segments
+    new = v.new_empty
+    d_transform, d_qk = new(rows * n, chunk, chunk), new(rows * n, chunk, chunk)
+    d_beta, d_v = new(beta.shape), new(v.shape)
+    d_w_weight, d_decay, d_coef = new(w_val.shape), new(w_val.shape), new(w_val.shape)
+    d_r_weight = new(r_val.shape)
+    # One program per chunk, looping over the width: 32 columns and an
+    # 8192-float tile were the fastest of those tried at every shape.
+    block_c = _next_pow2(chunk)
+    block_d = 32
+    entries = max(1, 8192 // (block_c * block_d))
+    _walk_grads_kernel[(rows * n,)](
+        saved["save_w"], saved["save_r"], g_slot, saved["err"], saved["delta"],
+        g_out, g_delta, g_u, beta, saved["dest"],
+        d_transform, d_qk, d_beta, d_v, d_w_weight, d_r_weight, d_decay, d_coef,
+        D=d_v_width, W=n_writes, R=n_reads, C=chunk,
+        BC=block_c, BW=min(_next_pow2(n_writes), entries),
+        BR=min(_next_pow2(n_reads), entries), BD=block_d,
+        DOT=block_c >= 16, num_warps=4,
+    )
+    beta_c = beta.view(*fold)
+    transform, a = saved["transform"], saved["a"]
+
+    # The solve: X = (I + B)⁻¹ with B = diag(β) A strictly lower, so
+    # dB = −Xᵀ dX Xᵀ on the strict lower triangle -- what autograd through
+    # the unitriangular solve gives the reference.
+    transform_t = transform.transpose(-1, -2)
+    d_b = torch.tril(-(transform_t @ d_transform @ transform_t), diagonal=-1)
+    d_beta = d_beta.view(*fold) + (d_b * a).sum(-1)
+    d_a = beta_c.unsqueeze(-1) * d_b
+
+    # ── the terms ─────────────────────────────────────────────────────
+    scratch_g, scratch_end = torch.empty_like(w_val), torch.empty_like(w_val)
+    scratch_gr = torch.empty_like(r_val)
+    d_k, d_l, d_q = torch.empty_like(w_val), torch.empty_like(w_val), torch.empty_like(r_val)
+    _terms_bwd_kernel[(rows * n,)](
+        w_val, r_val, w_order, w_lo, w_hi, r_lo, r_hi, r_order, wr_lo, wr_hi,
+        saved["g_w"], saved["g_r"], saved["g_end"],
+        *(x.contiguous() for x in (d_a, d_qk, d_w_weight, d_r_weight, d_decay, d_coef)),
+        scratch_g, scratch_end, scratch_gr,
+        d_k, d_l, d_q,
+        C=chunk, W=n_writes, R=n_reads,
+        **_terms_blocks(chunk, n_writes, n_reads),
+    )
+    return d_k, d_l, d_q, d_v, d_beta
 
 
 # ── the driver ────────────────────────────────────────────────────────────
@@ -1191,15 +1295,43 @@ def _drive(
     arena = ref._Arena(entering, 0) if differentiable else None
     table = arena.table if arena is not None else entering.reshape(n_real, d_v).clone()
 
+    parts = [
+        tuple(x.contiguous() for x in group_parts)
+        for group_parts in zip(
+            *(groups(x) for x in (write_idx, read_idx, write_val, log_decay, read_val, v, beta))
+        )
+    ]
+    # The table-free half of group g+1 is made on a second stream while the
+    # walk of group g holds the first: it depends on nothing the walk writes.
+    main = torch.cuda.current_stream()
+    side = _side_stream(device)
+    side.wait_stream(main)
+
+    def prepare(group_parts: tuple[torch.Tensor, ...]) -> tuple[dict[str, torch.Tensor], torch.cuda.Event]:
+        w_idx, r_idx, w_val, w_logd, r_val, _, beta = group_parts
+        with torch.cuda.stream(side), torch.no_grad():
+            prepared = _prepare_group(w_idx, r_idx, w_val, w_logd, r_val, beta, chunk_size, n_real)
+            ready = torch.cuda.Event()
+            ready.record(side)
+        _cross(group_parts, side)
+        return prepared, ready
+
     outputs = []
-    for inputs in zip(
-        *(groups(x) for x in (write_idx, read_idx, write_val, log_decay, read_val, v, beta))
-    ):
+    pending = prepare(parts[0])
+    for index, group_parts in enumerate(parts):
+        prepared, ready = pending
+        if index + 1 < len(parts):
+            pending = prepare(parts[index + 1])
+        main.wait_event(ready)
+        _cross(prepared.values(), main)
+        w_idx, r_idx, w_val, w_logd, r_val, v_group, beta_group = group_parts
         if arena is not None:
-            out, arena.token = _TritonGroup.apply(arena.token, arena, *inputs, chunk_size)
+            out, arena.token = _TritonGroup.apply(
+                arena.token, arena, *group_parts, chunk_size, prepared, index == 0
+            )
         else:
-            out = _forward_group(
-                table, *(x.contiguous() for x in inputs), chunk=chunk_size, save=False
+            out = _walk_group(
+                table, w_idx, r_idx, v_group, beta_group, prepared, chunk_size, save=False
             )["out"]
         outputs.append(out)
 
@@ -1240,14 +1372,38 @@ def _forward_op(
 
 
 @_forward_op.register_fake
-def _(memory, write_idx, write_val, log_decay, v, beta, read_idx, read_val, chunk_size, group):  # noqa: ANN001, ANN202
+def _(
+    memory: torch.Tensor,
+    write_idx: torch.Tensor,
+    write_val: torch.Tensor,
+    log_decay: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    read_idx: torch.Tensor,
+    read_val: torch.Tensor,
+    chunk_size: int,
+    group: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
     lead = write_idx.shape[:-2]
     n_slots, d_v = memory.shape[-2:]
     return v.new_empty(*lead, write_idx.shape[-2], d_v), memory.new_empty(*lead, n_slots, d_v)
 
 
 @_forward_op.register_vmap
-def _(info, in_dims, memory, write_idx, write_val, log_decay, v, beta, read_idx, read_val, chunk_size, group):  # noqa: ANN001, ANN202
+def _(
+    info: Any,
+    in_dims: tuple[int | None, ...],
+    memory: torch.Tensor,
+    write_idx: torch.Tensor,
+    write_val: torch.Tensor,
+    log_decay: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    read_idx: torch.Tensor,
+    read_val: torch.Tensor,
+    chunk_size: int,
+    group: int,
+) -> tuple[tuple[torch.Tensor, torch.Tensor], tuple[int, int]]:
     size = info.batch_size
 
     def front(x: torch.Tensor, dim: int | None) -> torch.Tensor:
