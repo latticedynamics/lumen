@@ -1033,6 +1033,13 @@ class _TritonGroup(torch.autograd.Function):
     @staticmethod
     @once_differentiable
     def backward(ctx, g_out, grad):  # type: ignore[override]
+        with torch.cuda.device(ctx.saved_tensors[0].device):
+            return _TritonGroup._backward(ctx, g_out, grad)
+
+    @staticmethod
+    def _backward(
+        ctx: Any, g_out: torch.Tensor | None, grad: torch.Tensor | None
+    ) -> tuple[torch.Tensor | None, ...]:
         w_idx, r_idx, w_val, w_logd, r_val, v, beta, *rest = ctx.saved_tensors
         saved = dict(zip(_SAVED, rest))
         chunk = ctx.chunk
@@ -1243,7 +1250,33 @@ def _drive(
     check_writes: bool,
     group: int | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """The kernels' driver: flatten, pad, group, walk.  Plain tensors only."""
+    """The kernels' driver: flatten, pad, group, walk.  Plain tensors only.
+
+    Runs with the tensors' device current: a launch goes to the current
+    device, and streams are per device, so a batch living on another GPU than
+    the current one would otherwise be launched -- and synchronised -- on the
+    wrong card.
+    """
+    with torch.cuda.device(v.device):
+        return _drive_here(
+            memory, write_idx, write_val, log_decay, v, beta, read_idx, read_val,
+            chunk_size=chunk_size, check_writes=check_writes, group=group,
+        )
+
+
+def _drive_here(
+    memory: torch.Tensor,
+    write_idx: torch.Tensor,
+    write_val: torch.Tensor,
+    log_decay: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    read_idx: torch.Tensor,
+    read_val: torch.Tensor,
+    chunk_size: int,
+    check_writes: bool,
+    group: int | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     if chunk_size < 1:
         raise ValueError(f"chunk_size must be >= 1, got {chunk_size}")
     if group is not None and group < 1:

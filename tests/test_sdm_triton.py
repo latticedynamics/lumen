@@ -597,3 +597,24 @@ def test_a_table_that_wants_no_gradient() -> None:
         results.append((out.detach(), final.detach(), *grads))
     for name, a, b in zip(["out", "final", *differentiable], *results):
         assert distance(a, b) < FP32_ROUNDOFF, name
+
+
+@requires_cuda
+@requires_triton
+@needs_cuda
+@needs_triton
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two CUDA devices")
+def test_a_batch_on_another_device_than_the_current_one() -> None:
+    """Launches go to the current device and streams are per device: a batch
+    on another card must be launched, and synchronised, on its own card."""
+    inputs = draw(n_slots=4096, n_writes=16, n_reads=16, d_v=32, seq_len=200)
+    previous = torch.cuda.current_device()
+    torch.cuda.set_device(0)
+    try:
+        got = run(tk.chunk_sparse_delta, place(inputs, "cuda:1", torch.float32), 8)
+        want = run(ref.chunk_sparse_delta, place(inputs, "cuda:1", torch.float32), 8)
+    finally:
+        torch.cuda.set_device(previous)
+    for name in got:
+        assert got[name].device == torch.device("cuda:1")
+        assert distance(got[name], want[name]) < FP32_ROUNDOFF, name
