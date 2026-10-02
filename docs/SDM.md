@@ -264,14 +264,16 @@ against the reference's:
 
 | shape | reference | `"triton"` |
 |---|---|---|
-| `d_model = 512`, 4 × 1,024 positions | 184 ms · 2.4 GiB | 73 ms · 1.6 GiB |
-| `d_model = 256`, 2 × 8,192 | 596 ms · 6.4 GiB | 157 ms · 2.4 GiB |
-| `d_model = 128`, 1 × 32,768 | 1,765 ms · 10.7 GiB | 194 ms · 2.4 GiB |
+| `d_model = 512`, 4 × 1,024 positions | 184 ms · 2.4 GiB | 52 ms · 1.8 GiB |
+| `d_model = 256`, 2 × 8,192 | 596 ms · 6.3 GiB | 101 ms · 2.5 GiB |
+| `d_model = 128`, 1 × 32,768 | 1,708 ms · 10.4 GiB | 149 ms · 2.4 GiB |
+| `d_model = 128`, 4 × 32,768, `chunk_size = 16` | out of memory | 431 ms · 9.4 GiB |
 
 The longer and narrower the sequence, the larger the gain: the reference's cost
 there was launching small operations per chunk, which the walk does not do.
-`chunk_size = 16` was faster than 32 on this path at every shape measured. These
-are one machine's numbers; on yours, measure.
+Without gradients the forward is 5--23× faster on the same shapes. On this path
+`chunk_size` matters little -- 16 was 2--8% faster than 32, and 32 kept less
+memory. These are one machine's numbers; on yours, measure.
 
 ```bash
 pytest -m "gpu and triton" tests/test_sdm_triton.py

@@ -647,14 +647,24 @@ Measured on one machine (a Pascal card, fp32, `N = 128²`, `W = R = 64`,
 
 | shape | reference | Triton |
 |---|---|---|
-| `d_model = 512`, 4 × 1,024 | 184 ms · 2.4 GiB | 73 ms · 1.6 GiB |
-| `d_model = 256`, 2 × 8,192 | 596 ms · 6.4 GiB | 157 ms · 2.4 GiB |
-| `d_model = 128`, 1 × 32,768 | 1,765 ms · 10.7 GiB | 194 ms · 2.4 GiB |
+| `d_model = 512`, 4 × 1,024 | 184 ms · 2.4 GiB | 52 ms · 1.8 GiB |
+| `d_model = 256`, 2 × 8,192 | 596 ms · 6.3 GiB | 101 ms · 2.5 GiB |
+| `d_model = 256`, 1 × 16,384 | 843 ms · 6.2 GiB | 112 ms · 2.4 GiB |
+| `d_model = 128`, 1 × 32,768 | 1,708 ms · 10.4 GiB | 149 ms · 2.4 GiB |
 
 The gain grows as rows narrow and sequences lengthen, where the reference was
 bound by launching operations. Memory falls because the pairwise arrays are not
-kept, or formed. On this path `C = 16` was faster than 32 at every shape, by
-2--20%; `C = 64` was slower. The default is unchanged.
+kept, or formed; four rows of 32,768 at `C = 16`, out of memory on the reference
+in 22 GiB, train in 9.4. On this path `C` matters little: 16 was 2--8% faster
+than 32, which kept less memory. The default is unchanged.
+
+Two further measured choices. The walks' loops over entry blocks are not
+unrolled: unrolling kept every block's tiles live, at the register limit and
+spilling, where the rolled loop ran 9--22% faster. And the work that does not
+wait on the walk -- the next group's table-free half in the forward, a group's
+reductions after its own walk in the backward -- runs on a second stream beside
+it, for 2--7%: concurrent kernels slow the latency-bound walk, which gives back
+much of the overlap.
 
 Held by tests (`tests/test_sdm_triton.py`): §7.17.
 
