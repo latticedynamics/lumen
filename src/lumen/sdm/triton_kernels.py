@@ -451,10 +451,13 @@ if HAS_TRITON:
                     rows = tl.load(
                         TABLE + idx * D + d3, mask=first & d3_ok, other=0.0, cache_modifier=".cg"
                     )
-                new_rows = decay * rows
+                # The head of a slot's segment is its first writer itself, at
+                # this very position: its share is this chunk's δ, already here.
+                coef = tl.load(COEF + entry, mask=first, other=0.0)
+                new_rows = decay * rows + coef * delta[:, None, :]
                 lo = tl.load(WLO + entry, mask=first, other=0)
                 n = tl.load(WHI + entry, mask=first, other=0) - lo
-                for j in range(tl.max(n)):
+                for j in range(1, tl.max(n)):
                     valid = first & (j < n)
                     m = tl.load(WORDER + base * W + lo + j, mask=valid, other=0)
                     coef = tl.load(COEF + base * W + m, mask=valid, other=0.0)
@@ -468,10 +471,61 @@ if HAS_TRITON:
             tl.debug_barrier()
 
     @triton.jit
+    def _read_sums_kernel(
+        RW, G_OUT, RORDER, RLO, RHI, RRLO, RRHI,
+        RSUM, ROWNER,
+        D: tl.constexpr, R: tl.constexpr, C: tl.constexpr,
+        BC: tl.constexpr, BR: tl.constexpr, BD: tl.constexpr,
+    ):
+        """What a chunk's reads hand back to each slot they read, summed per slot.
+
+        Depends on nothing the backward walk carries -- only the output's
+        gradient -- so it runs before the walk, with the whole card, one
+        program per chunk and block of columns.  Each read segment's sum lands
+        at its head; ``ROWNER`` marks the heads whose slot no write in the
+        chunk names, which own that slot in the walk.
+        """
+        pc = tl.program_id(0).to(tl.int64)
+        d = tl.program_id(1) * BD + tl.arange(0, BD)
+        base = pc * C
+        t = tl.arange(0, BC)
+        t3 = t[:, None, None]
+        d3 = d[None, None, :]
+        d3_ok = d3 < D
+        r3 = tl.arange(0, BR)[None, :, None]
+        g_out = tl.load(
+            G_OUT + (base + t[:, None]) * D + d[None, :],
+            mask=(t < C)[:, None] & (d < D)[None, :],
+            other=0.0,
+        )
+        for r0 in tl.static_range(0, R, BR):
+            ok = (t3 < C) & (r0 + r3 < R)
+            entry = (base + t3) * R + r0 + r3
+            lo = tl.load(RRLO + entry, mask=ok, other=0)
+            head = ok & (tl.load(RORDER + base * R + lo, mask=ok, other=-1) == entry - base * R)
+            n = tl.load(RRHI + entry, mask=head, other=0) - tl.where(head, lo, 0)
+            # The head reads at this position, so its share needs no gather.
+            owed = tl.load(RW + entry, mask=head, other=0.0) * g_out[:, None, :]
+            for j in range(1, tl.max(n)):
+                valid = head & (j < n)
+                f = tl.load(RORDER + base * R + lo + j, mask=valid, other=0)
+                weight = tl.load(RW + base * R + f, mask=valid, other=0.0)
+                g_out_f = tl.load(
+                    G_OUT + (base + f // R) * D + d3, mask=valid & d3_ok, other=0.0
+                )
+                owed += weight * g_out_f
+            tl.store(RSUM + entry * D + d3, owed, mask=head & d3_ok)
+            if tl.program_id(1) == 0:
+                unwritten = tl.load(RHI + entry, mask=head, other=0) == tl.load(
+                    RLO + entry, mask=head, other=0
+                )
+                tl.store(ROWNER + entry, (head & unwritten).to(tl.int8), mask=ok)
+
+    @triton.jit
     def _walk_bwd_kernel(
         GT, W_IDX, R_IDX, DEST,
-        WORDER, WLO, WHI, RLO, RHI, RORDER, WRLO, WRHI, RRLO, RRHI,
-        BETA, WW, RW, X, Q, DE, COEF, G_OUT,
+        WORDER, WLO, WHI, RORDER, WRLO, WRHI, RSUM, ROWNER,
+        BETA, WW, X, Q, DE, COEF, G_OUT,
         GSLOT, GDELTA, GU,
         n_chunks, L,
         D: tl.constexpr, W: tl.constexpr, R: tl.constexpr, C: tl.constexpr,
@@ -506,6 +560,7 @@ if HAS_TRITON:
             pos = base + t
 
             g_out = tl.load(G_OUT + pos[:, None] * D + d[None, :], mask=td_ok, other=0.0)
+            beta = tl.load(BETA + pos, mask=t_ok, other=0.0)
             qk = tl.load(Q + pos[:, None] * C + t[None, :], mask=cc_ok, other=0.0)
             # gδ[s] = Σ_t QK[t, s] · g_out[t]
             g_delta = _mm_t(qk, g_out, DOT)
@@ -541,10 +596,13 @@ if HAS_TRITON:
                 decay = tl.load(DE + entry, mask=first, other=0.0)
                 # What the new row passed back through the decay ...
                 owed = decay * tl.load(GSLOT + entry * D + d3, mask=first & d3_ok, other=0.0)
-                # ... what every write's retrieval drew from it ...
+                # ... what every write's retrieval drew from it, starting with
+                # the owner's own, at this position ...
+                weight = tl.load(WW + entry, mask=first, other=0.0)
+                owed -= (weight * beta[:, None, None]) * g_u[:, None, :]
                 lo = tl.load(WLO + entry, mask=first, other=0)
                 n = tl.load(WHI + entry, mask=first, other=0) - lo
-                for j in range(tl.max(n)):
+                for j in range(1, tl.max(n)):
                     valid = first & (j < n)
                     m = tl.load(WORDER + base * W + lo + j, mask=valid, other=0)
                     s = m // W
@@ -552,17 +610,11 @@ if HAS_TRITON:
                     beta_m = tl.load(BETA + base + s, mask=valid, other=0.0)
                     g_u_m = tl.load(GU + (base + s) * D + d3, mask=valid & d3_ok, other=0.0)
                     owed -= (weight * beta_m) * g_u_m
-                # ... and every read of it.
+                # ... and every read of it, summed before the walk began.
                 lo = tl.load(WRLO + entry, mask=first, other=0)
-                n = tl.load(WRHI + entry, mask=first, other=0) - lo
-                for j in range(tl.max(n)):
-                    valid = first & (j < n)
-                    f = tl.load(RORDER + base * R + lo + j, mask=valid, other=0)
-                    weight = tl.load(RW + base * R + f, mask=valid, other=0.0)
-                    g_out_f = tl.load(
-                        G_OUT + (base + f // R) * D + d3, mask=valid & d3_ok, other=0.0
-                    )
-                    owed += weight * g_out_f
+                read = first & (tl.load(WRHI + entry, mask=first, other=0) > lo)
+                head = tl.load(RORDER + base * R + lo, mask=read, other=0)
+                owed += tl.load(RSUM + (base * R + head) * D + d3, mask=read & d3_ok, other=0.0)
                 # A replaced row's gradient is exactly this: nothing after the
                 # chunk reached the old value except through the new row.
                 tl.store(GT + dest * D + d3, owed, mask=first & d3_ok)
@@ -571,24 +623,10 @@ if HAS_TRITON:
             for r0 in tl.static_range(0, R, BR):
                 ok = (t3 < C) & (r0 + r3 < R)
                 entry = (base + t3) * R + r0 + r3
-                n_writes = tl.load(RHI + entry, mask=ok, other=0) - tl.load(
-                    RLO + entry, mask=ok, other=0
-                )
-                lo = tl.load(RRLO + entry, mask=ok, other=0)
-                head = tl.load(RORDER + base * R + lo, mask=ok, other=-1)
-                owner = ok & (n_writes == 0) & (head == entry - base * R)
-                n = tl.load(RRHI + entry, mask=owner, other=0) - tl.where(owner, lo, 0)
-                owed = tl.zeros((BC, BR, BD), dtype=tl.float32)
-                for j in range(tl.max(n)):
-                    valid = owner & (j < n)
-                    f = tl.load(RORDER + base * R + lo + j, mask=valid, other=0)
-                    weight = tl.load(RW + base * R + f, mask=valid, other=0.0)
-                    g_out_f = tl.load(
-                        G_OUT + (base + f // R) * D + d3, mask=valid & d3_ok, other=0.0
-                    )
-                    owed += weight * g_out_f
-                idx = tl.load(R_IDX + entry, mask=owner, other=0)
+                owner = ok & (tl.load(ROWNER + entry, mask=ok, other=0) != 0)
                 keep = owner & d3_ok
+                idx = tl.load(R_IDX + entry, mask=owner, other=0)
+                owed = tl.load(RSUM + entry * D + d3, mask=keep, other=0.0)
                 held = tl.load(GT + idx * D + d3, mask=keep, other=0.0, cache_modifier=".cg")
                 tl.store(GT + idx * D + d3, held + owed, mask=keep)
 
@@ -714,8 +752,11 @@ def _walk_launch(
     """
     block_c = _next_pow2(chunk)
     slots = torch.cuda.get_device_properties(device).multi_processor_count
+    # Past 32 positions the broadcast products hold C·C·BD values at once,
+    # which no column block fits, so the block must be wide enough for tl.dot.
+    narrowest = (8, 16) if block_c <= 32 else (16,)
     block_d = 32
-    for width in (8, 16):
+    for width in narrowest:
         if rows * triton.cdiv(d_v, width) <= slots:
             block_d = width
             break
@@ -743,44 +784,55 @@ def _terms_blocks(chunk: int, n_writes: int, n_reads: int) -> dict[str, int]:
 # ── the sort ──────────────────────────────────────────────────────────────
 
 
-def _segments(w_idx: torch.Tensor, r_idx: torch.Tensor) -> tuple[torch.Tensor, ...]:
-    """Every entry's segments, by one sort of the writes and one of the reads.
+def _segments(
+    w_idx: torch.Tensor, r_idx: torch.Tensor, n_slots: int, reads_too: bool
+) -> tuple[torch.Tensor, ...]:
+    """Every entry's segments, by one sort of the writes (and one of the reads).
 
-    `(P', C, W|R)` slots → int32, flat per chunk:
+    `(P', C, W|R)` slots, each below ``n_slots`` → int32, flat per chunk:
 
     * ``worder`` `(P', C·W)` -- write entries sorted by `slot·C + position`,
       unique because a position names a slot at most once;
     * ``wlo, whi`` -- each write's segment of same-slot writes in it;
     * ``rlo, rhi`` -- each read's segment of writes to its slot;
+
+    and with ``reads_too`` -- the backward's, not the forward's:
+
     * ``rorder`` `(P', C·R)` -- read entries sorted the same way (a slot read
       twice at one position ties; the sort is stable, so ties keep entry order);
     * ``wrlo, wrhi`` -- each write's segment of reads of its slot;
     * ``rrlo, rrhi`` -- each read's segment of reads of its slot.
 
-    Integers only, no gradient.
+    The keys are int32 whenever `n_slots·C` fits, which halves what the sort
+    and the searches move.  Integers only, no gradient.
     """
     rows, chunk, n_writes = w_idx.shape
     n_reads = r_idx.shape[-1]
-    position = torch.arange(chunk, device=w_idx.device).view(1, chunk, 1)
+    if n_slots * chunk < 2**31:
+        w_idx, r_idx = w_idx.to(torch.int32), r_idx.to(torch.int32)
+    position = torch.arange(chunk, device=w_idx.device, dtype=w_idx.dtype).view(1, chunk, 1)
     w_base = (w_idx * chunk).reshape(rows, chunk * n_writes)
     r_base = (r_idx * chunk).reshape(rows, chunk * n_reads)
     w_keys, w_order = torch.sort((w_idx * chunk + position).reshape(rows, -1), dim=-1)
+
+    def search(keys: torch.Tensor, base: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return (
+            torch.searchsorted(keys, base, out_int32=True),
+            torch.searchsorted(keys, base + chunk, out_int32=True),
+        )
+
+    found = (w_order.to(torch.int32), *search(w_keys, w_base), *search(w_keys, r_base))
+    if not reads_too:
+        return found
     r_keys, r_order = torch.sort(
         (r_idx * chunk + position).reshape(rows, -1), dim=-1, stable=True
     )
-    found = (
-        w_order,
-        torch.searchsorted(w_keys, w_base),
-        torch.searchsorted(w_keys, w_base + chunk),
-        torch.searchsorted(w_keys, r_base),
-        torch.searchsorted(w_keys, r_base + chunk),
-        r_order,
-        torch.searchsorted(r_keys, w_base),
-        torch.searchsorted(r_keys, w_base + chunk),
-        torch.searchsorted(r_keys, r_base),
-        torch.searchsorted(r_keys, r_base + chunk),
+    return (
+        *found,
+        r_order.to(torch.int32),
+        *search(r_keys, w_base),
+        *search(r_keys, r_base),
     )
-    return tuple(x.to(torch.int32) for x in found)
 
 
 # ── one group of chunks: terms, solve, walk ───────────────────────────────
@@ -808,8 +860,9 @@ def _forward_group(
     d_v = table.shape[-1]
     n = length // chunk
     fold = (rows * n, chunk)
-    segments = _segments(w_idx.view(*fold, n_writes), r_idx.view(*fold, n_reads))
-    w_order, w_lo, w_hi, r_lo, r_hi = segments[:5]
+    w_order, w_lo, w_hi, r_lo, r_hi = _segments(
+        w_idx.view(*fold, n_writes), r_idx.view(*fold, n_reads), table.shape[0], reads_too=False
+    )
 
     new = w_val.new_empty
     g_w, g_end, g_r = new(w_val.shape), new(w_val.shape), new(r_val.shape)
@@ -909,7 +962,24 @@ class _TritonGroup(torch.autograd.Function):
         if grad is None:
             grad = v.new_zeros(ctx.table_shape)
         g_out = v.new_zeros(v.shape) if g_out is None else g_out.contiguous()
-        segments = _segments(w_idx.view(*fold, n_writes), r_idx.view(*fold, n_reads))
+        segments = _segments(
+            w_idx.view(*fold, n_writes), r_idx.view(*fold, n_reads), ctx.table_shape[0],
+            reads_too=True,
+        )
+
+        w_order, w_lo, w_hi, r_lo, r_hi, r_order, wr_lo, wr_hi, rr_lo, rr_hi = segments
+
+        # ── what the reads hand back: no walk needed, so all at once ───────
+        read_sums = v.new_empty(rows, length, n_reads, d_v_width)
+        read_owner = torch.empty(rows, length, n_reads, device=v.device, dtype=torch.int8)
+        block_c, block_d = _next_pow2(chunk), 8
+        _read_sums_kernel[(rows * n, triton.cdiv(d_v_width, block_d))](
+            saved["r_weight"], g_out, r_order, r_lo, r_hi, rr_lo, rr_hi,
+            read_sums, read_owner,
+            D=d_v_width, R=n_reads, C=chunk,
+            BC=block_c, BR=min(_next_pow2(n_reads), max(1, 8192 // (block_c * block_d))),
+            BD=block_d, num_warps=4,
+        )
 
         # ── the walk, in reverse: only the table gradient is sequential ────
         g_slot = v.new_empty(rows, length, n_writes, d_v_width)
@@ -917,8 +987,9 @@ class _TritonGroup(torch.autograd.Function):
         g_u = torch.empty_like(v)
         blocks, grid, warps = _walk_launch(rows, chunk, n_writes, n_reads, d_v_width, v.device)
         _walk_bwd_kernel[grid](
-            grad, w_idx, r_idx, saved["dest"], *segments,
-            beta, saved["w_weight"], saved["r_weight"], saved["transform"], saved["qk"],
+            grad, w_idx, r_idx, saved["dest"],
+            w_order, w_lo, w_hi, r_order, wr_lo, wr_hi, read_sums, read_owner,
+            beta, saved["w_weight"], saved["transform"], saved["qk"],
             saved["decay_end"], saved["coef"], g_out,
             g_slot, g_delta, g_u,
             n, length,
@@ -955,7 +1026,7 @@ class _TritonGroup(torch.autograd.Function):
         d_a = beta_c.unsqueeze(-1) * d_b
 
         # ── the terms ─────────────────────────────────────────────────────
-        w_order, w_lo, w_hi, r_lo, r_hi, r_order, wr_lo, wr_hi = segments[:8]
+        del read_sums  # the largest transient of the backward; free before the terms
         scratch_g, scratch_end = torch.empty_like(w_val), torch.empty_like(w_val)
         scratch_gr = torch.empty_like(r_val)
         d_k, d_l, d_q = torch.empty_like(w_val), torch.empty_like(w_val), torch.empty_like(r_val)
@@ -976,6 +1047,13 @@ class _TritonGroup(torch.autograd.Function):
 
 
 # ── the driver ────────────────────────────────────────────────────────────
+
+
+#: The longest chunk the kernels take.  The walk holds a chunk's `(C, C)`
+#: solve as one tile, and ``tl.dot`` stages it in shared memory: 16 KB at 64,
+#: 64 KB at 128, past the 48 KB a block gets on the bench card.  Longer chunks
+#: were also the slowest measured there, so they run the reference.
+MAX_CHUNK = 64
 
 
 def usable(tensor: torch.Tensor) -> bool:
@@ -1003,9 +1081,15 @@ def chunk_sparse_delta(
     same shapes, same preconditions.  ``recompute_pairwise`` is accepted and
     has nothing to do: no pairwise array is kept, or formed.  Falls back to the
     reference -- which is what runs under a ``torch.func`` transform, on a CPU
-    tensor, or in any dtype but fp32 -- rather than refusing.
+    tensor, in any dtype but fp32, or for a chunk longer than ``MAX_CHUNK`` --
+    rather than refusing.
     """
-    if not usable(v) or not usable(memory) or ref._transforms_active():
+    if (
+        not usable(v)
+        or not usable(memory)
+        or ref._transforms_active()
+        or chunk_size > MAX_CHUNK
+    ):
         return ref.chunk_sparse_delta(
             memory, write_idx, write_val, log_decay, v, beta, read_idx, read_val,
             chunk_size=chunk_size, check_writes=check_writes, group=group,

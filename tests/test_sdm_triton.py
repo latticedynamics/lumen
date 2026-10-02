@@ -210,6 +210,20 @@ def test_fp64_on_cuda_runs_the_reference_exactly() -> None:
         assert torch.equal(got[name], want[name]), name
 
 
+@requires_cuda
+@needs_cuda
+def test_a_chunk_past_the_limit_runs_the_reference_exactly() -> None:
+    """A chunk too long for the kernels' tiles is the reference's, bit for bit
+    in the forward (the backward's own scatter-adds reorder on CUDA)."""
+    inputs = draw(seq_len=150)
+    chunk = tk.MAX_CHUNK * 2
+    args = [x.detach() for x in place(inputs, "cuda", torch.float32).values()]
+    got = tk.chunk_sparse_delta(*args, chunk_size=chunk)
+    want = ref.chunk_sparse_delta(*args, chunk_size=chunk)
+    for a, b in zip(got, want):
+        assert torch.equal(a, b)
+
+
 def test_vmap_runs_the_reference() -> None:
     """A ``torch.func`` transform cannot see into the kernels; the reference's
     functional holder runs instead, as it does for the reference itself."""
@@ -238,6 +252,11 @@ CASES = {
     "wide-values": (dict(d_v=40, n_slots=64, n_writes=8, n_reads=8, seq_len=64), 16),
     "per-stream-table": (dict(shared_memory=False), 8),
     "realistic": (dict(batch=1, n_slots=4096, n_writes=64, n_reads=64, d_v=64, seq_len=96), 32),
+    # Past 32 positions the walk must take tl.dot; past 64 entries a chunk
+    # gathers in more than one block.
+    "long-chunk": (dict(n_slots=1024, n_writes=8, n_reads=8, d_v=24, seq_len=200), 64),
+    "many-entries": (dict(batch=1, heads=1, n_slots=4096, n_writes=128, n_reads=96, d_v=16, seq_len=40), 16),
+    "narrow-values": (dict(d_v=3), 8),
 }
 
 
