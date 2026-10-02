@@ -259,6 +259,7 @@ CASES = {
     "default": (dict(), 8),
     "ragged-last-chunk": (dict(seq_len=45), 8),
     "chunk-of-one": (dict(seq_len=12), 1),
+    "shorter-than-a-chunk": (dict(seq_len=5), 8),
     "chunk-not-a-power-of-two": (dict(seq_len=50), 6),
     "one-write-one-read": (dict(n_writes=1, n_reads=1), 8),
     "crowded": (dict(crowd=6, n_reads=4, seq_len=40), 8),
@@ -618,3 +619,22 @@ def test_a_batch_on_another_device_than_the_current_one() -> None:
     for name in got:
         assert got[name].device == torch.device("cuda:1")
         assert distance(got[name], want[name]) < FP32_ROUNDOFF, name
+
+
+@requires_cuda
+@requires_triton
+@needs_cuda
+@needs_triton
+def test_grouping_is_inert_bit_for_bit() -> None:
+    """How many chunks share a launch changes how the work is batched and
+    nothing it computes: each chunk's terms are their own program, and the
+    walk takes the chunks in the same order either way -- so the same bits,
+    outputs and every gradient, at one chunk per group, three, and all."""
+    inputs = draw(seq_len=96)
+    results = [
+        run(tk.chunk_sparse_delta, place(inputs, "cuda", torch.float32), 8, group=group)
+        for group in (1, 3, 12)
+    ]
+    for other in results[1:]:
+        for name in results[0]:
+            assert torch.equal(other[name], results[0][name]), name
