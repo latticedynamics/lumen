@@ -1079,22 +1079,46 @@ def chunk_sparse_delta(
 
     Same signature less ``in_place`` (the table is always held in place here),
     same shapes, same preconditions.  ``recompute_pairwise`` is accepted and
-    has nothing to do: no pairwise array is kept, or formed.  Falls back to the
-    reference -- which is what runs under a ``torch.func`` transform, on a CPU
-    tensor, in any dtype but fp32, or for a chunk longer than ``MAX_CHUNK`` --
-    rather than refusing.
+    has nothing to do: no pairwise array is kept, or formed.
+
+    Under ``torch.vmap`` **without gradients** the kernels still run: the
+    mapped axis becomes more streams (see :func:`_forward_op`).  With
+    gradients under a transform, on a CPU tensor, in any dtype but fp32, or for
+    a chunk longer than ``MAX_CHUNK``, the reference runs instead -- rather
+    than a refusal.
     """
-    if (
-        not usable(v)
-        or not usable(memory)
-        or ref._transforms_active()
-        or chunk_size > MAX_CHUNK
-    ):
+    args = (memory, write_idx, write_val, log_decay, v, beta, read_idx, read_val)
+    floats = (memory, write_val, log_decay, v, beta, read_val)
+    runs_here = usable(v) and usable(memory) and chunk_size <= MAX_CHUNK
+    if runs_here and ref._transforms_active():
+        wants_grad = torch.is_grad_enabled() and any(x.requires_grad for x in floats)
+        if not wants_grad:
+            if check_writes:
+                ref._check_distinct_writes(write_idx)
+            return _forward_op(*args, chunk_size, 0 if group is None else group)
+        runs_here = False
+    if not runs_here:
         return ref.chunk_sparse_delta(
-            memory, write_idx, write_val, log_decay, v, beta, read_idx, read_val,
-            chunk_size=chunk_size, check_writes=check_writes, group=group,
+            *args, chunk_size=chunk_size, check_writes=check_writes, group=group,
             recompute_pairwise=recompute_pairwise,
         )
+    return _drive(*args, chunk_size=chunk_size, check_writes=check_writes, group=group)
+
+
+def _drive(
+    memory: torch.Tensor,
+    write_idx: torch.Tensor,
+    write_val: torch.Tensor,
+    log_decay: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    read_idx: torch.Tensor,
+    read_val: torch.Tensor,
+    chunk_size: int,
+    check_writes: bool,
+    group: int | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The kernels' driver: flatten, pad, group, walk.  Plain tensors only."""
     if chunk_size < 1:
         raise ValueError(f"chunk_size must be >= 1, got {chunk_size}")
     if group is not None and group < 1:
@@ -1162,3 +1186,60 @@ def chunk_sparse_delta(
     out = torch.cat(outputs, dim=1).reshape(rows, padded_len, d_v)[:, :seq_len]
     final = arena.result(n_real) if arena is not None else table
     return out.reshape(*lead, seq_len, d_v), final.reshape(*lead, n_slots, d_v)
+
+
+# ── vmap without gradients: the mapped axis is more streams ──────────────
+#
+# A ``torch.func`` transform cannot see into a Triton launch, so the forward is
+# a custom op with its own batching rule.  The rule is the kernels' native
+# shape: any leading axes are streams, so the mapped axis moves to the front
+# and the whole call runs once.  Forward only -- with gradients under a
+# transform the reference's functional holder runs, which every transform
+# accepts.
+
+
+@torch.library.custom_op("lumen::sdm_triton_forward", mutates_args=())
+def _forward_op(
+    memory: torch.Tensor,
+    write_idx: torch.Tensor,
+    write_val: torch.Tensor,
+    log_decay: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    read_idx: torch.Tensor,
+    read_val: torch.Tensor,
+    chunk_size: int,
+    group: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    with torch.no_grad():
+        return _drive(
+            memory, write_idx, write_val, log_decay, v, beta, read_idx, read_val,
+            chunk_size=chunk_size, check_writes=False, group=group or None,
+        )
+
+
+@_forward_op.register_fake
+def _(memory, write_idx, write_val, log_decay, v, beta, read_idx, read_val, chunk_size, group):  # noqa: ANN001, ANN202
+    lead = write_idx.shape[:-2]
+    n_slots, d_v = memory.shape[-2:]
+    return v.new_empty(*lead, write_idx.shape[-2], d_v), memory.new_empty(*lead, n_slots, d_v)
+
+
+@_forward_op.register_vmap
+def _(info, in_dims, memory, write_idx, write_val, log_decay, v, beta, read_idx, read_val, chunk_size, group):  # noqa: ANN001, ANN202
+    size = info.batch_size
+
+    def front(x: torch.Tensor, dim: int | None) -> torch.Tensor:
+        return x.movedim(dim, 0) if dim is not None else x.expand(size, *x.shape)
+
+    tensors = [
+        front(x, dim)
+        for x, dim in zip(
+            (memory, write_idx, write_val, log_decay, v, beta, read_idx, read_val), in_dims[:8]
+        )
+    ]
+    # A shared table has fewer leading axes than the streams; its own mapped
+    # axis now leads, and the axes it broadcasts over go in after it.
+    while tensors[0].dim() < tensors[1].dim():
+        tensors[0] = tensors[0].unsqueeze(1)
+    return _forward_op(*tensors, chunk_size, group), (0, 0)

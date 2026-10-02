@@ -61,6 +61,9 @@ def draw(
     d_v: int = 5,
     shared_memory: bool = True,
     crowd: int = 0,
+    decay: str = "write_set",
+    write_slots: tuple[int, int] | None = None,
+    log_alpha: torch.Tensor | None = None,
     seed: int = 0,
 ) -> dict[str, torch.Tensor]:
     """Kernel inputs obeying the layer's invariants, in fp64 on the host.
@@ -71,24 +74,34 @@ def draw(
     chunk.  ``crowd`` > 0 confines writes AND reads to that many slots, which
     also puts the same slot in one position's reads twice.  ``shared_memory``
     gives one `(H, N, d_v)` table broadcast over the batch, as a learned
-    initial table is.
+    initial table is.  ``decay="key"`` weights each write's log-decay by its
+    write weight; ``write_slots=(lo, hi)`` confines writes to that range.
     """
     g = torch.Generator().manual_seed(seed)
     lead = (batch, heads)
     pool = crowd if crowd else n_slots
     write_idx = torch.rand(*lead, seq_len, pool, generator=g).argsort(-1)[..., :n_writes]
+    if write_slots is not None:
+        lo, hi = write_slots
+        write_idx = lo + torch.rand(*lead, seq_len, hi - lo, generator=g).argsort(-1)[..., :n_writes]
     if crowd:
         read_idx = torch.randint(0, pool, (*lead, seq_len, n_reads), generator=g)
     else:
         read_idx = torch.rand(*lead, seq_len, n_slots, generator=g).argsort(-1)[..., :n_reads]
     randn = lambda *shape: torch.randn(*shape, generator=g, dtype=torch.float64)  # noqa: E731
-    log_alpha = -F.softplus(2.0 * randn(*lead, seq_len))
+    if log_alpha is None:
+        log_alpha = -F.softplus(2.0 * randn(*lead, seq_len))
+    write_val = torch.softmax(randn(*lead, seq_len, n_writes), -1)
+    if decay == "key":
+        log_decay = log_alpha.unsqueeze(-1) * write_val
+    else:
+        log_decay = log_alpha.unsqueeze(-1).expand(*lead, seq_len, n_writes)
     memory_lead = (heads,) if shared_memory else lead
     return {
         "memory": randn(*memory_lead, n_slots, d_v),
         "write_idx": write_idx,
-        "write_val": torch.softmax(randn(*lead, seq_len, n_writes), -1),
-        "log_decay": log_alpha.unsqueeze(-1).expand(*lead, seq_len, n_writes).contiguous(),
+        "write_val": write_val,
+        "log_decay": log_decay.contiguous(),
         "v": randn(*lead, seq_len, d_v),
         "beta": 2.0 * torch.sigmoid(randn(*lead, seq_len)),
         "read_idx": read_idx,
@@ -224,9 +237,9 @@ def test_a_chunk_past_the_limit_runs_the_reference_exactly() -> None:
         assert torch.equal(a, b)
 
 
-def test_vmap_runs_the_reference() -> None:
-    """A ``torch.func`` transform cannot see into the kernels; the reference's
-    functional holder runs instead, as it does for the reference itself."""
+def test_vmap_on_the_host_runs_the_reference() -> None:
+    """Under a transform on a CPU tensor the reference's functional holder
+    runs, exactly as it does for the reference itself."""
     inputs = place(draw(batch=3, heads=1, shared_memory=False), "cpu", torch.float64)
     args = [inputs[a].detach() for a in ARGS]
 
@@ -251,6 +264,7 @@ CASES = {
     "crowded": (dict(crowd=6, n_reads=4, seq_len=40), 8),
     "wide-values": (dict(d_v=40, n_slots=64, n_writes=8, n_reads=8, seq_len=64), 16),
     "per-stream-table": (dict(shared_memory=False), 8),
+    "key-weighted-decay": (dict(decay="key"), 8),
     "realistic": (dict(batch=1, n_slots=4096, n_writes=64, n_reads=64, d_v=64, seq_len=96), 32),
     # Past 32 positions the walk must take tl.dot; past 64 entries a chunk
     # gathers in more than one block.
@@ -388,3 +402,173 @@ def test_the_layer_agrees_with_itself_across_backends() -> None:
     y_tri.square().sum().backward()
     for (name, p_ref), p_tri in zip(reference.named_parameters(), accelerated.parameters()):
         assert distance(p_tri.grad, p_ref.grad) < FP32_ROUNDOFF, name
+
+
+@requires_cuda
+@requires_triton
+@needs_cuda
+@needs_triton
+def test_every_slot_selected_is_gated_deltanet() -> None:
+    """`N = d_k`, `W = R = N`, dense unit keys: Gated DeltaNet, exactly the
+    reduction ``test_sdm.py`` holds the reference to.  For these kernels it is
+    also the worst case of the segment walk: every slot is written at every
+    position, so every segment holds the whole chunk."""
+    from lumen.gdn.reference import sequential_gated_delta
+
+    batch, seq_len, d_k, d_v = 2, 40, 8, 5
+    g = torch.Generator().manual_seed(3)
+    randn = lambda *shape: torch.randn(*shape, generator=g, dtype=torch.float64)  # noqa: E731
+    q = F.normalize(randn(batch, 1, 1, seq_len, d_k), dim=-1)
+    k = F.normalize(randn(batch, 1, 1, seq_len, d_k), dim=-1)
+    v = randn(batch, 1, 1, seq_len, d_v)
+    beta = 2.0 * torch.sigmoid(randn(batch, 1, 1, seq_len))
+    log_alpha = -F.softplus(randn(batch, 1, 1, seq_len))
+    y_gdn, m_gdn = sequential_gated_delta(q, k, v, beta, log_alpha)
+
+    every_slot = torch.arange(d_k).expand(batch, seq_len, d_k)
+    sdm = [
+        torch.zeros(batch, d_k, d_v, dtype=torch.float64),
+        every_slot,
+        k[:, 0, 0],
+        log_alpha[:, 0, 0].unsqueeze(-1).expand(batch, seq_len, d_k).contiguous(),
+        v[:, 0, 0],
+        beta[:, 0, 0],
+        every_slot,
+        q[:, 0, 0],
+    ]
+    sdm = [x.cuda().float() if x.is_floating_point() else x.cuda() for x in sdm]
+    y, m = tk.chunk_sparse_delta(*sdm, chunk_size=8)
+    assert distance(y, y_gdn[:, 0, 0].cuda()) < FP32_ROUNDOFF
+    assert distance(m, m_gdn[:, 0, 0].cuda()) < FP32_ROUNDOFF
+
+
+@requires_cuda
+@requires_triton
+@needs_cuda
+@needs_triton
+def test_unwritten_slots_are_frozen_bit_for_bit() -> None:
+    """A slot no position writes comes out as it went in, exactly -- including
+    the slots a ragged last chunk's padding names, which it writes back as
+    `exp(0)·row + 0·δ`.  The walk stores only first writers, so nothing else
+    touches them."""
+    n_slots = 24
+    inputs = place(draw(seq_len=45, write_slots=(n_slots // 2, n_slots)), "cuda", torch.float32)
+    _, final = tk.chunk_sparse_delta(*(inputs[a].detach() for a in ARGS), chunk_size=8)
+    entering = inputs["memory"].detach().expand_as(final)
+    untouched = slice(0, n_slots // 2)
+    assert torch.equal(final[..., untouched, :], entering[..., untouched, :])
+    assert not torch.equal(final[..., n_slots // 2 :, :], entering[..., n_slots // 2 :, :])
+
+
+@requires_cuda
+@requires_triton
+@needs_cuda
+@needs_triton
+def test_no_overflow_at_extreme_decay() -> None:
+    """Every write a full wipe: finite, and each slot holds exactly its last
+    write.  Every exponent the kernels form is `<= 0` -- the carry coefficient's
+    `G_end − G` included -- so the worst that happens is underflow to zero,
+    which is the right answer for a wiped slot."""
+    batch, heads, seq_len = 2, 2, 40
+    log_alpha = torch.full((batch, heads, seq_len), -1e4, dtype=torch.float64)
+    inputs = draw(log_alpha=log_alpha, seq_len=seq_len, shared_memory=False)
+    got = run(tk.chunk_sparse_delta, place(inputs, "cuda", torch.float32), 16)
+    assert all(torch.isfinite(x).all() for x in got.values())
+    want = oracle(inputs, 16)
+    assert distance(got["out"], want["out"]) < FP32_ROUNDOFF
+    assert distance(got["final"], want["final"]) < FP32_ROUNDOFF
+    expected = inputs["memory"].clone()
+    fresh = inputs["write_val"].unsqueeze(-1) * (inputs["beta"].unsqueeze(-1) * inputs["v"]).unsqueeze(-2)
+    for t in range(seq_len):  # in order, so the last writer wins
+        index = inputs["write_idx"][:, :, t].unsqueeze(-1).expand_as(fresh[:, :, t])
+        expected = expected.scatter(-2, index, fresh[:, :, t])
+    assert distance(got["final"], expected.cuda()) < FP32_ROUNDOFF
+
+
+@requires_cuda
+@requires_triton
+@needs_cuda
+@needs_triton
+def test_the_backward_is_deterministic_without_asking() -> None:
+    """No atomics anywhere: every sum has one owner and a fixed order, so two
+    runs agree bit for bit -- outputs and every gradient -- with deterministic
+    algorithms off.  The reference cannot claim this on CUDA."""
+    assert not torch.are_deterministic_algorithms_enabled()
+    inputs = draw(crowd=6, n_reads=4, seq_len=64)
+    first = run(tk.chunk_sparse_delta, place(inputs, "cuda", torch.float32), 8)
+    second = run(tk.chunk_sparse_delta, place(inputs, "cuda", torch.float32), 8)
+    for name in first:
+        assert torch.equal(first[name], second[name]), name
+
+
+@requires_cuda
+@requires_triton
+@needs_cuda
+@needs_triton
+def test_vmap_without_gradients_runs_the_kernels() -> None:
+    """Many parameter sets in one call: the mapped axis becomes more streams.
+
+    A consumer that evaluates parameter sets under ``vmap`` with no gradient
+    gets the kernels, not the reference -- checked by the result's agreement
+    with each set run alone, and by the kernels being called at all.  Distinct
+    parameter sets and a learned table, so a rule that broadcast one set, or
+    lost the table's own mapped axis, could not pass.
+    """
+    config = SparseDeltaMemoryConfig(
+        d_model=32, n_heads=2, n_slots=16**2, initial_memory="learned",
+        n_writes=8, n_reads=8, chunk_size=16, backend="triton",
+    )
+    models = []
+    for seed in (0, 1, 2):
+        torch.manual_seed(seed)
+        model = SparseDeltaMemory(config).cuda().eval()
+        with torch.no_grad():
+            model.initial_memory.normal_()
+        models.append(model)
+    params, buffers = torch.func.stack_module_state(models)
+    base = SparseDeltaMemory(config).cuda().eval()
+    x = torch.randn(2, 50, 32, device="cuda")
+
+    def call(p: dict[str, torch.Tensor], b: dict[str, torch.Tensor]) -> torch.Tensor:
+        return torch.func.functional_call(base, (p, b), (x,))
+
+    calls = []
+    original = tk._drive
+
+    def counted(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    tk._drive = counted
+    try:
+        with torch.no_grad():
+            batched = torch.func.vmap(call)(params, buffers)
+    finally:
+        tk._drive = original
+    assert calls, "the kernels never ran under vmap"
+    with torch.no_grad():
+        for model, y in zip(models, batched):
+            assert distance(y, model(x)) < FP32_ROUNDOFF
+
+
+@requires_cuda
+@requires_triton
+@needs_cuda
+@needs_triton
+def test_vmap_with_gradients_runs_the_reference() -> None:
+    """With gradients under a transform the kernels step aside: the
+    reference's functional holder is what every transform can differentiate."""
+    inputs = place(draw(batch=3, heads=1, shared_memory=False), "cuda", torch.float32)
+    args = [inputs[a].detach() for a in ARGS]
+
+    def loss(memory: torch.Tensor, *rest: torch.Tensor) -> torch.Tensor:
+        out, final = tk.chunk_sparse_delta(memory, *rest, chunk_size=8, check_writes=False)
+        return out.square().sum() + final.square().sum()
+
+    def loss_ref(memory: torch.Tensor, *rest: torch.Tensor) -> torch.Tensor:
+        out, final = ref.chunk_sparse_delta(memory, *rest, chunk_size=8, check_writes=False)
+        return out.square().sum() + final.square().sum()
+
+    got = torch.func.grad(loss)(*args)
+    want = torch.func.grad(loss_ref)(*args)
+    assert distance(got, want) < FP32_ROUNDOFF
