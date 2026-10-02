@@ -393,7 +393,7 @@ if HAS_TRITON:
 
             # ── the rows as the chunk enters: retrieve and read back ─────────
             ret = tl.zeros((BC, BD), dtype=tl.float32)
-            for w0 in tl.static_range(0, W, BW):
+            for w0 in range(0, W, BW):
                 ok = (t3 < C) & (w0 + w3 < W)
                 entry = (base + t3) * W + w0 + w3
                 idx = tl.load(W_IDX + entry, mask=ok, other=0)
@@ -405,7 +405,7 @@ if HAS_TRITON:
                     tl.store(SAVE_W + entry * D + d3, rows, mask=ok & d3_ok)
                 ret += tl.sum(weight * rows, axis=1)
             read_back = tl.zeros((BC, BD), dtype=tl.float32)
-            for r0 in tl.static_range(0, R, BR):
+            for r0 in range(0, R, BR):
                 ok = (t3 < C) & (r0 + r3 < R)
                 entry = (base + t3) * R + r0 + r3
                 idx = tl.load(R_IDX + entry, mask=ok, other=0)
@@ -436,7 +436,7 @@ if HAS_TRITON:
             tl.debug_barrier()
 
             # ── the new rows, one per slot, placed by its first writer ─────
-            for w0 in tl.static_range(0, W, BW):
+            for w0 in range(0, W, BW):
                 ok = (t3 < C) & (w0 + w3 < W)
                 entry = (base + t3) * W + w0 + w3
                 dest = tl.load(DEST + entry, mask=ok, other=-1)
@@ -481,9 +481,13 @@ if HAS_TRITON:
 
         Depends on nothing the backward walk carries -- only the output's
         gradient -- so it runs before the walk, with the whole card, one
-        program per chunk and block of columns.  Each read segment's sum lands
-        at its head; ``ROWNER`` marks the heads whose slot no write in the
-        chunk names, which own that slot in the walk.
+        program per chunk and block of columns.  A read segment's sum lands at
+        its head, but only where the walk will look for it: a slot read more
+        than once, or read and written (its first writer gathers the sum).
+        Most slots are read once and not written, and their one term is the
+        walk's to form from registers.  ``ROWNER`` marks the heads whose slot
+        no write names, which own it in the walk: 1 for a lone read, 2 for a
+        segment whose sum is here.
         """
         pc = tl.program_id(0).to(tl.int64)
         d = tl.program_id(1) * BD + tl.arange(0, BD)
@@ -498,34 +502,36 @@ if HAS_TRITON:
             mask=(t < C)[:, None] & (d < D)[None, :],
             other=0.0,
         )
-        for r0 in tl.static_range(0, R, BR):
+        for r0 in range(0, R, BR):
             ok = (t3 < C) & (r0 + r3 < R)
             entry = (base + t3) * R + r0 + r3
             lo = tl.load(RRLO + entry, mask=ok, other=0)
             head = ok & (tl.load(RORDER + base * R + lo, mask=ok, other=-1) == entry - base * R)
             n = tl.load(RRHI + entry, mask=head, other=0) - tl.where(head, lo, 0)
+            written = tl.load(RHI + entry, mask=head, other=0) != tl.load(
+                RLO + entry, mask=head, other=0
+            )
+            summed = head & ((n > 1) | written)
             # The head reads at this position, so its share needs no gather.
-            owed = tl.load(RW + entry, mask=head, other=0.0) * g_out[:, None, :]
+            owed = tl.load(RW + entry, mask=summed, other=0.0) * g_out[:, None, :]
             for j in range(1, tl.max(n)):
-                valid = head & (j < n)
+                valid = summed & (j < n)
                 f = tl.load(RORDER + base * R + lo + j, mask=valid, other=0)
                 weight = tl.load(RW + base * R + f, mask=valid, other=0.0)
                 g_out_f = tl.load(
                     G_OUT + (base + f // R) * D + d3, mask=valid & d3_ok, other=0.0
                 )
                 owed += weight * g_out_f
-            tl.store(RSUM + entry * D + d3, owed, mask=head & d3_ok)
+            tl.store(RSUM + entry * D + d3, owed, mask=summed & d3_ok)
             if tl.program_id(1) == 0:
-                unwritten = tl.load(RHI + entry, mask=head, other=0) == tl.load(
-                    RLO + entry, mask=head, other=0
-                )
-                tl.store(ROWNER + entry, (head & unwritten).to(tl.int8), mask=ok)
+                owner = head & (written == 0)
+                tl.store(ROWNER + entry, tl.where(owner, tl.where(n > 1, 2, 1), 0).to(tl.int8), mask=ok)
 
     @triton.jit
     def _walk_bwd_kernel(
         GT, W_IDX, R_IDX, DEST,
         WORDER, WLO, WHI, RORDER, WRLO, WRHI, RSUM, ROWNER,
-        BETA, WW, X, Q, DE, COEF, G_OUT,
+        BETA, WW, RW, X, Q, DE, COEF, G_OUT,
         GSLOT, GDELTA, GU,
         n_chunks, L,
         D: tl.constexpr, W: tl.constexpr, R: tl.constexpr, C: tl.constexpr,
@@ -566,7 +572,7 @@ if HAS_TRITON:
             g_delta = _mm_t(qk, g_out, DOT)
 
             # ── the new rows: each write's slot gradient, and δ's share ────
-            for w0 in tl.static_range(0, W, BW):
+            for w0 in range(0, W, BW):
                 ok = (t3 < C) & (w0 + w3 < W)
                 entry = (base + t3) * W + w0 + w3
                 idx = tl.load(W_IDX + entry, mask=ok, other=0)
@@ -588,7 +594,7 @@ if HAS_TRITON:
             tl.debug_barrier()
 
             # ── written slots: the first writer owns the old row ───────────
-            for w0 in tl.static_range(0, W, BW):
+            for w0 in range(0, W, BW):
                 ok = (t3 < C) & (w0 + w3 < W)
                 entry = (base + t3) * W + w0 + w3
                 dest = tl.load(DEST + entry, mask=ok, other=-1)
@@ -620,13 +626,18 @@ if HAS_TRITON:
                 tl.store(GT + dest * D + d3, owed, mask=first & d3_ok)
 
             # ── slots only read: the first reader owns them ────────────────
-            for r0 in tl.static_range(0, R, BR):
+            for r0 in range(0, R, BR):
                 ok = (t3 < C) & (r0 + r3 < R)
                 entry = (base + t3) * R + r0 + r3
-                owner = ok & (tl.load(ROWNER + entry, mask=ok, other=0) != 0)
+                kind = tl.load(ROWNER + entry, mask=ok, other=0)
+                owner = ok & (kind != 0)
                 keep = owner & d3_ok
                 idx = tl.load(R_IDX + entry, mask=owner, other=0)
-                owed = tl.load(RSUM + entry * D + d3, mask=keep, other=0.0)
+                # A lone read's share is formed here; a segment's was summed.
+                lone = tl.load(RW + entry, mask=owner & (kind == 1), other=0.0)
+                owed = lone * g_out[:, None, :] + tl.load(
+                    RSUM + entry * D + d3, mask=keep & (kind == 2), other=0.0
+                )
                 held = tl.load(GT + idx * D + d3, mask=keep, other=0.0, cache_modifier=".cg")
                 tl.store(GT + idx * D + d3, held + owed, mask=keep)
 
@@ -687,7 +698,7 @@ if HAS_TRITON:
         # ── per write: its weight, its decay to the end, its coefficient ───
         t3 = t[:, None, None]
         w3 = tl.arange(0, BW)[None, :, None]
-        for w0 in tl.static_range(0, W, BW):
+        for w0 in range(0, W, BW):
             ok_e = (t3 < C) & (w0 + w3 < W)
             entry = (base + t3) * W + w0 + w3
             d_ww = tl.zeros((BC, BW), dtype=tl.float32)
@@ -716,7 +727,7 @@ if HAS_TRITON:
 
         # ── per read: its weight ───────────────────────────────────────────
         r3 = tl.arange(0, BR)[None, :, None]
-        for r0 in tl.static_range(0, R, BR):
+        for r0 in range(0, R, BR):
             ok_e = (t3 < C) & (r0 + r3 < R)
             entry = (base + t3) * R + r0 + r3
             d_rw = tl.zeros((BC, BR), dtype=tl.float32)
@@ -749,6 +760,12 @@ def _walk_launch(
     each paying the whole chain.  So: the narrowest block whose grid fits one
     wave, one program per multiprocessor.  Measured on one Pascal card, where
     that rule picked the best of the column blocks tried at every shape.
+
+    The walks' loops over entry blocks are deliberately *not* unrolled.
+    Unrolling was meant to put every block's loads in flight at once; what it
+    did was keep every block's tiles live, at 255 registers and spilling, and
+    the rolled loop -- one block's tiles at a time, 128 to 168 registers --
+    was 9-22% faster at every shape measured.
     """
     block_c = _next_pow2(chunk)
     slots = torch.cuda.get_device_properties(device).multi_processor_count
@@ -972,7 +989,9 @@ class _TritonGroup(torch.autograd.Function):
         # ── what the reads hand back: no walk needed, so all at once ───────
         read_sums = v.new_empty(rows, length, n_reads, d_v_width)
         read_owner = torch.empty(rows, length, n_reads, device=v.device, dtype=torch.int8)
-        block_c, block_d = _next_pow2(chunk), 8
+        # Parallel, not a chain: wide column blocks, so each program's index
+        # loads serve more columns.
+        block_c, block_d = _next_pow2(chunk), min(32, _next_pow2(d_v_width))
         _read_sums_kernel[(rows * n, triton.cdiv(d_v_width, block_d))](
             saved["r_weight"], g_out, r_order, r_lo, r_hi, rr_lo, rr_hi,
             read_sums, read_owner,
@@ -989,7 +1008,7 @@ class _TritonGroup(torch.autograd.Function):
         _walk_bwd_kernel[grid](
             grad, w_idx, r_idx, saved["dest"],
             w_order, w_lo, w_hi, r_order, wr_lo, wr_hi, read_sums, read_owner,
-            beta, saved["w_weight"], saved["transform"], saved["qk"],
+            beta, saved["w_weight"], saved["r_weight"], saved["transform"], saved["qk"],
             saved["decay_end"], saved["coef"], g_out,
             g_slot, g_delta, g_u,
             n, length,
@@ -1002,9 +1021,11 @@ class _TritonGroup(torch.autograd.Function):
         d_beta, d_v = new(beta.shape), new(v.shape)
         d_w_weight, d_decay, d_coef = new(w_val.shape), new(w_val.shape), new(w_val.shape)
         d_r_weight = new(r_val.shape)
+        # One program per chunk, looping over the width: 32 columns and an
+        # 8192-float tile were the fastest of those tried at every shape.
         block_c = _next_pow2(chunk)
-        block_d = 16
-        entries = max(1, 4096 // (block_c * block_d))
+        block_d = 32
+        entries = max(1, 8192 // (block_c * block_d))
         _walk_grads_kernel[(rows * n,)](
             saved["save_w"], saved["save_r"], g_slot, saved["err"], saved["delta"],
             g_out, g_delta, g_u, beta, saved["dest"],
