@@ -138,10 +138,12 @@ class SparseDeltaMemoryConfig:
                   this layer must be running the same code.  ``"triton"`` is
                   Lumen's own kernels (:mod:`lumen.sdm.triton_kernels`) for
                   the table-free terms and the walk over the table: the same
-                  arithmetic to fp32 round-off, not bit-identical, and its
-                  backward is not bit-deterministic run to run.  Where they
+                  arithmetic to fp32 round-off, not bit-identical to the
+                  reference, and its backward is bit-identical run to run
+                  without deterministic algorithms (no atomics).  Where they
                   cannot run -- a CPU tensor, fp64, a ``torch.func``
-                  transform -- the reference runs instead.
+                  transform with gradients, a ``chunk_size`` above 64 -- the
+                  reference runs instead.
     """
 
     d_model: int
