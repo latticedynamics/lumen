@@ -4,8 +4,9 @@
 place (§3.11) and partners are found by search (§3.1); in 0.6.2 only the
 table-touching work stays in the chunk loop, and the pairwise terms can be
 recomputed (§3.12); in 0.7.0 an opt-in Triton backend computes the same
-function as kernels (§3.13). The implementation is expected to match this
-record; where the two disagree, one of them is a bug.
+function as kernels (§3.13); in 0.8.0 a decode step given `donate=True`
+writes the table in place (§3.6). The implementation is expected to match
+this record; where the two disagree, one of them is a bug.
 
 Unlike Gated DeltaNet and Undertow, this is **not a consolidation.** No
 existing implementation was merged, so there is no port to verify and no
