@@ -1232,6 +1232,19 @@ def test_state_size_is_flat_in_generated_length():
         assert state.memory.shape == shape
 
 
+def test_a_prefilled_state_holds_only_itself():
+    """The table a state keeps is the table, not the kernel's working buffer.
+
+    The reference kernel returns a view of a buffer that also carries `B·H·C·W`
+    scratch rows, which a state would otherwise keep alive with it.
+    """
+    layer = make_layer()
+    with torch.no_grad():
+        _, state = layer(sequence(seq_len=10), return_state=True)
+    memory = state.memory
+    assert memory.untyped_storage().nbytes() == memory.numel() * memory.element_size()
+
+
 def test_step_refuses_more_than_one_position():
     layer = make_layer()
     with pytest.raises(ValueError, match="one position"):
