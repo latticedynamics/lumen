@@ -389,12 +389,18 @@ class UndertowAttention(nn.Module):
         buffer_len = self.config.window - 1
         available = keys.shape[2]
 
+        # Copied, never sliced: a slice is a view, and a view holds the whole
+        # pass it was cut from.  Not `.contiguous()` either, which copies only
+        # what is not already contiguous -- at `B · n_heads == 1` the newest
+        # positions are, so it returned the view and the state held the pass.
         if buffer_len == 0:
-            return UndertowState(keys[:, :, :0], values[:, :, :0], seen)
+            return UndertowState(
+                keys[:, :, :0].clone(), values[:, :, :0].clone(), seen
+            )
         if available >= buffer_len:
             return UndertowState(
-                keys[:, :, -buffer_len:].contiguous(),
-                values[:, :, -buffer_len:].contiguous(),
+                keys[:, :, -buffer_len:].clone(memory_format=torch.contiguous_format),
+                values[:, :, -buffer_len:].clone(memory_format=torch.contiguous_format),
                 seen,
             )
         pad = buffer_len - available

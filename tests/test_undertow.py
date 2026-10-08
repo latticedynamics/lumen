@@ -576,6 +576,28 @@ def test_state_size_is_constant_in_generated_length() -> None:
     assert state.filled == 7  # saturates at window-1 and stays there
 
 
+@pytest.mark.parametrize(
+    ("n_heads", "batch", "window"),
+    [(8, 2, 8), (1, 1, 8), (8, 2, 1)],
+    ids=["ordinary", "one-head-one-stream", "window-1"],
+)
+def test_a_prefilled_state_holds_only_itself(n_heads: int, batch: int, window: int) -> None:
+    """The window is copied out of the pass, not sliced from it.
+
+    ``.contiguous()`` stood in for the copy and is not one: at
+    `B · n_heads == 1` the newest positions are already contiguous, so the state
+    was a view holding the whole pass.  At `window = 1` an empty state held it.
+    """
+    torch.manual_seed(5)
+    layer = UndertowAttention(
+        UndertowConfig(d_model=64, n_heads=n_heads, window=window)
+    ).eval()
+    with torch.no_grad():
+        _, state = layer(torch.randn(batch, 256, 64), return_state=True)
+    for tensor in (state.keys, state.values):
+        assert tensor.untyped_storage().nbytes() == tensor.numel() * tensor.element_size()
+
+
 def test_prefill_then_step_matches_one_pass() -> None:
     """Prefill a prompt in parallel, continue token by token, same answer."""
     layer = _layer(window=8, plateau=6)

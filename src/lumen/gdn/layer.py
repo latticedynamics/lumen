@@ -358,6 +358,16 @@ class ShortConv(nn.Module):
             y = F.conv1d(u, self.conv.weight, groups=channels)
 
         new_cache = u[..., -(self.size - 1):] if self.size > 1 else cache
+        if self.size > 1 and u.shape[-1] > self.size:
+            # A slice is a view, and a view keeps its whole storage alive: left
+            # alone, a cache reporting `(B, C, size - 1)` holds the entire
+            # `(B, C, T + size - 1)` pass until the stream is next advanced --
+            # linear in the prompt, and invisible to `numel()`.  So a chunk's
+            # cache is copied out.  Decode's is not: there `u` is `size`
+            # columns, a fixed `size / (size - 1)` overhead, and a copy would
+            # add a kernel to the launch-bound path the branch above exists to
+            # keep short.
+            new_cache = new_cache.clone()
         return y.transpose(1, 2), new_cache
 
 

@@ -714,8 +714,28 @@ def test_memory_is_flat_in_generated_length():
     for step in range(64):
         _, state = layer.step(x, state)
         if step in (7, 63):
-            sizes.append(state.memory.numel() + sum(c.numel() for c in state.conv))
+            sizes.append(_held_bytes(state))
     assert sizes[0] == sizes[1]
+
+
+def _held_bytes(state: GatedDeltaNetState) -> int:
+    """What a state keeps alive -- storage, not ``numel()``, which cannot see a view."""
+    return sum(t.untyped_storage().nbytes() for t in (state.memory, *state.conv))
+
+
+def test_a_prefilled_state_holds_only_itself():
+    """A state from ``forward`` keeps alive what it holds, not the pass it came from.
+
+    The short-conv cache was a slice of the whole `(B, C, T + size - 1)`
+    concatenation, so a prefilled state held memory linear in the prompt while
+    its shape said `size - 1` columns.
+    """
+    torch.manual_seed(0)
+    layer = make_layer()
+    with torch.no_grad():
+        _, state = layer(torch.randn(2, 256, 64, dtype=torch.float64), return_state=True)
+    own = sum(t.numel() * t.element_size() for t in (state.memory, *state.conv))
+    assert _held_bytes(state) == own
 
 
 # ── claims made "by construction" ─────────────────────────────────────────
