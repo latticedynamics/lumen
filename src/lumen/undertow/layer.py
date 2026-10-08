@@ -403,7 +403,7 @@ class UndertowAttention(nn.Module):
         )
 
     def step(
-        self, x: torch.Tensor, state: UndertowState
+        self, x: torch.Tensor, state: UndertowState, *, donate: bool = False
     ) -> tuple[torch.Tensor, UndertowState]:
         """One position — `(B, 1, d_model)` → output and the successor state.
 
@@ -415,6 +415,10 @@ class UndertowAttention(nn.Module):
         by *count*, where :meth:`forward` masks by positional validity.  Two
         different mechanisms reaching the same answer is exactly why the
         agreement between them is worth a test rather than an assertion.
+
+        ``donate`` is accepted so a trunk can pass it to every sub-layer, and
+        ignored: the successor is `W - 1` positions, no more than the step
+        already reads, so there is no copy worth saving.
         """
         if x.shape[1] != 1:
             raise ValueError(

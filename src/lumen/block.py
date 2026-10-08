@@ -255,25 +255,35 @@ class Block(nn.Module):
         )
 
     def step(
-        self, x: torch.Tensor, state: BlockState
+        self, x: torch.Tensor, state: BlockState, *, donate: bool = False
     ) -> tuple[torch.Tensor, BlockState]:
-        """One position — ``(B, 1, d_model)`` → output and the successor state."""
+        """One position — ``(B, 1, d_model)`` → output and the successor state.
+
+        ``donate=True`` says the caller will not read ``state`` again, and is
+        passed to every stateful sub-layer so each may reuse its buffers.
+        It is passed only when set: a stateful sub-layer from outside this
+        library that does not take the keyword steps as it always did, and
+        fails loudly only when someone asks it to donate.
+        """
         if x.shape[1] != 1:
             raise ValueError(
                 f"step() consumes one position at a time, got {x.shape[1]}; "
                 f"use forward(x, state=..., return_state=True) for a chunk"
             )
 
+        donation = {"donate": True} if donate else {}
         s_local = None
         if self.local is not None:
             if _is_stateful(self.local):
-                y, s_local = self.local.step(self.norm_local(x), state.local)
+                y, s_local = self.local.step(
+                    self.norm_local(x), state.local, **donation
+                )
             else:
                 y = self.local(self.norm_local(x))
             x = x + y
 
         if _is_stateful(self.mixer):
-            y, s_mixer = self.mixer.step(self.norm(x), state.mixer)
+            y, s_mixer = self.mixer.step(self.norm(x), state.mixer, **donation)
         else:
             y, s_mixer = self.mixer(self.norm(x)), None
         x = x + y

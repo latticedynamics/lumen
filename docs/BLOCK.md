@@ -111,6 +111,19 @@ y, state = trunk.step(x, state)                      # x is (256, 1, d_model)
 sharing a buffer, which matters wherever a prefix is continued down more than one
 future.
 
+A caller that never forks can waive that:
+
+```python
+y, state = trunk.step(x, state, donate=True)         # the old state is spent
+```
+
+`donate=True` is passed to every stateful sub-layer, and each may write its
+successor into the buffers it was given. The donated state must not be read
+again. Sparse Delta Memory uses it to skip copying its table per stream per
+step, which at a large batch is most of the step (see [SDM.md](SDM.md)). The other
+mixers accept it and ignore it. A block passes it on only when it is set, so a
+stateful sub-layer of your own that does not take the keyword keeps working.
+
 ---
 
 ## Initialisation

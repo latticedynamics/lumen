@@ -303,18 +303,27 @@ class Stack(nn.Module):
         )
 
     def step(
-        self, x: torch.Tensor, state: StackState
+        self, x: torch.Tensor, state: StackState, *, donate: bool = False
     ) -> tuple[torch.Tensor, StackState]:
-        """One position — ``(B, 1, d_model)`` → output and the successor state."""
+        """One position — ``(B, 1, d_model)`` → output and the successor state.
+
+        ``donate=True`` says the caller will not read ``state`` again, so a
+        sub-layer may write its successor into the buffers it was given
+        rather than copies.  For many streams in lockstep that can be most
+        of a step: Sparse Delta Memory copies a whole table per stream
+        otherwise.  Passed to each block only when set, as
+        :meth:`Block.step` passes it on.
+        """
         if x.shape[1] != 1:
             raise ValueError(
                 f"step() consumes one position at a time, got {x.shape[1]}; "
                 f"use forward(x, state=..., return_state=True) for a chunk"
             )
 
+        donation = {"donate": True} if donate else {}
         successors: list[BlockState] = []
         for block, block_state in zip(self.blocks, state.blocks):
-            x, successor = block.step(x, block_state)
+            x, successor = block.step(x, block_state, **donation)
             successors.append(successor)
 
         return self.norm_f(x), StackState(blocks=tuple(successors))
