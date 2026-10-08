@@ -521,7 +521,13 @@ class SparseDeltaMemory(nn.Module):
         o, memory = self._scan(self._features(x), memory)
         y = self._out(o, x)
         if return_state:
-            return y, SparseDeltaMemoryState(memory=memory)
+            # The reference kernel's table is a view of its working buffer,
+            # which carries `B·H·C·W` scratch rows past the real ones -- several
+            # tables' worth when `N` is small -- so a state kept from it would
+            # keep the scratch too.  Copied here rather than in the kernel: a
+            # training forward discards the table, and should not pay a second
+            # one in peak memory for a state nobody asked for.
+            return y, SparseDeltaMemoryState(memory=memory.clone())
         return y
 
     def extra_repr(self) -> str:
