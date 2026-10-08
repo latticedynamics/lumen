@@ -1251,6 +1251,96 @@ def test_step_refuses_more_than_one_position():
         layer.step(sequence(seq_len=2), layer.init_state(2))
 
 
+# ── donated steps ─────────────────────────────────────────────────────────
+
+
+def _stream(
+    layer: SparseDeltaMemory, state: SparseDeltaMemoryState, steps: int, donate: bool
+) -> tuple[torch.Tensor, SparseDeltaMemoryState]:
+    batch = state.memory.shape[0]
+    outputs = []
+    for t in range(steps):
+        y, state = layer.step(sequence(batch=batch, seq_len=1, seed=t), state, donate=donate)
+        outputs.append(y)
+    return torch.cat(outputs, dim=1), state
+
+
+@pytest.mark.parametrize("batch", [1, 3])
+@pytest.mark.parametrize("initial_memory", ["zero", "learned"])
+def test_a_donated_step_is_the_same_step(initial_memory, batch):
+    """One body, `scatter_` for `scatter`: the outputs and the table are the same bits."""
+    layer = make_layer(initial_memory)
+    with torch.no_grad():
+        kept, kept_state = _stream(layer, layer.init_state(batch), 12, donate=False)
+        donated, donated_state = _stream(layer, layer.init_state(batch), 12, donate=True)
+    assert torch.equal(kept, donated)
+    assert torch.equal(kept_state.memory, donated_state.memory)
+
+
+@pytest.mark.parametrize("mode", [torch.no_grad, torch.inference_mode], ids=["no_grad", "inference_mode"])
+@pytest.mark.parametrize("batch", [1, 3])
+def test_donating_the_initial_state_leaves_the_learned_table_alone(batch, mode):
+    """``init_state`` shares the parameter's storage, so a donated step copies first.
+
+    At `B = 1` the shared view does not overlap, so an in-place write would go
+    through, and decoding would rewrite the learned table.
+    """
+    layer = make_layer("learned")
+    table = layer.initial_memory.detach().clone()
+    with mode():
+        _stream(layer, layer.init_state(batch), 4, donate=True)
+    assert torch.equal(layer.initial_memory, table)
+
+
+def test_a_donated_step_writes_in_place_after_the_first():
+    """Otherwise ``donate`` could quietly copy forever and every other test would pass.
+
+    Predecessor and successor are both alive when compared, so an allocator
+    reusing a freed block cannot make a copy look like the same buffer.
+    """
+    layer = make_layer()
+    with torch.no_grad():
+        _, state = layer.step(sequence(seq_len=1), layer.init_state(2), donate=True)
+        for t in range(3):
+            _, successor = layer.step(sequence(seq_len=1, seed=t), state, donate=True)
+            assert successor.memory.data_ptr() == state.memory.data_ptr()
+            state = successor
+
+
+def test_donation_is_declined_while_autograd_records_the_table():
+    """An in-place write would break the gradient, so with grad on the step copies."""
+    layer = make_layer("learned")
+    _, state = layer.step(sequence(seq_len=1), layer.init_state(2))
+    assert state.memory.requires_grad
+    before = state.memory.detach().clone()
+    _, successor = layer.step(sequence(seq_len=1, seed=3), state, donate=True)
+    assert torch.equal(state.memory, before)
+    successor.memory.sum().backward()
+    assert layer.initial_memory.grad is not None
+
+
+def test_donation_is_declined_under_a_transform():
+    """Under ``vmap`` the step copies, and agrees with the step that was not donated."""
+    layer = make_layer()
+    with torch.no_grad():
+        _, state = layer.step(sequence(seq_len=1), layer.init_state(2))
+        tables = torch.stack([state.memory, state.memory.flip(-2)])
+        before = tables.clone()
+        x = sequence(seq_len=1, seed=5)
+
+        def run(donate: bool):
+            def one(memory: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+                y, successor = layer.step(x, SparseDeltaMemoryState(memory=memory), donate=donate)
+                return y, successor.memory
+
+            return one
+
+        y, m = torch.func.vmap(run(True))(tables)
+        y_kept, m_kept = torch.func.vmap(run(False))(tables)
+    assert torch.equal(tables, before)
+    assert torch.equal(y, y_kept) and torch.equal(m, m_kept)
+
+
 def test_residual_out_projections_is_the_output():
     layer = make_layer()
     assert layer.residual_out_projections() == (layer.o_proj,)

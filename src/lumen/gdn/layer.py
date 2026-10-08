@@ -772,9 +772,14 @@ class GatedDeltaNet(nn.Module):
         return GatedDeltaNetState(memory=memory, conv=conv)
 
     def step(
-        self, x: torch.Tensor, state: GatedDeltaNetState
+        self, x: torch.Tensor, state: GatedDeltaNetState, *, donate: bool = False
     ) -> tuple[torch.Tensor, GatedDeltaNetState]:
-        """One position — `(B, 1, d_model)` → output and the successor state."""
+        """One position — `(B, 1, d_model)` → output and the successor state.
+
+        ``donate`` is accepted so a trunk can pass it to every sub-layer, and
+        ignored: the successor's memory is this step's own arithmetic, so there
+        is no copy to save.
+        """
         if x.shape[1] != 1:
             raise ValueError(
                 f"step() consumes one position at a time, got {x.shape[1]}; "

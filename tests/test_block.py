@@ -277,6 +277,46 @@ def test_step_returns_a_successor_rather_than_mutating(name):
     assert after_a is not state and after_b is not state
 
 
+class _Stepper(nn.Module):
+    """A stateful sub-layer from before ``donate``: ``step`` takes two arguments."""
+
+    def init_state(self, batch: int, device=None, dtype=None) -> torch.Tensor:
+        return torch.zeros(batch)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.zeros_like(x)
+
+    def step(self, x: torch.Tensor, state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return torch.zeros_like(x), state + 1
+
+
+class _Recording(_Stepper):
+    """Records the keywords ``step`` was given."""
+
+    def step(self, x: torch.Tensor, state: torch.Tensor, **keywords) -> tuple[torch.Tensor, torch.Tensor]:
+        self.received = keywords
+        return super().step(x, state)
+
+
+@pytest.mark.parametrize("donate", [False, True])
+def test_donate_reaches_every_stateful_sub_layer_only_when_set(donate):
+    mixer, local = _Recording(), _Recording()
+    block = Block(D_MODEL, mixer, norm_eps=1e-5, d_mlp=0, local=local)
+    block.step(torch.randn(2, 1, D_MODEL), block.init_state(2), donate=donate)
+    expected = {"donate": True} if donate else {}
+    assert mixer.received == expected
+    assert local.received == expected
+
+
+def test_a_sub_layer_without_donate_steps_until_asked_to_donate():
+    """Passed only when set, so a sub-layer written before it keeps working."""
+    block = Block(D_MODEL, _Stepper(), norm_eps=1e-5, d_mlp=0)
+    _, state = block.step(torch.randn(2, 1, D_MODEL), block.init_state(2))
+    assert torch.equal(state.mixer, torch.ones(2))
+    with pytest.raises(TypeError):
+        block.step(torch.randn(2, 1, D_MODEL), state, donate=True)
+
+
 def test_step_refuses_more_than_one_position():
     block = build("mixer")
     with pytest.raises(ValueError, match="one position at a time"):

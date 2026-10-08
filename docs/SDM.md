@@ -2,9 +2,11 @@
 
 A gated delta rule over a large, sparsely addressed table. Each head holds a
 table of `N` slots; each position writes `W` of them and reads `R`, chosen by
-product keys. Per-token work is `O((W+R)·d_v)` whatever `N` is, and a slot
-nobody writes to is left exactly as it was — decay included — so **state size
-is decoupled from parameter count and from compute.**
+product keys. Per-token arithmetic is `O((W+R)·d_v)` whatever `N` is, and a
+slot nobody writes to is left exactly as it was — decay included — so **state
+size is decoupled from parameter count and from compute.** One cost does grow
+with `N`: by default `step` returns a fresh table per stream, which at a large
+batch is most of a decode step. [Generation](#generation) says how to waive it.
 
 The design rationale — the diagonal-decay derivation, which defaults are earned
 and which are not, what is deliberately excluded — is in
@@ -94,10 +96,32 @@ through its state carries a gradient back to the table.
 **`step` returns a successor and never mutates the state it was given**, the
 same guarantee every mixer here makes, so branching a stream cannot leave two
 branches sharing a buffer. For this layer that guarantee is not free: the
-successor is a full table, `O(n_slots · d_v)` per head per step against
-`O((W+R) · d_v)` of actual work. At small tables it does not matter; at very
-large ones it dominates decode. An in-place decode path is an open question,
-not a feature (design record §3.6).
+successor is a full table per stream, `O(B · n_slots · d_v)` per head per step
+against `O(B · (W+R) · d_v)` of actual work. The batch matters as much as the
+table. Measured on one machine at `d_model = 512`, a step at `B = 1` takes about
+1.2 ms at every table size, because it is launch-bound. At `B = 128` it rises
+from 4.1 ms at 32² slots to 37.6 ms at 128².
+
+A caller that will not read a state again can say so:
+
+```python
+for _ in range(max_new_tokens):
+    y, state = mixer.step(embed(token), state, donate=True)
+    token = sample(y[:, -1])
+```
+
+`donate=True` lets the layer write the successor into the table it was given.
+On the same machine, at `B = 128` and 128² slots, that is 2.3 ms against 37.6.
+The outputs are the same bits either way. The donated state then shares its
+buffer with the successor, so do not read it or step it again, and do not donate
+a state you have forked.
+
+Donating is a permission, not a demand. The first donated step after
+`init_state` still copies, because the initial table is a shared view, and
+under `"learned"` a view of the parameter. A step under autograd or a
+`torch.func` transform also copies. `Block.step` and `Stack.step` take the same
+keyword and pass it to every sub-layer. Design record §3.6 has the whole
+measurement.
 
 ## Reading without writing
 

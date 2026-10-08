@@ -1,9 +1,11 @@
 """Sparse Delta Memory — a gated delta rule over a large, sparsely addressed table.
 
 Per head, a table of `N` slots.  Each position writes `W` of them and reads `R`,
-chosen by product keys, so per-token work is `O((W+R)·d_v)` whatever `N` is,
-and a slot nobody writes to is frozen — decay included.  State size is
-decoupled from parameter count and from compute.
+chosen by product keys, so per-token arithmetic is `O((W+R)·d_v)` whatever
+`N` is, and a slot nobody writes to is frozen — decay included.  State size is
+decoupled from parameter count and from compute — except that ``step`` copies
+the table per stream unless its state is donated; see
+:class:`SparseDeltaMemoryState`.
 
 Public surface is the layer, its config and its state::
 

@@ -6,10 +6,12 @@ Per head, a table of `N` slots, read as `y_t = M_tᵀ q_t` and updated by::
 
 where `k_t` and `q_t` are nonzero only on the `W` slots position `t` writes and
 the `R` it reads, chosen by product keys, and `Λ_t` decays the written slots and
-nothing else.  Per-token work is `O((W+R)·d_v)` whatever `N` is, and the only
-parameters that grow with `N` are the two address projections, as `√N`.  **State
-size is decoupled from parameter count and from compute** — which is the reason
-to have this layer.
+nothing else.  Per-token arithmetic is `O((W+R)·d_v)` whatever `N` is, and the
+only parameters that grow with `N` are the two address projections, as `√N`.
+**State size is decoupled from parameter count and from compute** — which is the
+reason to have this layer.  One cost is not: :meth:`SparseDeltaMemory.step`
+returns a new table per stream, `O(B·N·d_v)` a step, unless its state is
+donated — see :class:`SparseDeltaMemoryState`.
 
 The design record is drafted ahead of promotion.  Points from it worth
 repeating where the code lives:
@@ -50,6 +52,7 @@ import torch.nn.functional as F
 from lumen.nn import rms_norm
 from lumen.sdm import triton_kernels
 from lumen.sdm.reference import (
+    _transforms_active,
     chunk_sparse_delta,
     read_sparse_delta,
     recurrent_sparse_delta,
@@ -73,12 +76,35 @@ class SparseDeltaMemoryState:
     Frozen — :meth:`SparseDeltaMemory.step` returns a successor rather than
     mutating in place, so branching a stream cannot leave two branches quietly
     sharing a buffer.  **Here that guarantee has a price** that it does not have
-    for Gated DeltaNet: the successor is a full table, `O(N·d_v)` per head per
-    step against `O((W+R)·d_v)` of actual work.  Paid on purpose; an in-place
-    decode is a separate, measured decision.
+    for Gated DeltaNet: the successor is a full table per stream, `O(B·N·d_v)`
+    per head per step against `O(B·(W+R)·d_v)` of actual work.  At `B = 1` the
+    step is launch-bound and the copy hides; at a large batch it is most of the
+    step, at tables nobody would call large.
+
+    ``step(x, state, donate=True)`` waives it: the successor is written into
+    the donated table, and the donated state must not be read again.  The
+    default keeps the guarantee.  Design record §3.6 has the measurements.
     """
 
     memory: torch.Tensor
+
+
+def _writable_in_place(memory: torch.Tensor) -> bool:
+    """May a donated table be written where it stands?
+
+    Donation says the caller is done with the state, not that its table is the
+    stream's own.  It is not when it is a view: ``init_state`` hands out a
+    broadcast, and under ``"learned"`` that broadcast shares the parameter's
+    storage -- at `B = 1` it does not even overlap, so a write would go through
+    and change the learned table.  Nor under a ``torch.func`` transform, or
+    while autograd records the table, where an in-place write is refused or
+    breaks the gradient.  Each of those steps by copy instead.
+    """
+    if _transforms_active():
+        return False
+    if torch.is_grad_enabled() and memory.requires_grad:
+        return False
+    return memory._base is None
 
 
 @dataclass(frozen=True)
@@ -91,8 +117,10 @@ class SparseDeltaMemoryConfig:
                   ``d_v = d_model / n_heads``.
         n_slots:  `N`, slots **per head**, a perfect square — product keys
                   address it as `√N × √N`.  The knob that grows the state
-                  without growing compute: per-token work does not depend on
-                  it, and the address projections grow as `√N`.
+                  without growing compute: per-token arithmetic does not
+                  depend on it, and the address projections grow as `√N`.
+                  Decode's successor copy does, `O(B·N·d_v)` a step, unless
+                  the state is donated — see :class:`SparseDeltaMemoryState`.
         initial_memory: ``"zero"`` or ``"learned"``, and **required** — see the
                   module docstring.  ``"learned"`` adds `H · N · d_v`
                   parameters, reported like any others; the paper this layer
@@ -468,16 +496,29 @@ class SparseDeltaMemory(nn.Module):
         return SparseDeltaMemoryState(memory=self._initial_table(batch, device, dtype))
 
     def step(
-        self, x: torch.Tensor, state: SparseDeltaMemoryState
+        self, x: torch.Tensor, state: SparseDeltaMemoryState, *, donate: bool = False
     ) -> tuple[torch.Tensor, SparseDeltaMemoryState]:
-        """One position — `(B, 1, d_model)` → output and the successor state."""
+        """One position — `(B, 1, d_model)` → output and the successor state.
+
+        Args:
+            donate: the caller will not read ``state`` again, so the successor
+                may be written into its table rather than a copy of it -- at a
+                large batch, most of the step.  A permission, not a demand: a
+                table that is not the stream's own to write is copied anyway,
+                which makes the first donated step from :meth:`init_state` a
+                copy and every one after it in place.
+        """
         if x.shape[1] != 1:
             raise ValueError(
                 f"step() consumes one position at a time, got {x.shape[1]}; "
                 f"use forward(x, state=..., return_state=True) for a chunk"
             )
         features = tuple(t[:, :, 0] for t in self._features(x))
-        o, memory = recurrent_sparse_delta(state.memory, *features)
+        o, memory = recurrent_sparse_delta(
+            state.memory,
+            *features,
+            in_place=donate and _writable_in_place(state.memory),
+        )
         return self._out(o.unsqueeze(2), x), SparseDeltaMemoryState(memory=memory)
 
     def read(self, x: torch.Tensor, state: SparseDeltaMemoryState) -> torch.Tensor:
