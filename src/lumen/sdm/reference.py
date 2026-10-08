@@ -210,12 +210,19 @@ def recurrent_sparse_delta(
     beta: torch.Tensor,
     read_idx: torch.Tensor,
     read_val: torch.Tensor,
+    *,
+    in_place: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """One position of the recurrence — the decode step, and the oracle's body.
 
     The module's shapes with the time axis removed: `memory (…, N, d_v)`,
     `write_* (…, W)`, `v (…, d_v)`, `beta (…)`, `read_* (…, R)`.  Returns the
     output `(…, d_v)` and the successor table.
+
+    ``in_place`` writes the rows into ``memory`` itself and returns it, so the
+    caller's table *is* the successor; otherwise the successor is a new table.
+    One body either way and only the last write differs, so the two agree bit
+    for bit.  Whether a table may be written in place is the caller's to know.
 
     Only the `W` written rows are touched; every other row of the returned
     table is the incoming row, bit for bit.  Write indices must be distinct —
@@ -237,7 +244,10 @@ def recurrent_sparse_delta(
     # A replacing scatter, not an additive one: the written rows ARE the new
     # rows, so nothing is formed as `old + (new - old)` and rounded twice.
     index = write_idx.unsqueeze(-1).expand_as(written)
-    memory = memory.scatter(-2, index, written)
+    if in_place:
+        memory = memory.scatter_(-2, index, written)
+    else:
+        memory = memory.scatter(-2, index, written)
     return read_sparse_delta(memory, read_idx, read_val), memory
 
 

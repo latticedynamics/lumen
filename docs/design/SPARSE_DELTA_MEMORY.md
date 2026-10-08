@@ -304,12 +304,58 @@ Decisions:
 successor rather than mutating — the house guarantee that branching a stream
 cannot leave two branches sharing a buffer.
 
-For GDN that guarantee is free. **Here it costs a table copy per step:**
-`O(N·d_v)` per head per position, against `O((W+R)·d_v)` of actual work. For
-small tables that is tens of MB per step and acceptable; at `N = 2¹⁸,
-d_v = 512` it is half a gigabyte per step per layer. The reference keeps the
-guarantee. An in-place decode path — explicit about aliasing, opt-in — is a
-later decision with its own measurement, not a refactor of this one.
+For GDN that guarantee is free. **Here it costs a table copy per stream per
+step:** `O(B·N·d_v)` per head per position, against `O(B·(W+R)·d_v)` of actual
+work. It is easy to read that as a cost of large tables, and it is not only
+that: the copy scales with the batch exactly as it scales with `N`. At `B = 1` a
+step is launch-bound and flat in `N`, which hides it. Measured on one machine (a
+Pascal card, fp32, one layer at `d_model = 512`, 2 heads, `W = R = 64`), against
+the same arithmetic written into the table in place:
+
+| `N` | `B = 1` | `B = 32` | `B = 128` |
+|---|---|---|---|
+| 32² | 1.22 → 1.20 ms | 1.34 → 1.16 ms | 4.10 → 1.89 ms |
+| 64² | 1.20 → 1.18 ms | 3.06 → 1.14 ms | 11.07 → 2.22 ms |
+| 128² | 1.21 → 1.18 ms | 9.70 → 1.15 ms | 37.62 → 2.27 ms |
+
+In a five-block trunk with two such layers at 64² or 128², the copy was
+nothing at `B = 8`, and 61% and 86% of the whole step at `B = 128`. At
+`N = 512²` it is most of a step already at `B = 8`: 36 ms against 0.2.
+
+**So the guarantee is the default, and the copy can be waived:**
+`step(x, state, donate=True)`. Donating a state hands its buffers to the layer,
+which may write the successor into the table it was given. The caller must not
+read a donated state again; the successor is the stream. A caller who does not
+opt in keeps the functional path unchanged. The two paths are one function,
+`recurrent_sparse_delta`, with `scatter` or `scatter_` as its last write, so
+they agree bit for bit, and a test holds it.
+
+Why a keyword and not a separate `step_`. The path that needs it is a trunk
+stepping many streams, so whatever is chosen has to pass through `Block.step`
+and `Stack.step`. A method on this layer alone would not reach that path, and a
+fourth method on every component would break the surface they share. Gated
+DeltaNet and Undertow accept the keyword and ignore it, because their successors
+cost no more than their arithmetic. `Block` forwards it only when it is set, so a
+stateful sub-layer from outside the library that predates it keeps stepping.
+
+Why not copy-on-write at the granularity of pages of rows. Product keys spread a
+position's writes across the table on purpose. With 64-row pages, 64 writes touch
+essentially every page of a 32² table and up to a quarter of a 128² one. So
+paging saves little at the sizes where the copy bites, and every kernel would
+then have to read a paged table.
+
+**Donating is a permission, not a demand.** The layer copies anyway when the
+table is not its own to write:
+
+- any view. This includes the broadcast that `init_state` hands out, which
+  under `"learned"` shares the parameter's storage. At `B = 1` that view is not
+  even overlapping, so an in-place write would silently change the learned
+  table;
+- a table autograd is recording;
+- a table under a `torch.func` transform.
+
+The first donated step from `init_state` is therefore a copy, the same one the
+successor rule makes anyway, and every step after it is in place.
 
 `init_state` hands out the initial table as a **broadcast view**, `(B, H, N,
 d_v)` over `(H, N, d_v)`: no stream costs a copy until its first write, which is
@@ -896,8 +942,3 @@ Each of these is a standing test in `tests/test_sdm.py`.
   kept), and, for one or two sequences, more parallelism than splitting value
   columns gives. Unmeasured on any card with tensor cores, or with more shared
   memory per block than 48 KB -- where the cap on chunk length may not bind.
-- **An in-place decode** (§3.6). Measured on one machine, the successor copy is
-  most of a step once the table is large: at `B = 8`, 36 ms per step at
-  `N = 512²` against 0.2 ms for the same arithmetic in place, which also costs
-  0.2 ms at every smaller table. Whether that buys an opt-in `step_` against the
-  house's successor guarantee is an API decision, not an optimisation.

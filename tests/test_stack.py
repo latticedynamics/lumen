@@ -20,6 +20,7 @@ import torch.nn as nn
 from lumen.block import Block, BlockState
 from lumen.gdn import GatedDeltaNet, GatedDeltaNetConfig, HeadLayout
 from lumen.nn import SwiGLU
+from lumen.sdm import SparseDeltaMemory, SparseDeltaMemoryConfig
 from lumen.stack import Stack, StackState
 from lumen.undertow import UndertowAttention, UndertowConfig
 
@@ -451,6 +452,54 @@ def test_step_returns_a_successor_rather_than_mutating():
 
     assert torch.equal(a, b), "the shared prior state was mutated by the first step"
     assert after_a is not state
+
+
+def test_a_donated_step_is_the_same_step_and_reaches_the_table():
+    """``donate`` changes no bit of the stream, and gets to the layer that uses it.
+
+    Every block holds an Undertow window; the middle one holds a sparse delta
+    memory, the only sub-layer that writes in place when donated.  Each pair of
+    states compared is alive at once, so a reused allocation cannot pass for an
+    in-place write.
+    """
+
+    def factory(index: int) -> Block:
+        mixer = (
+            SparseDeltaMemory(
+                SparseDeltaMemoryConfig(
+                    d_model=D_MODEL, n_heads=2, n_slots=16, initial_memory="learned",
+                    n_writes=3, n_reads=3, chunk_size=4,
+                )
+            )
+            if index == 1
+            else a_mixer()
+        )
+        return Block(D_MODEL, mixer, norm_eps=1e-5, d_mlp=0, local=a_local())
+
+    torch.manual_seed(0)
+    stack = Stack(D_MODEL, 3, factory, norm_eps=1e-5).eval()
+    prompt = torch.randn(2, 10, D_MODEL)
+    tokens = torch.randn(2, 6, D_MODEL)
+
+    def stream(donate: bool) -> tuple[torch.Tensor, list[bool]]:
+        outputs, in_place = [], []
+        with torch.no_grad():
+            _, state = stack(prompt, return_state=True)
+            for t in range(tokens.shape[1]):
+                y, successor = stack.step(tokens[:, t : t + 1], state, donate=donate)
+                in_place.append(
+                    successor.blocks[1].mixer.memory.data_ptr()
+                    == state.blocks[1].mixer.memory.data_ptr()
+                )
+                outputs.append(y)
+                state = successor
+        return torch.cat(outputs, dim=1), in_place
+
+    kept, kept_in_place = stream(False)
+    donated, donated_in_place = stream(True)
+    assert torch.equal(kept, donated)
+    assert not any(kept_in_place)
+    assert all(donated_in_place[1:])
 
 
 def test_step_refuses_more_than_one_position():
