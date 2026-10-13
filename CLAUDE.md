@@ -114,6 +114,33 @@ case* — it is where assumptions fail hardest — and it is **not** the audienc
 - **`triton` is not a dependency.** It is a runtime capability that gets probed,
   and everything degrades cleanly without it.
 
+## Releases
+
+A version is a promise downstream projects hold Lumen to. They pin it by tag —
+`lumen @ git+https://github.com/latticedynamics/lumen.git@v0.8.0` — so a result
+can name the exact Lumen that produced it. That is the "same layer" guarantee,
+extended across time.
+
+- **The version lives in `pyproject.toml`,** bumped by the last commit of the PR
+  that releases it, titled with what the version is (`0.8.0 — a state holds
+  only itself, and a step can give it up`). A release can span PRs: 0.8.0 was
+  #28 and #29 together.
+- **Tag the commit where the release lands on `main`,** not the commit where
+  the version was typed. They differ whenever another PR merges first: 0.8.0
+  was bumped on its feature branch, #28 landed on `main` in between, and the
+  release is the merge that contains both.
+- **Annotated tags only** — `git tag -a v0.8.0 <commit>`, the message being the
+  version's title plus a line per change, with PR numbers. A lightweight tag
+  records no tagger, no date and no reason.
+- **Push the tag by name** — `git push origin v0.8.0`. A plain `git push` does
+  not send tags, and an unpushed tag pins nothing.
+- **Never move or delete a published tag.** Anyone pinned to it would silently
+  get different code, which is the one thing a tag promises not to do. A bad
+  release gets a new patch version.
+
+Versions before 0.8.0 are untagged. Tag them retroactively, by the same rule,
+if one is ever needed.
+
 ## Code conventions
 
 - Type hints on every parameter and return. `from __future__ import annotations`.
