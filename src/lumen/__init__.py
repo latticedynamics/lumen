@@ -55,9 +55,9 @@ from lumen.sdm import (
 from lumen.undertow import UndertowAttention, UndertowConfig, UndertowState
 from lumen.stack import Stack, StackState
 
-# Imported for its side effect as much as its surface: the state containers are
-# declared as pytree nodes here, so `torch.func` can traverse them.  Additive
-# and numerically inert -- see :mod:`lumen.pytree`.
+# Imported for its side effect as much as its surface: the state containers and
+# the GDN read caches are declared as pytree nodes here, so `torch.func` can
+# traverse them.  Additive and numerically inert -- see :mod:`lumen.pytree`.
 from lumen.pytree import REGISTERED, register_state_pytrees
 from lumen.probe import (
     ArchFacts,
@@ -73,7 +73,7 @@ from lumen.probe import (
     probe_triton,
 )
 
-__version__ = "0.8.0"
+__version__ = "0.8.1"
 
 __all__ = [
     "__version__",

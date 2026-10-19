@@ -1,7 +1,9 @@
 # States as pytrees
 
 Every streaming state in this package is a registered pytree node, so the
-`torch` transforms that have to flatten a structure can walk one.
+`torch` transforms that have to flatten a structure can walk one. So is the
+gated delta net's read cache, which is not a state but meets the same
+boundaries — see [Read caches](#read-caches).
 
 `GatedDeltaNetState`, `UndertowState`, `SparseDeltaMemoryState`, `BlockState`
 and `StackState` are frozen dataclasses of tensors. Until they are declared, `torch` sees each of them as a
@@ -103,6 +105,59 @@ automatically, same outputs, and a cost that grows with the table. A learned
 initial table is a parameter like any other, so it is stacked per set with the
 rest.
 
+## Read caches
+
+`GatedDeltaNet.forward(..., return_cache=True)` returns a
+`GatedDeltaNetReadCache`, which `reread` reads again with a fresh query and no
+write. A cache made and consumed inside one vmapped function never crosses the
+transform boundary, and one cache shared by every set crosses it unbatched
+(`in_dims=None`). What the registration is for is the write and the re-read in
+*separate* batched calls — `G` writers returning `G` caches out of `vmap`, and
+`G` re-readers taking them back in:
+
+```python
+import torch
+from torch.func import functional_call, stack_module_state, vmap
+
+from lumen.gdn import GatedDeltaNet
+
+class Rereading(torch.nn.Module):
+    """`functional_call` only calls `forward`; this one's forward is `reread`."""
+
+    def __init__(self, layer: GatedDeltaNet) -> None:
+        super().__init__()
+        self.layer = layer
+
+    def forward(self, x, cache):
+        return self.layer.reread(x, cache)
+
+layers = [GatedDeltaNet(config) for _ in range(SETS)]
+params, buffers = stack_module_state(layers)
+base = GatedDeltaNet(config).to("meta")
+rereading = Rereading(base)
+
+def prefixed(tensors):
+    return {f"layer.{name}": tensor for name, tensor in tensors.items()}
+
+def write(parameters, buffered, x):
+    return functional_call(
+        base, (parameters, buffered), (x,), {"return_cache": True}
+    )[1]
+
+def reread(parameters, buffered, x, cache):
+    weights = (prefixed(parameters), prefixed(buffered))
+    return functional_call(rereading, weights, (x, cache))
+
+caches = vmap(write)(params, buffers, x)           # every leaf leads with SETS
+y = vmap(reread)(params, buffers, fresh, caches)   # (SETS, BATCH, SEQ, D)
+```
+
+`ReadCache.seq_len`, the unpadded length inside the cache, is
+`UndertowState.seen` again: an `int` that drives control flow, so it rides in
+the treespec context and every leaf is a tensor. A cache from a continued pass
+carries the short-conv context it started from, and that is batched like
+everything else.
+
 ## Checking what registered
 
 ```python
@@ -110,13 +165,15 @@ import lumen
 
 lumen.REGISTERED
 # ('GatedDeltaNetState', 'BlockState', 'StackState', 'UndertowState',
-#  'SparseDeltaMemoryState')
+#  'SparseDeltaMemoryState', 'ReadCache', 'GatedDeltaNetReadCache')
 ```
 
-Five names is the whole set. A shorter tuple means `torch` on this machine did
-not expose an entry point one of the states needs — the library is unaffected
-and every path documented elsewhere behaves identically, but a `torch.func`
-transform will still refuse the states that are missing. Reading it is cheaper
+Seven names is the whole set: the five states, then the read cache's two layers
+— the kernel's `ReadCache` and the layer's `GatedDeltaNetReadCache` around it.
+A shorter tuple means `torch` on this machine did not expose an entry point one
+of them needs — the library is unaffected and every path documented elsewhere
+behaves identically, but a `torch.func` transform will still refuse the ones
+that are missing. Reading it is cheaper
 than rediscovering the same fact from a `vmap` error inside a recurrence.
 
 `register_state_pytrees()` returns the same tuple and can be called at any time;

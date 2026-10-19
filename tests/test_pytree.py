@@ -8,6 +8,11 @@ second is the capability the registration exists to buy: many distinct parameter
 sets through one module definition in a single batched call, without a second,
 batched implementation of the layer.
 
+The read caches are not states, and are tested here because they meet the same
+boundary: :func:`test_vmapped_rereads_of_vmapped_writes_agree_with_a_loop` is
+their counterpart to the second, with the writes and the re-reads in separate
+calls — the arrangement an unregistered cache cannot cross.
+
 CPU-only on purpose. Every traversal here is over the reference path and needs
 no device, which puts the whole file in what CI already covers.
 """
@@ -22,7 +27,12 @@ import torch.utils._pytree as pytree
 from torch.func import functional_call, stack_module_state, vmap
 
 from lumen.block import Block
-from lumen.gdn import GatedDeltaNet, GatedDeltaNetConfig, HeadLayout
+from lumen.gdn import (
+    GatedDeltaNet,
+    GatedDeltaNetConfig,
+    GatedDeltaNetReadCache,
+    HeadLayout,
+)
 from lumen.pytree import REGISTERED, register_state_pytrees
 from lumen.sdm import SparseDeltaMemory, SparseDeltaMemoryConfig
 from lumen.stack import Stack
@@ -35,7 +45,7 @@ SEQ = 8
 SETS = 4
 
 needs_registration = pytest.mark.skipif(
-    len(REGISTERED) < 5,
+    len(REGISTERED) < 7,
     reason=f"torch {torch.__version__} registered only {REGISTERED}",
 )
 
@@ -108,6 +118,8 @@ def test_import_registers_every_state() -> None:
         "StackState",
         "UndertowState",
         "SparseDeltaMemoryState",
+        "ReadCache",
+        "GatedDeltaNetReadCache",
     )
 
 
@@ -319,3 +331,140 @@ def test_a_vmapped_sparse_delta_memory_streams_like_one_pass() -> None:
     tail, _ = vmap(one_set)(params, buffers, x[:, :, SEQ:], carried)
 
     torch.testing.assert_close(torch.cat([head, tail], dim=2), whole)
+
+
+# ── the read caches ───────────────────────────────────────────────────────
+
+
+class Rereading(torch.nn.Module):
+    """A layer whose ``forward`` is its ``reread``.
+
+    ``functional_call`` only ever calls ``forward``, so this is the smallest
+    module that lets it reach the other method with stacked weights.
+    """
+
+    def __init__(self, layer: GatedDeltaNet) -> None:
+        super().__init__()
+        self.layer = layer
+
+    def forward(
+        self, x: torch.Tensor, cache: GatedDeltaNetReadCache
+    ) -> torch.Tensor:
+        return self.layer.reread(x, cache)
+
+
+def a_cache(
+    continued: bool,
+) -> tuple[GatedDeltaNet, torch.Tensor, torch.Tensor, GatedDeltaNetReadCache]:
+    """A layer, the input it wrote, the output it gave, and the cache it wrote.
+
+    A continued pass is the one whose cache carries a ``conv`` tuple.  A first
+    pass carries ``None`` there, which has to stay context rather than a leaf.
+    """
+    layer = a_mixer()
+    state = None
+    if continued:
+        _, state = layer(torch.randn(BATCH, SEQ, D_MODEL), return_state=True)
+    x = torch.randn(BATCH, SEQ, D_MODEL)
+    y, cache = layer(x, state=state, return_cache=True)
+    return layer, x, y, cache
+
+
+PASSES = [pytest.param(False, id="first-pass"), pytest.param(True, id="continued")]
+
+
+@needs_registration
+@pytest.mark.parametrize("continued", PASSES)
+def test_a_read_cache_keeps_its_length_across_a_round_trip(continued: bool) -> None:
+    """``seq_len`` is context, as ``seen`` is, and the rebuilt cache still reads.
+
+    A cache that lost its length would not answer wrongly -- ``reread`` checks
+    the query against it -- but it would fail at the re-read, naming a shape,
+    far from the flatten that dropped it.  So it is asserted at the flatten.
+    """
+    layer, x, y, cache = a_cache(continued)
+
+    leaves, spec = pytree.tree_flatten(cache)
+    assert all(torch.is_tensor(leaf) for leaf in leaves)
+    assert len(leaves) == 5 + (3 if continued else 0)
+
+    restored = pytree.tree_unflatten(leaves, spec)
+    assert restored.trajectory.seq_len == SEQ
+    assert (restored.conv is None) == (not continued)
+    # A re-read with the original input is the original output, exactly -- so
+    # a rebuilt cache that is a cache in every respect passes this at zero.
+    torch.testing.assert_close(layer.reread(x, restored), y, rtol=0, atol=0)
+
+
+@needs_registration
+@pytest.mark.parametrize("continued", PASSES)
+def test_paths_reach_every_leaf_of_a_read_cache(continued: bool) -> None:
+    """Through the outer dataclass and the inner hand-rolled flatten alike.
+
+    The two halves of a cache are registered by different entry points.  A
+    path that stopped at ``.trajectory`` would mean the inner keyed flatten did
+    not take, and a ``.conv`` on a first pass would mean ``None`` became a leaf.
+    """
+    *_, cache = a_cache(continued)
+    paths = [
+        pytree.keystr(path) for path, _ in pytree.tree_flatten_with_path(cache)[0]
+    ]
+
+    trajectory = [f".trajectory.{name}" for name in ("unfolded", "u", "k_t", "gamma", "rel")]
+    conv = [f".conv[{index}]" for index in range(3)] if continued else []
+    assert paths == trajectory + conv
+
+
+@needs_registration
+@pytest.mark.parametrize("continued", PASSES)
+def test_vmapped_rereads_of_vmapped_writes_agree_with_a_loop(continued: bool) -> None:
+    """`SETS` writers return `SETS` caches; `SETS` re-readers take them back.
+
+    The write and the re-read in separate ``vmap`` calls, which is the
+    arrangement that needs the registration: a cache made and consumed inside
+    one call never crosses the boundary, and one shared cache crosses it
+    unbatched.  Compared against the layers run one at a time, so a transform
+    that broadcast one set's cache across all of them would not pass.
+    """
+    layers = [a_mixer() for _ in range(SETS)]
+    params, buffers = stack_module_state(layers)
+    base = a_mixer().to("meta")
+    rereading = Rereading(base)
+
+    def prefixed(tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        return {f"layer.{name}": tensor for name, tensor in tensors.items()}
+
+    def advance(parameters, buffered, x):
+        return functional_call(base, (parameters, buffered), (x,), {"return_state": True})[1]
+
+    def write(parameters, buffered, x, state):
+        kwargs = {"state": state, "return_cache": True}
+        return functional_call(base, (parameters, buffered), (x,), kwargs)[1]
+
+    def reread(parameters, buffered, x, cache):
+        weights = (prefixed(parameters), prefixed(buffered))
+        return functional_call(rereading, weights, (x, cache))
+
+    prefix = torch.randn(SETS, BATCH, SEQ, D_MODEL)
+    x = torch.randn(SETS, BATCH, SEQ, D_MODEL)
+    fresh = torch.randn(SETS, BATCH, SEQ, D_MODEL)
+
+    state = vmap(advance)(params, buffers, prefix) if continued else None
+    # A first pass has no state to map over, and `vmap` wants that said.
+    in_dims = (0, 0, 0, 0 if continued else None)
+    caches = vmap(write, in_dims=in_dims)(params, buffers, x, state)
+
+    assert isinstance(caches, GatedDeltaNetReadCache)
+    assert caches.trajectory.seq_len == SEQ
+    assert (caches.conv is not None) == continued
+    assert all(leaf.shape[0] == SETS for leaf in pytree.tree_leaves(caches))
+
+    batched = vmap(reread)(params, buffers, fresh, caches)
+
+    looped = []
+    for index, layer in enumerate(layers):
+        own = layer(prefix[index], return_state=True)[1] if continued else None
+        _, cache = layer(x[index], state=own, return_cache=True)
+        looped.append(layer.reread(fresh[index], cache))
+
+    torch.testing.assert_close(batched, torch.stack(looped), rtol=1e-5, atol=1e-5)
