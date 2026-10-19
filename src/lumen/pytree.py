@@ -10,9 +10,9 @@ flattens across a :func:`torch.compile` boundary.  There the abstraction stops,
 because a pytree that has never been declared is a leaf, and a leaf that is not
 a tensor is rejected.
 
-Nothing about these five classes is hostile to registration.  They are frozen
-dataclasses holding tensors, tuples of tensors, ``None``, and one ``int``.  The
-declaration is the whole fix.  See `latticedynamics/lumen#12`.
+Nothing about these classes is hostile to registration.  They are frozen
+dataclasses holding tensors, tuples of tensors, ``None``, and in two places an
+``int``.  The declaration is the whole fix.  See `latticedynamics/lumen#12`.
 
 **This is additive and numerically inert.**  No tensor changes value, no
 checkpoint key moves, no existing call path behaves differently.  What is
@@ -30,14 +30,28 @@ That is a larger commitment than this package usually makes, and it is made here
 because the states are Lumen's own classes — no other library can be holding a
 registration for them to collide with.
 
-Why three registrations are public and one is not
--------------------------------------------------
+Why the read caches are here too
+--------------------------------
+
+A :class:`~lumen.gdn.GatedDeltaNetReadCache` is not a state — it continues
+nothing — but it meets the same boundary.  Made and consumed inside one
+transformed call it never crosses it, and one cache shared by every member of a
+batch crosses it unbatched, as a constant.  What needs the declaration is the
+write and the re-read happening in *separate* calls over ``G`` parameter sets:
+``G`` writers return ``G`` caches out of ``vmap``, and ``G`` re-readers take them
+back in at ``in_dims=0``.  Both are refused while the cache is a leaf.  See
+`latticedynamics/lumen#20`.
+
+Why two registrations are not public
+------------------------------------
 
 :func:`torch.export.register_dataclass` handles the case that looks hardest.
 ``GatedDeltaNetState.conv`` is ``None`` on a layer with no convolution and
 ``BlockState.local`` is ``None`` on a block with no local sub-layer; it drops
 absent fields from the children and records their absence in the context, which
 is exactly what a hand-rolled flatten gets wrong on the first attempt.
+``GatedDeltaNetReadCache.conv`` is ``None`` on a pass that began a sequence, and
+is the same case again.
 
 It cannot express the case that looks easy.  ``UndertowState.seen`` is present,
 permanent, and not a tensor, so it becomes a child and ``vmap`` refuses it for
@@ -45,30 +59,36 @@ the same reason it refuses ``None``.  ``seen`` is not data: it drives Python
 control flow — the valid-position count, the front-padding width, the slice
 bounds — and it describes the tree rather than living in it.  That is what a
 treespec context is for, and ``register_dataclass`` has no way to put a field
-there.
+there.  ``ReadCache.seq_len`` is the same case a second time: it is where a
+re-read trims its padded output and what a query's length is checked against.
 
 ``drop_field_names`` is the public-looking escape and is a worse trap than the
 one it solves: flattening succeeds and unflattening raises, because a dropped
 field is reconstructed from nothing.  **The repair that suggests itself next is
 the one to refuse loudest** — giving ``seen`` a default makes every round-tripped
 state rebuild as ``seen=0``, and a window state that has forgotten its count
-masks the wrong slots and returns numbers instead of an error.
+masks the wrong slots and returns numbers instead of an error.  ``seq_len``
+gets no default either, for the same reason.
 
-So one class is registered against ``torch.utils._pytree``, which is private.
-The degradation discipline covers it on the same terms as everything else here:
-attempt it, skip it if the surface moved, and change nothing that works today.
-A skipped registration costs the ``torch.func`` path, which is unavailable
-anyway on a version that lacks the API.
+So two classes are registered against ``torch.utils._pytree``, which is private,
+through one helper: the tensor fields as children, the one field that is not a
+tensor as context.  The degradation discipline covers it on the same terms as
+everything else here: attempt it, skip it if the surface moved, and change
+nothing that works today.  A skipped registration costs the ``torch.func`` path,
+which is unavailable anyway on a version that lacks the API.
 """
 
 from __future__ import annotations
 
+from dataclasses import fields
+from functools import partial
 from typing import Any, Callable, Iterable
 
 import torch
 
 from lumen.block import BlockState
-from lumen.gdn import GatedDeltaNetState
+from lumen.gdn import GatedDeltaNetReadCache, GatedDeltaNetState
+from lumen.gdn.reference import ReadCache
 from lumen.sdm import SparseDeltaMemoryState
 from lumen.stack import StackState
 from lumen.undertow import UndertowState
@@ -83,29 +103,23 @@ __all__ = ["REGISTERED", "register_state_pytrees"]
 _REGISTERED: set[type] = set()
 
 
-def _flatten_undertow(
-    state: UndertowState,
-) -> tuple[list[torch.Tensor], int]:
-    """Two tensors as children, the count as context."""
-    return [state.keys, state.values], state.seen
-
-
-def _unflatten_undertow(
-    children: Iterable[torch.Tensor], seen: int
-) -> UndertowState:
-    keys, values = children
-    return UndertowState(keys=keys, values=values, seen=seen)
-
-
 def _register_dataclass(cls: type) -> None:
     from torch.export import register_dataclass
 
     register_dataclass(cls)
 
 
-def _register_undertow(cls: type) -> None:
-    """Register with paths if this ``torch`` has them, without if it does not.
+def _register_with_context(cls: type, context: str) -> None:
+    """Every field but ``context`` as a child; ``context`` in the treespec.
 
+    The children are read off the dataclass rather than listed here, so a field
+    added to the class later becomes a child without anyone remembering this
+    file.  Listed by hand, a new field would be dropped by the flatten and
+    either rebuilt from its default or refused by the constructor -- the first
+    silently.  Read off the class, the worst a new non-tensor field can do is
+    be refused by ``vmap``, which is loud.
+
+    Registered with paths if this ``torch`` has them, without if it does not.
     The keyed flatten is what makes ``tree_map_with_path`` treat every state
     alike; omitting it leaves the path-carrying traversals working on the
     dataclass-registered states and failing on this one, which is the asymmetry
@@ -120,53 +134,62 @@ def _register_undertow(cls: type) -> None:
     """
     from torch.utils._pytree import register_pytree_node
 
+    children = tuple(field.name for field in fields(cls) if field.name != context)
+
+    def flatten(node: Any) -> tuple[list[torch.Tensor], Any]:
+        return [getattr(node, name) for name in children], getattr(node, context)
+
+    def unflatten(leaves: Iterable[torch.Tensor], value: Any) -> Any:
+        return cls(**dict(zip(children, leaves, strict=True)), **{context: value})
+
     try:
         from torch.utils._pytree import GetAttrKey
     except ImportError:
-        register_pytree_node(cls, _flatten_undertow, _unflatten_undertow)
+        register_pytree_node(cls, flatten, unflatten)
         return
 
-    def flatten_with_keys(
-        state: UndertowState,
-    ) -> tuple[list[tuple[Any, torch.Tensor]], int]:
-        return [
-            (GetAttrKey("keys"), state.keys),
-            (GetAttrKey("values"), state.values),
-        ], state.seen
+    def flatten_with_keys(node: Any) -> tuple[list[tuple[Any, torch.Tensor]], Any]:
+        keyed = [(GetAttrKey(name), getattr(node, name)) for name in children]
+        return keyed, getattr(node, context)
 
     try:
         register_pytree_node(
-            cls,
-            _flatten_undertow,
-            _unflatten_undertow,
-            flatten_with_keys_fn=flatten_with_keys,
+            cls, flatten, unflatten, flatten_with_keys_fn=flatten_with_keys
         )
     except TypeError:
         # The keyword is not accepted on this version, so nothing was registered
         # -- binding fails before any work.  Retrying without it is safe.
-        register_pytree_node(cls, _flatten_undertow, _unflatten_undertow)
+        register_pytree_node(cls, flatten, unflatten)
 
 
-#: Each state and the entry point that can express its shape.  Enumerated in one
-#: place rather than declared beside each class: the set is no longer a uniform
-#: loop, and the asymmetry is the thing most worth keeping visible.
+#: Each container and the entry point that can express its shape.  Enumerated in
+#: one place rather than declared beside each class: the set is no longer a
+#: uniform loop, and the asymmetry is the thing most worth keeping visible.
+#:
+#: The read caches come last, so the five states keep the positions in
+#: :data:`REGISTERED` they have always had.
 _STATES: tuple[tuple[type, Callable[[type], None]], ...] = (
     (GatedDeltaNetState, _register_dataclass),
     (BlockState, _register_dataclass),
     (StackState, _register_dataclass),
-    (UndertowState, _register_undertow),
+    (UndertowState, partial(_register_with_context, context="seen")),
     (SparseDeltaMemoryState, _register_dataclass),
+    (ReadCache, partial(_register_with_context, context="seq_len")),
+    (GatedDeltaNetReadCache, _register_dataclass),
 )
 
 
 def register_state_pytrees() -> tuple[str, ...]:
-    """Declare the state containers as pytree nodes.  Idempotent.
+    """Declare the state containers and the read caches as pytree nodes.
+
+    Idempotent.
 
     Returns:
-        The names of every state that is registered once this call returns,
-        in declaration order.  A short tuple is a partial registration and a
-        working library: the states behave exactly as they did before, and only
-        the ``torch.func`` path on the missing ones is unavailable.
+        The names of every container that is registered once this call
+        returns, in declaration order.  A short tuple is a partial registration
+        and a working library: the containers behave exactly as they did
+        before, and only the ``torch.func`` path on the missing ones is
+        unavailable.
 
     Failures are captured rather than raised, matching :mod:`lumen.probe` and
     for the same reason -- one absent API in ``torch`` should be a shorter tuple
@@ -186,8 +209,8 @@ def register_state_pytrees() -> tuple[str, ...]:
 
 #: What registration achieved on this ``torch``, evaluated once at import.
 #:
-#: Five names is the whole set.  Anything shorter names the states a
-#: ``torch.func`` transform will still refuse, which is the only question a
-#: consumer needs answered and is cheaper to read than to rediscover from a
-#: ``vmap`` error.
+#: Seven names is the whole set: five states and the two read caches.  Anything
+#: shorter names the containers a ``torch.func`` transform will still refuse,
+#: which is the only question a consumer needs answered and is cheaper to read
+#: than to rediscover from a ``vmap`` error.
 REGISTERED: tuple[str, ...] = register_state_pytrees()

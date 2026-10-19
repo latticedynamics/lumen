@@ -752,11 +752,12 @@ The cache's members are tensors autograd already saves for backward — each is
 a matmul or multiply operand — so under a training graph retaining it costs
 nothing; the cache is returned as a frozen value rather than stashed on the
 module, because a cache held on `self` leaks when a block raises and is a
-side effect `torch.compile` cannot trace. It is **not** registered as a pytree
-node: `seq_len` is an int that describes the tree rather than living in it —
-the `UndertowState.seen` case `lumen.pytree` documents — so the registration
-is a hand-rolled flatten with its own round-trip tests, and is its own change.
-Until then a cache is an ordinary value, and a leaf at a `torch.func` boundary.
+side effect `torch.compile` cannot trace. It is registered as a pytree node,
+and by hand rather than through `register_dataclass`: `seq_len` is an int that
+describes the tree rather than living in it — the `UndertowState.seen` case
+`lumen.pytree` documents — so it rides in the treespec context, and a batch of
+caches crosses a `vmap` boundary the way a batch of states does
+(`latticedynamics/lumen#20`).
 
 **The re-read query is formed by `_features`, through the short conv.** The
 memory was written under keys that went through `k_conv`; the address space is
