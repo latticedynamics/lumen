@@ -341,6 +341,9 @@ installations of this layer are no longer running the same object, and a
 difference in their numbers stops being a difference in their experiment. Ask
 for it, measure it on your hardware, and record that you did.
 
+There is no backend for Apple silicon, and none to select: the reference runs
+on a Metal GPU as it stands. See [On Apple silicon](#on-apple-silicon).
+
 ### What it needs
 
 Refused at construction, not at the first forward:
@@ -429,6 +432,132 @@ Run the device-marked tests locally before relying on a GPU path; CI is CPU-only
 pytest -m "gpu or triton"      # on a CUDA box
 pytest -m mps                  # on Apple silicon
 ```
+
+### On Apple silicon
+
+The reference runs on a Metal GPU with no backend and no change:
+
+```python
+mixer = GatedDeltaNet(config).to("mps")
+```
+
+Every op the layer issues has a native Metal implementation, at every layout
+and every `decay` arrangement, through `forward`, `step`, `read` and `reread`.
+It is the same chunkwise algorithm it is everywhere else, so the sequential
+part is one matmul per chunk rather than one Python iteration per position.
+
+Three things are different on this device, and each is easy to get wrong
+quietly.
+
+**There is no fp64.** Metal refuses the dtype, so the fp64 oracle cannot run
+where the layer does. The 1e-9 gate in
+[Verifying it yourself](#verifying-it-yourself) is a statement about the
+*algorithm*, and it is discharged on any device that has fp64. What can be
+checked on Metal is the arithmetic: the fp32 path there against an oracle on
+the CPU, from one fp64 draw cast down for each route. On one machine,
+`diagonal(4)`, `B=2`, `T=256`:
+
+| route | output | gradients, all five inputs |
+|---|---|---|
+| CPU, fp32 chunkwise | 2.26e-7 | 2.8e-7 … 4.0e-7 |
+| Metal, fp32 chunkwise | 2.43e-7 | 2.9e-7 … 4.7e-7 |
+| Metal, fp32 chunkwise, compiled | 2.43e-7 | 2.9e-7 … 4.7e-7 |
+
+Relative distance from the fp64 sequential oracle. Metal lands where the CPU
+does, which is the claim; `tests/test_gdn_mps.py` holds it, and asserts Metal
+is no further out than the CPU rather than merely under a threshold.
+
+**A missing op need not raise.** With `PYTORCH_ENABLE_MPS_FALLBACK=1` in the
+environment, an operator Metal lacks runs on the CPU instead, with one warning
+and the right answer. Nothing in this layer needs that today. But a machine
+that has the variable set would not notice if that changed: the numbers would
+still be right and part of the layer would have left the GPU. The suite checks
+it in a child process with the variable removed, which is the only arrangement
+in which a missing op is an error. Do the same when the question is whether
+something runs on the GPU.
+
+**Reduced precision is accepted, which is not the same as being faster.** On
+the one machine this was measured on, an fp16 matmul ran at 0.91× the fp32
+rate and bf16 at 1.03×, and the layer under autocast gained 3–4% while moving
+1e-3 (fp16) to 1e-2 (bf16) away from its fp32 output. That is one GPU, not a
+property of the platform. Measure before reaching for it; the reference is
+fp32 for the reason it is everywhere else.
+
+#### Compiling it
+
+`torch.compile` is the faster path here, and it is **not a backend**. Lumen
+has no code for it and no config field: it is torch's own compilation of the
+reference, so there is no second implementation to keep in agreement with the
+first. Nothing in this library calls it. You do:
+
+```python
+import torch
+import torch._dynamo
+
+from lumen import Block, GatedDeltaNet, GatedDeltaNetConfig, HeadLayout, Stack
+
+# Past the recompile limit, raise instead of quietly running eagerly.  See below.
+torch._dynamo.config.fail_on_recompile_limit_hit = True
+
+def layer(index: int) -> Block:
+    mixer = GatedDeltaNet(GatedDeltaNetConfig(d_model=512, layout=HeadLayout.shared_key(8)))
+    return Block(512, mixer, norm_eps=1e-5, d_mlp=0)
+
+trunk = Stack(512, n_layers=6, block=layer, norm_eps=1e-5).to("mps")
+trunk = torch.compile(trunk)
+
+y = trunk(x)                                   # (B, T, 512) -> (B, T, 512)
+```
+
+Compile the outermost module you train rather than each mixer, so the whole
+trunk is one graph. The layer traces with no graph breaks, the chunk loop is
+unrolled into that graph, and the elementwise work around the matmuls is fused.
+`state=`, `return_state`, `return_cache`, `reread` and `step` all work on the
+compiled module and return the same dataclasses, because states and read caches
+are [pytree nodes](PYTREE.md). A cache built by a compiled pass can be re-read
+by the eager layer.
+
+It computes the same function — the last row of the table above — and, like
+switching to `"fla"`, it still moves your numbers at fp32 round-off. Record
+whether a run was compiled.
+
+On one machine, one layer at `d_model=512`, forward+backward came out roughly
+1.4× to 2× faster compiled, depending on the layout and the length, and 1.5×
+at `d_model=2048`. **The gain is in the backward.** The forward alone was a
+wash and sometimes slightly slower, so a forward-only benchmark would have
+reported nothing to gain.
+
+> Those ratios were taken while the machine was running an unrelated job, so
+> treat them as indicative and the *direction* as the claim. The mechanism is
+> what generalises: on this device the step is not dominated by arithmetic —
+> the matmuls are a minority of it — so the gain comes from fusion and from
+> issuing fewer operations, and it shrinks as the layer gets wider and the
+> arithmetic takes a larger share.
+
+Nothing in the mechanism is specific to Metal. It is described here because
+this is where it was measured; on any other device, measure. `lumen.bench`
+synchronises Metal, so `compare(..., device="mps")` with an eager builder and
+a compiled one gives the comparison for your configuration.
+
+Two costs come with it, and the first fails without raising:
+
+- **Every distinct sequence length is its own compilation**, because the chunk
+  count is a loop bound and the graph is specialised to it. After eight
+  compilations of one function torch stops compiling it and runs it eagerly —
+  one warning, no error, and from then on the "compiled" model is the eager
+  one. Training on variable-length batches reaches that on the ninth distinct
+  length. The config line in the example turns it into an error. Then bucket
+  lengths to a fixed set, or raise `torch._dynamo.config.recompile_limit`. The
+  flag lives in an underscore module, so check the name against your torch.
+- **The first call at each length takes seconds**, not milliseconds, and
+  longer for a deeper trunk. In the runs behind this page it was longer again
+  for a length that is not a multiple of `chunk_size`, which is observed and
+  not explained. It is cached afterwards. A benchmark that includes the first
+  call is measuring the compiler.
+
+Whether a given torch build can compile for Metal at all is something to try
+rather than to look up; the measurements above are from torch 2.15, and the
+suite skips its compiled tests, with the reason, on a build that cannot.
 
 ## Verifying it yourself
 
