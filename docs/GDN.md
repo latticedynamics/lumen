@@ -423,10 +423,11 @@ That is small, and it is not zero.
 
 ## Precision and hardware
 
-Run the GPU-marked tests locally before relying on a GPU path; CI is CPU-only:
+Run the device-marked tests locally before relying on a GPU path; CI is CPU-only:
 
 ```bash
-pytest -m "gpu or triton"
+pytest -m "gpu or triton"      # on a CUDA box
+pytest -m mps                  # on Apple silicon
 ```
 
 ## Verifying it yourself
