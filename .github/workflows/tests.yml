@@ -8,7 +8,8 @@ name: tests
 #
 # The Triton kernels and the hardware measurements are covered locally:
 #
-#     pytest -m "gpu or triton"
+#     pytest -m "gpu or triton"      # on a CUDA box
+#     pytest -m mps                  # on Apple silicon
 #
 # run before tagging.  Anything a hosted runner cannot check is a reason to keep
 # the reference path exact, not a reason to lower the bar.
@@ -69,4 +70,4 @@ jobs:
           "
 
       - name: Test
-        run: pytest -m "not gpu and not triton" -q
+        run: pytest -m "not gpu and not triton and not mps" -q

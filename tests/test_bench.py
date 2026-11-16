@@ -8,9 +8,11 @@ import pytest
 import torch
 import torch.nn as nn
 
+from lumen import bench
 from lumen.bench import BenchResult, benchmark_layer, compare, format_table
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+requires_mps = pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs an MPS device")
 
 
 def _result(**kwargs) -> BenchResult:
@@ -155,6 +157,71 @@ def test_benchmark_layer_on_a_real_module():
     # Whatever the ordering came out as, the table must not contain a negative
     # duration.  Matched by pattern rather than by cell index, so this keeps
     # meaning the same thing if a column is ever added.
+    assert not re.search(r"-\d+\.\d", format_table([result]))
+
+
+# ── waiting on the device that was asked ──────────────────────────────────
+#
+# Whether a timing waited for the device is not visible in the timing.  An
+# unsynchronised cell returns a positive number of milliseconds and no error,
+# so neither of the two tests below asserts on a duration: they record which
+# device was waited on, which is deterministic and needs no hardware -- the
+# wait is replaced by a counter, so this runs in CI on a box with no GPU.
+
+
+@pytest.fixture
+def waits(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Every device wait `lumen.bench` issues, in order, with the wait itself removed."""
+    seen: list[str] = []
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *args, **kwargs: seen.append("cuda"))
+    monkeypatch.setattr(torch.mps, "synchronize", lambda *args, **kwargs: seen.append("mps"))
+    return seen
+
+
+@pytest.mark.parametrize(
+    ("device", "expected"),
+    [("cpu", []), ("cuda:0", ["cuda"]), ("mps", ["mps"])],
+)
+def test_sync_waits_on_the_device_being_measured(
+    waits: list[str], device: str, expected: list[str]
+) -> None:
+    """Each queueing device has its own wait, and the CPU has none.
+
+    The Metal row is the one this exists for.  It used to take the CPU branch,
+    so a cell on `mps` timed the dispatch and reported it as the kernel -- an
+    order of magnitude low on a real layer, and indistinguishable from a
+    measurement.
+    """
+    bench._sync(torch.device(device))
+    assert waits == expected
+
+
+def test_every_timed_sample_is_synchronised(waits: list[str]) -> None:
+    """One wait after warmup, then one per sample -- or the sample is of nothing.
+
+    A single wait at the end would still be "synchronised" and would still be
+    wrong: every sample but the last would close before its work had finished,
+    and the median would be of dispatch times with one honest outlier.
+    """
+    bench._time(lambda: None, warmup=2, reps=5, device=torch.device("mps"))
+    assert waits == ["mps"] * 6
+
+
+@pytest.mark.mps
+@requires_mps
+def test_benchmark_layer_runs_on_mps():
+    """The harness produces a real row on Metal, and not an error one.
+
+    Deliberately says nothing about how long it took.  That the samples were
+    waited for is held above, without a device; what needs the device is that
+    the cell runs at all -- `.to("mps")`, the synchronise, and the cache
+    release are each a call that only exists here.
+    """
+    result = benchmark_layer(_mlp(), label="mlp", batch=2, seq_len=128, d_model=64,
+                             device="mps", warmup=1, reps=3)
+    assert result.error is None, f"MPS benchmark failed: {result.error}"
+    assert result.fwd_ms > 0
+    assert result.fwd_bwd_ms > 0
     assert not re.search(r"-\d+\.\d", format_table([result]))
 
 
