@@ -89,17 +89,27 @@ class BenchResult:
 def _sync(device: torch.device) -> None:
     """Block until `device` has finished the work already queued on it.
 
-    On CUDA this is what makes the timing mean anything: a launch returns
-    immediately, so timing without it measures the dispatch and not the kernel.
-    On CPU the work is complete when the call returns and there is nothing to
-    wait for, so the honest implementation is to do nothing.
+    On a device that queues work this is what makes the timing mean anything:
+    a launch returns immediately, so timing without it measures the dispatch
+    and not the kernel.  On CPU the work is complete when the call returns and
+    there is nothing to wait for, so the honest implementation is to do nothing.
 
     Branching on `device.type` rather than on `torch.cuda.is_available()`: the
     question is what this measurement is running on, not what the machine has.
     A CPU cell on a GPU box must take the CPU path.
+
+    Metal queues exactly as CUDA does, and it has its own branch because it
+    used to fall through to the CPU one.  That did not raise.  Measured on one
+    machine, a gated delta net at `T=4096` reported 2.8 ms forward and 10.1 ms
+    forward+backward against a synchronised 31 ms and 117 ms -- an order of
+    magnitude out, `error=None`, in a table that looked like any other.  A
+    measurement that silently times the wrong thing is worse than one that
+    fails, and this module exists to say so about other people's benchmarks.
     """
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+    elif device.type == "mps":
+        torch.mps.synchronize()
 
 
 def _time(fn: Callable[[], Any], warmup: int, reps: int, device: torch.device) -> float:
@@ -173,6 +183,10 @@ def benchmark_layer(
         # not have side effects on a device it is not measuring.
         if device.type == "cuda":
             torch.cuda.empty_cache()
+        elif device.type == "mps":
+            # The same release, for the same reason: on unified memory a cell's
+            # cached buffers come out of the RAM the next cell's CPU side needs.
+            torch.mps.empty_cache()
 
 
 def compare(
